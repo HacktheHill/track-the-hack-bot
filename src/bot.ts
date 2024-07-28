@@ -100,8 +100,7 @@ app.post("/verify", async (req: Request, res: Response) => {
 		}
 
 		await member.roles.add(role);
-
-		log(member);
+		await log(member);
 
 		return res.json({ status: "Success" });
 	} catch (error) {
@@ -118,6 +117,45 @@ client.once("ready", () => {
 	console.log(`Logged in as ${client.user?.tag ?? "Unknown"}`);
 });
 
+const getVerificationLinkButton = (userId: string) => {
+	const link = `${TRACK_THE_HACK_URL}/discord?id=${userId}`;
+	const linkButton = new ButtonBuilder()
+		.setLabel("Verification Link / Lien de vérification")
+		.setStyle(ButtonStyle.Link)
+		.setURL(link);
+
+	const row = new ActionRowBuilder<ButtonBuilder>().addComponents(linkButton);
+
+	return row;
+};
+
+const getVerificationLinkReply = (userId: string) => ({
+	content:
+		"Here is your verification link | Voici votre lien de vérification",
+	components: [getVerificationLinkButton(userId)],
+	ephemeral: true,
+});
+
+const getGenerateLinkButton = () => {
+	const generateButton = new ButtonBuilder()
+		.setCustomId("generateLink")
+		.setLabel(
+			"Generate Verification Link | Générer un lien de vérification",
+		)
+		.setStyle(ButtonStyle.Primary);
+
+	const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+		generateButton,
+	);
+
+	return row;
+};
+
+const getGenerateLinkReply = () => ({
+	components: [getGenerateLinkButton()],
+	ephemeral: false,
+});
+
 client.on("interactionCreate", async interaction => {
 	if (!interaction.isCommand() && !interaction.isButton()) return;
 
@@ -127,19 +165,16 @@ client.on("interactionCreate", async interaction => {
 		const member = await guild.members.fetch(userId);
 		const isOrganizer = member.roles.cache.has(ORGANIZER_ROLE_ID);
 
-		const link = `${TRACK_THE_HACK_URL}/discord?id=${userId}`;
+		if (isOrganizer) {
+			await interaction.reply(getGenerateLinkReply());
+		} else {
+			await interaction.reply(getVerificationLinkReply(userId));
+		}
+	}
 
-		const button = new ButtonBuilder()
-			.setLabel("Verification Link / Lien de vérification")
-			.setStyle(ButtonStyle.Link)
-			.setURL(link);
-
-		const row = new ActionRowBuilder<ButtonBuilder>().addComponents(button);
-
-		await interaction.reply({
-			components: [row],
-			ephemeral: !isOrganizer,
-		});
+	if (interaction.isButton() && interaction.customId === "generateLink") {
+		const userId = interaction.user.id;
+		await interaction.reply(getVerificationLinkReply(userId));
 	}
 });
 
