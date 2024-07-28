@@ -6,7 +6,7 @@
 	"scripts": {
 		"start": "node dist/bot.js",
 		"build": "tsc",
-		"dev": "npx tsx src/bot.ts",
+		"dev": "npx nodemon --exec npx tsx src/bot.ts",
 		"register": "npx tsx src/register.ts"
 	},
 	"dependencies": {
