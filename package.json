@@ -6,7 +6,8 @@
 	"scripts": {
 		"start": "node dist/bot.js",
 		"build": "tsc",
-		"dev": "npx tsx src/bot.ts"
+		"dev": "npx tsx src/bot.ts",
+		"register": "npx tsx src/register.ts"
 	},
 	"dependencies": {
 		"body-parser": "^1.19.1",

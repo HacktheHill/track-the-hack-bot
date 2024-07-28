@@ -1,5 +1,11 @@
 import bodyParser from "body-parser";
-import { Client, GatewayIntentBits } from "discord.js";
+import {
+	ActionRowBuilder,
+	ButtonBuilder,
+	ButtonStyle,
+	Client,
+	GatewayIntentBits,
+} from "discord.js";
 import { config } from "dotenv";
 import type { Request, Response } from "express";
 import express from "express";
@@ -11,13 +17,22 @@ const client = new Client({
 	intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
 });
 
-const PORT = process.env.PORT ?? 4000;
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const GUILD_ID = process.env.GUILD_ID;
-const HACKER_ROLE_ID = process.env.HACKER_ROLE_ID;
-const SECRET_KEY = process.env.SECRET_KEY;
+const {
+	PORT = 40000,
+	DISCORD_TOKEN,
+	GUILD_ID,
+	HACKER_ROLE_ID,
+	ORGANIZER_ROLE_ID,
+	SECRET_KEY,
+} = process.env;
 
-if (!DISCORD_TOKEN || !GUILD_ID || !HACKER_ROLE_ID || !SECRET_KEY) {
+if (
+	!DISCORD_TOKEN ||
+	!GUILD_ID ||
+	!HACKER_ROLE_ID ||
+	!ORGANIZER_ROLE_ID ||
+	!SECRET_KEY
+) {
 	console.error("Missing environment variables");
 	process.exit(1);
 }
@@ -54,6 +69,32 @@ app.listen(PORT, () => {
 
 client.once("ready", () => {
 	console.log(`Logged in as ${client.user?.tag ?? "Unknown"}`);
+});
+
+client.on("interactionCreate", async interaction => {
+	if (!interaction.isCommand() && !interaction.isButton()) return;
+
+	if (interaction.isCommand() && interaction.commandName === "verify") {
+		const userId = interaction.user.id;
+		const guild = await client.guilds.fetch(GUILD_ID);
+		const member = await guild.members.fetch(userId);
+		const isOrganizer = member.roles.cache.has(ORGANIZER_ROLE_ID);
+
+		const link = `http://tracker.hackthehill.com/discord?id=${userId}`;
+
+		const button = new ButtonBuilder()
+			.setLabel("Get Verification Link")
+			.setStyle(ButtonStyle.Link)
+			.setURL(link);
+
+		const row = new ActionRowBuilder<ButtonBuilder>().addComponents(button);
+
+		await interaction.reply({
+			content: "Click the button below to verify your account:",
+			components: [row],
+			ephemeral: !isOrganizer,
+		});
+	}
 });
 
 client.login(DISCORD_TOKEN);
