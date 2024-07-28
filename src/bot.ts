@@ -135,7 +135,8 @@ client.on("interactionCreate", async interaction => {
 		const row = new ActionRowBuilder<ButtonBuilder>().addComponents(button);
 
 		await interaction.reply({
-			content: "Click the button below to verify your account:",
+			content:
+				"Click the button below to verify your account and gain access to the server.\nCliquez sur le bouton ci-dessous pour vérifier votre compte et accéder au serveur.",
 			components: [row],
 			ephemeral: !isOrganizer,
 		});
