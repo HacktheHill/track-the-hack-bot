@@ -10,7 +10,7 @@ import {
 import express, { Request, Response } from "express";
 import bodyParser from "body-parser";
 import { config } from "dotenv";
-import { getClient } from "./bot";
+import { getClient } from "./bot.js";
 
 config();
 

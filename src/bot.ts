@@ -1,8 +1,8 @@
 import { Client, GatewayIntentBits } from "discord.js";
 import { config } from "dotenv";
-import registerHelpCommand from "./help";
-import registerSyncCommand from "./sync";
-import registerVerificationCommand from "./verification";
+import registerHelpCommand from "./help.js";
+import registerSyncCommand from "./sync.js";
+import registerVerificationCommand from "./verification.js";
 
 config();
 
