@@ -130,15 +130,13 @@ client.on("interactionCreate", async interaction => {
 		const link = `${TRACK_THE_HACK_URL}/discord?id=${userId}`;
 
 		const button = new ButtonBuilder()
-			.setLabel("Get Verification Link")
+			.setLabel("Verification Link / Lien de vérification")
 			.setStyle(ButtonStyle.Link)
 			.setURL(link);
 
 		const row = new ActionRowBuilder<ButtonBuilder>().addComponents(button);
 
 		await interaction.reply({
-			content:
-				"Click the button below to verify your account and gain access to the server.\nCliquez sur le bouton ci-dessous pour vérifier votre compte et accéder au serveur.",
 			components: [row],
 			ephemeral: !isOrganizer,
 		});
