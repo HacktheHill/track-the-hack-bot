@@ -3,6 +3,7 @@
 	"version": "1.0.0",
 	"description": "A Discord bot that automatically assigns roles to verified hackers on the Hack the Hill server, integrating with the Track the Hack event management platform.",
 	"main": "bot.js",
+	"type": "module",
 	"scripts": {
 		"start": "node dist/bot.js",
 		"build": "tsc",
