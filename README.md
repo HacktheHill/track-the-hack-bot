@@ -22,18 +22,22 @@ Track the Hack Bot is a Discord bot designed to automatically assign roles to ve
    Create a `.env` file in the root directory and add the following environment variables:
 
    ```bash
-   DISCORD_TOKEN=your_discord_bot_token
-   GUILD_ID=your_guild_id
-   HACKER_ROLE_ID=your_hacker_role_id
-   SECRET_KEY=your_secret_key
-   PORT=4000
+   DISCORD_TOKEN=
+   GUILD_ID=
+   HACKER_ROLE_ID=
+   ORGANIZER_ROLE_ID=
+   LOG_CHANNEL_ID=
+   SECRET_KEY=
+   TRACK_THE_HACK_URL=
    ```
 
    - `DISCORD_TOKEN`: Your Discord bot token.
    - `GUILD_ID`: The ID of your Discord server.
    - `HACKER_ROLE_ID`: The ID of the role to be assigned to verified hackers.
+   - `ORGANIZER_ROLE_ID`: The ID of the role to be assigned to verified organizers.
+   - `LOG_CHANNEL_ID`: The ID of the channel to log bot activity.
    - `SECRET_KEY`: A secret key for verifying requests from the Track the Hack platform.
-   - `PORT`: The port number for the Express server (default: 4000).
+   - `TRACK_THE_HACK_URL`: The URL of the Track the Hack platform.
 
 4. **Start the Bot**
 
