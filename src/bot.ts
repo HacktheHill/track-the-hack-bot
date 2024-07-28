@@ -5,6 +5,9 @@ import {
 	ButtonStyle,
 	Client,
 	GatewayIntentBits,
+	GuildMember,
+	PermissionFlagsBits,
+	TextChannel,
 } from "discord.js";
 import { config } from "dotenv";
 import type { Request, Response } from "express";
@@ -18,11 +21,12 @@ const client = new Client({
 });
 
 const {
-	PORT = 40000,
+	PORT = 4000,
 	DISCORD_TOKEN,
 	GUILD_ID,
 	HACKER_ROLE_ID,
 	ORGANIZER_ROLE_ID,
+	LOG_CHANNEL_ID,
 	SECRET_KEY,
 } = process.env;
 
@@ -31,6 +35,7 @@ if (
 	!GUILD_ID ||
 	!HACKER_ROLE_ID ||
 	!ORGANIZER_ROLE_ID ||
+	!LOG_CHANNEL_ID ||
 	!SECRET_KEY
 ) {
 	console.error("Missing environment variables");
@@ -39,8 +44,45 @@ if (
 
 app.use(bodyParser.json());
 
-app.post("/assign", async (req: Request, res: Response) => {
-	const { discordUserId, secretKey } = req.body;
+const log = async (member: GuildMember) => {
+	try {
+		const guild = await client.guilds.fetch(GUILD_ID);
+		const channel = await guild.channels.fetch(LOG_CHANNEL_ID);
+
+		if (!channel) {
+			console.error("Log channel not found");
+			return;
+		}
+
+		if (!(channel instanceof TextChannel)) {
+			console.error("Log channel is not a text channel");
+			return;
+		}
+
+		if (
+			!channel
+				.permissionsFor(client.user!)
+				?.has(PermissionFlagsBits.SendMessages)
+		) {
+			console.error(
+				"Missing permissions to send messages in the log channel",
+			);
+			return;
+		}
+
+		await channel.send({
+			content: `:white_check_mark: <@${member.id}> has been verified`,
+		});
+	} catch (error) {
+		console.error(
+			"An error occurred while sending the log message:",
+			error,
+		);
+	}
+};
+
+app.post("/verify", async (req: Request, res: Response) => {
+	const { discordId, secretKey } = req.body;
 
 	if (secretKey !== SECRET_KEY) {
 		return res.status(403).json({ error: "Invalid secret key" });
@@ -48,7 +90,7 @@ app.post("/assign", async (req: Request, res: Response) => {
 
 	try {
 		const guild = await client.guilds.fetch(GUILD_ID);
-		const member = await guild.members.fetch(discordUserId);
+		const member = await guild.members.fetch(discordId);
 		const role = guild.roles.cache.get(HACKER_ROLE_ID);
 
 		if (!member || !role) {
@@ -56,6 +98,9 @@ app.post("/assign", async (req: Request, res: Response) => {
 		}
 
 		await member.roles.add(role);
+
+		log(member);
+
 		return res.json({ status: "Success" });
 	} catch (error) {
 		console.error(error);
