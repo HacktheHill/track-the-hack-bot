@@ -28,6 +28,7 @@ const {
 	ORGANIZER_ROLE_ID,
 	LOG_CHANNEL_ID,
 	SECRET_KEY,
+	TRACK_THE_HACK_URL,
 } = process.env;
 
 if (
@@ -36,7 +37,8 @@ if (
 	!HACKER_ROLE_ID ||
 	!ORGANIZER_ROLE_ID ||
 	!LOG_CHANNEL_ID ||
-	!SECRET_KEY
+	!SECRET_KEY ||
+	!TRACK_THE_HACK_URL
 ) {
 	console.error("Missing environment variables");
 	process.exit(1);
@@ -125,7 +127,7 @@ client.on("interactionCreate", async interaction => {
 		const member = await guild.members.fetch(userId);
 		const isOrganizer = member.roles.cache.has(ORGANIZER_ROLE_ID);
 
-		const link = `http://tracker.hackthehill.com/discord?id=${userId}`;
+		const link = `${TRACK_THE_HACK_URL}/discord?id=${userId}`;
 
 		const button = new ButtonBuilder()
 			.setLabel("Get Verification Link")
