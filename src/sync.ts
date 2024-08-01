@@ -3,9 +3,17 @@ import { config } from "dotenv";
 
 config();
 
-const { ORGANIZER_GUILD_ID, COMMUNITY_GUILD_ID } = process.env;
+const {
+	ORGANIZER_GUILD_ID,
+	COMMUNITY_GUILD_ID,
+	COMMUNITY_GUILD_ORGANIZER_ROLE_ID,
+} = process.env;
 
-if (!ORGANIZER_GUILD_ID || !COMMUNITY_GUILD_ID) {
+if (
+	!ORGANIZER_GUILD_ID ||
+	!COMMUNITY_GUILD_ID ||
+	!COMMUNITY_GUILD_ORGANIZER_ROLE_ID
+) {
 	console.error("Missing environment variables for sync");
 	process.exit(1);
 }
@@ -20,7 +28,7 @@ const registerSyncCommand = async (client: Client) => {
 			try {
 				await interaction.reply({
 					content:
-						"Syncing roles and nicknames | Synchronisation des rôles et des surnoms",
+						"Syncing organizer role and nicknames | Synchronisation du rôle d'organisateur et des surnoms",
 					ephemeral: true,
 				});
 
@@ -33,16 +41,37 @@ const registerSyncCommand = async (client: Client) => {
 				const organizerMembers = await organizerGuild.members.fetch();
 				const communityMembers = await communityGuild.members.fetch();
 
+				// Add Organizer role to members in the organizer server
 				for (const [_, organizerMember] of organizerMembers) {
 					const communityMember = communityMembers.get(
 						organizerMember.id,
 					);
 					if (communityMember) {
-						await communityMember.roles.set(
-							organizerMember.roles.cache,
-						);
+						if (
+							!communityMember.roles.cache.has(
+								COMMUNITY_GUILD_ORGANIZER_ROLE_ID,
+							)
+						) {
+							await communityMember.roles.add(
+								COMMUNITY_GUILD_ORGANIZER_ROLE_ID,
+							);
+						}
 						await communityMember.setNickname(
 							organizerMember.nickname,
+						);
+					}
+				}
+
+				// Remove Organizer role from members not in the organizer server
+				for (const [_, communityMember] of communityMembers) {
+					if (
+						!organizerMembers.has(communityMember.id) &&
+						communityMember.roles.cache.has(
+							COMMUNITY_GUILD_ORGANIZER_ROLE_ID,
+						)
+					) {
+						await communityMember.roles.remove(
+							COMMUNITY_GUILD_ORGANIZER_ROLE_ID,
 						);
 					}
 				}
