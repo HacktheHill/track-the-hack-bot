@@ -21,6 +21,7 @@ const {
 	PORT = 4000,
 	COMMUNITY_GUILD_ID,
 	COMMUNITY_GUILD_HACKER_ROLE_ID,
+	COMMUNITY_GUILD_ORGANIZER_ROLE_ID,
 	LOG_CHANNEL_ID,
 	SECRET_KEY,
 	TRACK_THE_HACK_URL,
@@ -29,6 +30,7 @@ const {
 if (
 	!COMMUNITY_GUILD_ID ||
 	!COMMUNITY_GUILD_HACKER_ROLE_ID ||
+	!COMMUNITY_GUILD_ORGANIZER_ROLE_ID ||
 	!LOG_CHANNEL_ID ||
 	!SECRET_KEY ||
 	!TRACK_THE_HACK_URL
@@ -150,7 +152,7 @@ const registerVerificationCommand = (client: Client) => {
 				const guild = await client.guilds.fetch(COMMUNITY_GUILD_ID);
 				const member = await guild.members.fetch(userId);
 				const isOrganizer = member.roles.cache.has(
-					COMMUNITY_GUILD_HACKER_ROLE_ID,
+					COMMUNITY_GUILD_ORGANIZER_ROLE_ID,
 				);
 
 				if (isOrganizer) {
