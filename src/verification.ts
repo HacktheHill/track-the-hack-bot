@@ -156,7 +156,8 @@ const registerVerificationCommand = (client: Client) => {
 				);
 
 				if (isOrganizer) {
-					await interaction.editReply(getGenerateLinkReply());
+					await interaction.deleteReply();
+					await interaction.followUp(getGenerateLinkReply());
 				} else {
 					await interaction.editReply(
 						getVerificationLinkReply(userId),
