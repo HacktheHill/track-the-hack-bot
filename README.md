@@ -23,7 +23,8 @@ Track the Hack Bot is a Discord bot designed to automatically assign roles to ve
 
    ```bash
    DISCORD_TOKEN=
-   GUILD_ID=
+   ORGANIZER_GUILD_ID=
+   COMMUNITY_GUILD_ID=
    COMMUNITY_GUILD_HACKER_ROLE_ID=
    COMMUNITY_GUILD_ORGANIZER_ROLE_ID=
    LOG_CHANNEL_ID=
@@ -32,12 +33,14 @@ Track the Hack Bot is a Discord bot designed to automatically assign roles to ve
    ```
 
    - `DISCORD_TOKEN`: Your Discord bot token.
-   - `GUILD_ID`: The ID of your Discord server.
+   - `ORGANIZER_GUILD_ID`: The ID of the Organizer server.
+   - `COMMUNITY_GUILD_ID`: The ID of the Community server.
    - `COMMUNITY_GUILD_HACKER_ROLE_ID`: The ID of the role to be assigned to verified hackers.
-   - `COMMUNITY_GUILD_ORGANIZER_ROLE_ID`: The ID of the role to be assigned to verified organizers.
+   - `COMMUNITY_GUILD_ORGANIZER_ROLE_ID`: The ID of the role to be assigned to organizers in the Community server.
    - `LOG_CHANNEL_ID`: The ID of the channel to log bot activity.
    - `SECRET_KEY`: A secret key for verifying requests from the Track the Hack platform.
    - `TRACK_THE_HACK_URL`: The URL of the Track the Hack platform.
+   - `PORT`: The port number on which the bot's server should run (default: 4000).
 
 4. **Start the Bot**
 
@@ -47,7 +50,15 @@ Track the Hack Bot is a Discord bot designed to automatically assign roles to ve
 
 ## Usage
 
-Once the bot is running, it listens for requests from the Track the Hack platform to assign roles to users based on their verification status.
+### Commands
+
+- **`/verify`**: Provides a verification link to the user to verify their account in the Community server.
+- **`/sync`**: Synchronizes roles and nicknames between the Organizer and Community servers.
+- **`/help`**: Displays information about the bot's commands and functionalities.
+
+### Synchronization
+
+When a new member joins the Community server, the bot automatically synchronizes their roles and nickname with those from the Organizer server. This can also be triggered manually using the `/sync` command.
 
 ## Contributing
 
@@ -55,7 +66,7 @@ Contributions are welcome! For major changes, please open an issue first to disc
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE] file for more information.
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for more information.
 
 ## Contact
 

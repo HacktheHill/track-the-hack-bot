@@ -1,7 +1,7 @@
 import { Client, GatewayIntentBits } from "discord.js";
 import { config } from "dotenv";
 import registerHelpCommand from "./help.js";
-import registerSyncCommand from "./sync.js";
+import registerSyncCommand, { registerGuildMemberAddHandler } from "./sync.js";
 import registerVerificationCommand from "./verification.js";
 
 config();
@@ -22,6 +22,7 @@ const {
 } = process.env;
 
 if (
+	!PORT ||
 	!COMMUNITY_GUILD_ID ||
 	!ORGANIZER_GUILD_ID ||
 	!COMMUNITY_GUILD_HACKER_ROLE_ID ||
@@ -40,6 +41,8 @@ client.once("ready", () => {
 	registerHelpCommand(client);
 	registerSyncCommand(client);
 	registerVerificationCommand(client);
+
+	registerGuildMemberAddHandler(client);
 });
 
 client.login(DISCORD_TOKEN);

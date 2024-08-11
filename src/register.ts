@@ -21,14 +21,18 @@ if (
 const communityCommands = [
 	new SlashCommandBuilder()
 		.setName("verify")
-		.setDescription("Get a verification link | Obtenir un lien de vérification")
+		.setDescription(
+			"Get a verification link | Obtenir un lien de vérification",
+		)
 		.toJSON(),
 ];
 
 const organizerCommands = [
 	new SlashCommandBuilder()
 		.setName("sync")
-		.setDescription("Synchronize roles and nicknames | Synchroniser les rôles et les surnoms")
+		.setDescription(
+			"Synchronize roles and nicknames | Synchroniser les rôles et les surnoms",
+		)
 		.toJSON(),
 ];
 

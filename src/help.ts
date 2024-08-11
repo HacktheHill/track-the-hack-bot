@@ -14,13 +14,12 @@ const registerHelpCommand = async (client: Client) => {
 	client.on("interactionCreate", async interaction => {
 		if (!interaction.isCommand()) return;
 
-		const { commandName } = interaction;
+		const { commandName, guildId } = interaction;
 
 		if (commandName === "help") {
 			try {
 				await interaction.deferReply({ ephemeral: true });
 
-				const guildId = interaction.guildId;
 				const organizerGuild = await client.guilds.fetch(
 					ORGANIZER_GUILD_ID,
 				);
@@ -177,7 +176,7 @@ Ce bot aide à gérer et coordonner les activités sur les serveurs Discord de H
 					},
 				];
 
-				interaction.editReply({
+				await interaction.editReply({
 					embeds: helpEmbeds.map(content => {
 						const embed = new EmbedBuilder()
 							.setColor(embedColor)

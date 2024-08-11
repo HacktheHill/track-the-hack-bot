@@ -1,4 +1,4 @@
-import { Client } from "discord.js";
+import { Client, GuildMember } from "discord.js";
 import { config } from "dotenv";
 
 config();
@@ -18,7 +18,7 @@ if (
 	process.exit(1);
 }
 
-const registerSyncCommand = async (client: Client) => {
+const registerSyncCommand = (client: Client) => {
 	client.on("interactionCreate", async interaction => {
 		if (!interaction.isCommand()) return;
 
@@ -28,78 +28,18 @@ const registerSyncCommand = async (client: Client) => {
 			try {
 				await interaction.reply({
 					content:
-						"Syncing organizer role and nicknames | Synchronisation du rôle d'organisateur et des surnoms",
+						"Syncing organizer roles and nicknames... | Synchronisation des rôles et surnoms d'organisateur...",
 					ephemeral: true,
 				});
 
-				const organizerGuild = await client.guilds.fetch(
-					ORGANIZER_GUILD_ID,
-				);
-				const communityGuild = await client.guilds.fetch(
-					COMMUNITY_GUILD_ID,
-				);
-				const organizerMembers = await organizerGuild.members.fetch();
-				const communityMembers = await communityGuild.members.fetch();
-				const communityOwner = communityGuild.ownerId;
-
-				const errors = [];
-
-				// Add Organizer role to members in the organizer server
-				for (const [_, organizerMember] of organizerMembers) {
-					try {
-						const communityMember = communityMembers.get(
-							organizerMember.id,
-						);
-						if (
-							communityMember &&
-							communityMember.id !== communityOwner
-						) {
-							if (
-								!communityMember.roles.cache.has(
-									COMMUNITY_GUILD_ORGANIZER_ROLE_ID,
-								)
-							) {
-								await communityMember.roles.add(
-									COMMUNITY_GUILD_ORGANIZER_ROLE_ID,
-								);
-							}
-							await communityMember.setNickname(
-								organizerMember.nickname,
-							);
-						}
-					} catch (error) {
-						errors.push(
-							`Failed to sync ${organizerMember.user.tag}: ${(error as Error).message}`,
-						);
-					}
-				}
-
-				// Remove Organizer role from members not in the organizer server
-				for (const [_, communityMember] of communityMembers) {
-					try {
-						if (
-							communityMember.id !== communityOwner &&
-							!organizerMembers.has(communityMember.id) &&
-							communityMember.roles.cache.has(
-								COMMUNITY_GUILD_ORGANIZER_ROLE_ID,
-							)
-						) {
-							await communityMember.roles.remove(
-								COMMUNITY_GUILD_ORGANIZER_ROLE_ID,
-							);
-						}
-					} catch (error) {
-						errors.push(
-							`Failed to remove role from ${communityMember.user.tag}: ${(error as Error).message}`,
-						);
-					}
-				}
+				const errors = await syncOrganizerRoleAndNicknames(client);
 
 				let finalMessage =
-					"Organizer role and nicknames synced | Rôle d'organisateur et surnoms synchronisés";
+					"Organizer roles and nicknames synced successfully. | Rôles et surnoms d'organisateur synchronisés avec succès.";
 				if (errors.length > 0) {
 					finalMessage +=
-						"\n\nSome errors occurred:\n" + errors.join("\n");
+						"\n\nSome errors occurred: | Quelques erreurs se sont produites :\n" +
+						errors.join("\n");
 				}
 
 				await interaction.editReply({
@@ -131,4 +71,116 @@ const registerSyncCommand = async (client: Client) => {
 	});
 };
 
+const syncMember = async ({
+	organizerMember,
+	member,
+	errors,
+}: {
+	organizerMember?: GuildMember;
+	member: GuildMember;
+	errors: string[];
+}) => {
+	try {
+		if (organizerMember && member.id !== member.guild.ownerId) {
+			if (!member.roles.cache.has(COMMUNITY_GUILD_ORGANIZER_ROLE_ID)) {
+				await member.roles.add(COMMUNITY_GUILD_ORGANIZER_ROLE_ID);
+			}
+			await member.setNickname(organizerMember.nickname);
+		} else if (
+			member.id !== member.guild.ownerId &&
+			!organizerMember &&
+			member.roles.cache.has(COMMUNITY_GUILD_ORGANIZER_ROLE_ID)
+		) {
+			await member.roles.remove(COMMUNITY_GUILD_ORGANIZER_ROLE_ID);
+		}
+	} catch (error) {
+		errors.push(
+			`Failed to sync roles or nickname for ${
+				member.user.tag
+			} | Échec de la synchronisation des rôles ou du surnom pour ${
+				member.user.tag
+			}: ${(error as Error).message}`,
+		);
+	}
+};
+
+const syncGuildMembers = async ({
+	communityMembers,
+	organizerMembers,
+	singleUserId,
+	errors,
+}: {
+	communityMembers: Map<string, GuildMember>;
+	organizerMembers: Map<string, GuildMember>;
+	singleUserId?: string;
+	errors: string[];
+}) => {
+	if (singleUserId) {
+		const singleMember = communityMembers.get(singleUserId);
+		if (singleMember) {
+			const organizerMember = organizerMembers.get(singleUserId);
+			await syncMember({
+				organizerMember,
+				member: singleMember,
+				errors,
+			});
+		}
+	} else {
+		for (const member of communityMembers.values()) {
+			const organizerMember = organizerMembers.get(member.id);
+			await syncMember({ organizerMember, member, errors });
+		}
+	}
+};
+
+const syncOrganizerRoleAndNicknames = async (
+	client: Client,
+	singleUserId?: string,
+) => {
+	try {
+		const organizerGuild = await client.guilds.fetch(ORGANIZER_GUILD_ID);
+		const organizerMembers = await organizerGuild.members.fetch();
+
+		const communityGuild = await client.guilds.fetch(COMMUNITY_GUILD_ID);
+		const communityMembers = await communityGuild.members.fetch();
+
+		const errors: string[] = [];
+
+		await syncGuildMembers({
+			communityMembers,
+			organizerMembers,
+			singleUserId,
+			errors,
+		});
+
+		return errors;
+	} catch (error) {
+		console.error("Error during synchronization:", error);
+		return [
+			"An unexpected error occurred during synchronization. | Une erreur inattendue s'est produite lors de la synchronisation.",
+		];
+	}
+};
+
+const registerGuildMemberAddHandler = (client: Client) => {
+	client.on("guildMemberAdd", async member => {
+		if (member.guild.id === COMMUNITY_GUILD_ID) {
+			console.log(
+				`New member joined: ${member.user.tag}, syncing roles and nickname... | Nouveau membre rejoint : ${member.user.tag}, synchronisation des rôles et surnoms...`,
+			);
+			const errors = await syncOrganizerRoleAndNicknames(
+				client,
+				member.user.id,
+			);
+			if (errors.length > 0) {
+				console.error(
+					"Errors during sync for new member: | Erreurs lors de la synchronisation pour le nouveau membre :",
+					errors.join("\n"),
+				);
+			}
+		}
+	});
+};
+
 export default registerSyncCommand;
+export { registerGuildMemberAddHandler };
