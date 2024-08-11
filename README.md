@@ -27,6 +27,7 @@ Track the Hack Bot is a Discord bot designed to automatically assign roles to ve
    COMMUNITY_GUILD_ID=
    COMMUNITY_GUILD_HACKER_ROLE_ID=
    COMMUNITY_GUILD_ORGANIZER_ROLE_ID=
+   ORGANIZER_GUILD_ORGANIZER_ROLE_ID=
    LOG_CHANNEL_ID=
    SECRET_KEY=
    TRACK_THE_HACK_URL=
@@ -37,6 +38,7 @@ Track the Hack Bot is a Discord bot designed to automatically assign roles to ve
    - `COMMUNITY_GUILD_ID`: The ID of the Community server.
    - `COMMUNITY_GUILD_HACKER_ROLE_ID`: The ID of the role to be assigned to verified hackers.
    - `COMMUNITY_GUILD_ORGANIZER_ROLE_ID`: The ID of the role to be assigned to organizers in the Community server.
+   - `ORGANIZER_GUILD_ORGANIZER_ROLE_ID`: The ID of the role that organizers have in the Organizer server.
    - `LOG_CHANNEL_ID`: The ID of the channel to log bot activity.
    - `SECRET_KEY`: A secret key for verifying requests from the Track the Hack platform.
    - `TRACK_THE_HACK_URL`: The URL of the Track the Hack platform.

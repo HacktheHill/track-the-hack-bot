@@ -7,12 +7,14 @@ const {
 	ORGANIZER_GUILD_ID,
 	COMMUNITY_GUILD_ID,
 	COMMUNITY_GUILD_ORGANIZER_ROLE_ID,
+	ORGANIZER_GUILD_ORGANIZER_ROLE_ID,
 } = process.env;
 
 if (
 	!ORGANIZER_GUILD_ID ||
 	!COMMUNITY_GUILD_ID ||
-	!COMMUNITY_GUILD_ORGANIZER_ROLE_ID
+	!COMMUNITY_GUILD_ORGANIZER_ROLE_ID ||
+	!ORGANIZER_GUILD_ORGANIZER_ROLE_ID
 ) {
 	console.error("Missing environment variables for sync");
 	process.exit(1);
@@ -73,32 +75,38 @@ const registerSyncCommand = (client: Client) => {
 
 const syncMember = async ({
 	organizerMember,
-	member,
+	communityMember,
 	errors,
 }: {
 	organizerMember?: GuildMember;
-	member: GuildMember;
+	communityMember: GuildMember;
 	errors: string[];
 }) => {
+	const isOrganizerGuildOrganizer = organizerMember?.roles.cache.has(
+		ORGANIZER_GUILD_ORGANIZER_ROLE_ID,
+	);
+	const isCommunityGuildOrganizer = communityMember.roles.cache.has(
+		COMMUNITY_GUILD_ORGANIZER_ROLE_ID,
+	);
+	const isOwner = communityMember.id === communityMember.guild.ownerId;
+
 	try {
-		if (organizerMember && member.id !== member.guild.ownerId) {
-			if (!member.roles.cache.has(COMMUNITY_GUILD_ORGANIZER_ROLE_ID)) {
-				await member.roles.add(COMMUNITY_GUILD_ORGANIZER_ROLE_ID);
+		if (!isOwner && organizerMember && isOrganizerGuildOrganizer) {
+			if (!isCommunityGuildOrganizer) {
+				await communityMember.roles.add(COMMUNITY_GUILD_ORGANIZER_ROLE_ID);
 			}
-			await member.setNickname(organizerMember.nickname);
-		} else if (
-			member.id !== member.guild.ownerId &&
-			!organizerMember &&
-			member.roles.cache.has(COMMUNITY_GUILD_ORGANIZER_ROLE_ID)
-		) {
-			await member.roles.remove(COMMUNITY_GUILD_ORGANIZER_ROLE_ID);
+			await communityMember.setNickname(organizerMember.nickname);
+		} else if (!isOwner && !isOrganizerGuildOrganizer && isCommunityGuildOrganizer) {
+			await communityMember.roles.remove(
+				COMMUNITY_GUILD_ORGANIZER_ROLE_ID,
+			);
 		}
 	} catch (error) {
 		errors.push(
 			`Failed to sync roles or nickname for ${
-				member.user.tag
+				communityMember.user.tag
 			} | Échec de la synchronisation des rôles ou du surnom pour ${
-				member.user.tag
+				communityMember.user.tag
 			}: ${(error as Error).message}`,
 		);
 	}
@@ -121,14 +129,14 @@ const syncGuildMembers = async ({
 			const organizerMember = organizerMembers.get(singleUserId);
 			await syncMember({
 				organizerMember,
-				member: singleMember,
+				communityMember: singleMember,
 				errors,
 			});
 		}
 	} else {
-		for (const member of communityMembers.values()) {
-			const organizerMember = organizerMembers.get(member.id);
-			await syncMember({ organizerMember, member, errors });
+		for (const communityMember of communityMembers.values()) {
+			const organizerMember = organizerMembers.get(communityMember.id);
+			await syncMember({ organizerMember, communityMember, errors });
 		}
 	}
 };
