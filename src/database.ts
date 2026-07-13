@@ -307,18 +307,41 @@ export class Database {
 		);
 	}
 
-	async reconcileProposal(id: string, actorId: string, workPackageId: number) {
-		const result = await this.pool.query(
-			`UPDATE task_proposals SET status='created', reviewer_discord_id=$2,
-			 openproject_work_package_id=$3, error=NULL, updated_at=now()
-			 WHERE id=$1 AND status='needs_reconciliation'`,
-			[id, actorId, workPackageId],
-		);
-		if (result.rowCount !== 1) throw new Error("That proposal is not awaiting reconciliation.");
-		await this.pool.query(
-			"INSERT INTO task_audit_log(proposal_id,event,actor_discord_id,metadata) VALUES($1,'reconciled',$2,$3)",
-			[id, actorId, { workPackageId }],
-		);
+	async reconcileCreation(id: string, actorId: string, workPackageId: number) {
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			const proposal = await client.query(
+				`UPDATE task_proposals SET status='created', reviewer_discord_id=$2,
+				 openproject_work_package_id=$3, error=NULL, updated_at=now()
+				 WHERE id=$1 AND status='needs_reconciliation' RETURNING id`,
+				[id, actorId, workPackageId],
+			);
+			if (proposal.rowCount === 1) {
+				await client.query(
+					"INSERT INTO task_audit_log(proposal_id,event,actor_discord_id,metadata) VALUES($1,'reconciled',$2,$3)",
+					[id, actorId, { workPackageId }],
+				);
+			} else {
+				const draft = await client.query(
+					`UPDATE task_drafts SET status='created', openproject_work_package_id=$2,
+					 claimed_by=$3, error=NULL, updated_at=now()
+					 WHERE id=$1 AND status='needs_reconciliation' RETURNING id`,
+					[id, workPackageId, actorId],
+				);
+				if (draft.rowCount !== 1) throw new Error("That creation is not awaiting reconciliation.");
+				await client.query(
+					"INSERT INTO task_audit_log(openproject_work_package_id,event,actor_discord_id,metadata) VALUES($1,'reconciled',$2,$3)",
+					[workPackageId, actorId, { draftId: id }],
+				);
+			}
+			await client.query("COMMIT");
+		} catch (error) {
+			await client.query("ROLLBACK");
+			throw error;
+		} finally {
+			client.release();
+		}
 	}
 
 	async cleanup(config: IntegrationConfig) {
