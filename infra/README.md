@@ -211,6 +211,11 @@ The bot requires its dedicated user-assigned managed identity with:
 - read access to its Key Vault secrets;
 - PostgreSQL connection access as configured by the database authentication mode.
 
+Production alerting uses the `TrackTheHack-Alerts` action group
+(`development@ctn-rtc.org`) and currently includes restart and zero-replica
+metric alerts for both `track-the-hack` and `track-the-hack-bot`. Keep these
+alerts enabled when changing revision scaling or names.
+
 The web image has separate `runtime` and `migration` targets. Runtime startup
 must not run Prisma migrations. Before updating the web revision, configure and
 run the dedicated Container Apps migration job with
