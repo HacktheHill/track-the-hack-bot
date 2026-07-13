@@ -1,6 +1,7 @@
 # Track the Hack Bot
 
-Track the Hack Bot is a Discord bot designed to automatically assign roles to verified hackers on the Hack the Hill server. It integrates seamlessly with the Track the Hack event management platform to streamline and secure the verification process for participants.
+Track the Hack Bot verifies hackers, synchronizes organizer roles, and provides
+the Hack the Hill Discord-to-OpenProject task workflow.
 
 ## Installation
 
@@ -29,8 +30,8 @@ Track the Hack Bot is a Discord bot designed to automatically assign roles to ve
    COMMUNITY_GUILD_ORGANIZER_ROLE_ID=
    ORGANIZER_GUILD_ORGANIZER_ROLE_ID=
    LOG_CHANNEL_ID=
-   SECRET_KEY=
    TRACK_THE_HACK_URL=
+   INTERNAL_API_SECRET=
    ```
 
    Copy `.env.example` for the OpenProject, PostgreSQL, role/project mapping,
@@ -44,7 +45,7 @@ Track the Hack Bot is a Discord bot designed to automatically assign roles to ve
    - `COMMUNITY_GUILD_ORGANIZER_ROLE_ID`: The ID of the role to be assigned to organizers in the Community server.
    - `ORGANIZER_GUILD_ORGANIZER_ROLE_ID`: The ID of the role that organizers have in the Organizer server.
    - `LOG_CHANNEL_ID`: The ID of the channel to log bot activity.
-   - `SECRET_KEY`: A secret key for verifying requests from the Track the Hack platform.
+   - `INTERNAL_API_SECRET`: Shared secret used for timestamped HMAC verification requests from Track the Hack.
    - `TRACK_THE_HACK_URL`: The URL of the Track the Hack platform.
    - `PORT`: The port number on which the bot's server should run (default: 4000).
 
@@ -64,13 +65,16 @@ Track the Hack Bot is a Discord bot designed to automatically assign roles to ve
 - **`/task create`**: Creates an OpenProject task for any Organizer-server member
   with the Members role. Description is optional; date fields offer upcoming-date
   autocomplete and also accept `YYYY-MM-DD`.
-- **`/task view|assign|reschedule|close|reopen`**: Performs the small set of
+
+- **`/task view|assign|reschedule|close|reopen|announce`**: Performs the small set of
   high-frequency task operations that should not require opening OpenProject.
 - **`/task link-user`** and **`/task configure-category`**: Organizer-only setup
   commands for persistent Discord user and category mappings.
 - **Message → Apps → Create OpenProject task**: Creates a task with an automatic backlink.
 - **Message → Apps → Draft OpenProject task with AI**: Produces an ephemeral,
   editable proposal in an explicitly allowlisted channel before creating anything.
+- **`/task reconcile`**: Organizer-only recovery command for an ambiguous
+  OpenProject create request after the created task has been checked.
 
 ### OpenProject task integration
 
@@ -112,8 +116,8 @@ production target is Azure Container Apps with PostgreSQL Flexible Server; the
 Compose file is for local development and smoke testing only. The bot exposes
 `/healthz` for liveness and `/readyz` for readiness. The Track the Hack app
 should call `/verify` over private HTTPS using `x-track-the-hack-timestamp` and
-`x-track-the-hack-signature` (HMAC-SHA256 over `timestamp.body`). The legacy
-`secretKey` body is retained temporarily for cutover compatibility.
+`x-track-the-hack-signature` (HMAC-SHA256 over `timestamp.body`). Requests
+without a valid timestamped signature are rejected.
 
 ### Synchronization
 

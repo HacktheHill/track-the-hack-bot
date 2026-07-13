@@ -26,10 +26,8 @@ const {
 	COMMUNITY_GUILD_HACKER_ROLE_ID,
 	COMMUNITY_GUILD_ORGANIZER_ROLE_ID,
 	LOG_CHANNEL_ID,
-	SECRET_KEY,
 	TRACK_THE_HACK_URL,
 	INTERNAL_API_SECRET,
-	ALLOW_LEGACY_API_SECRET = "false",
 } = process.env;
 
 if (
@@ -37,7 +35,7 @@ if (
 	!COMMUNITY_GUILD_HACKER_ROLE_ID ||
 	!COMMUNITY_GUILD_ORGANIZER_ROLE_ID ||
 	!LOG_CHANNEL_ID ||
-	!SECRET_KEY ||
+	!INTERNAL_API_SECRET ||
 	!TRACK_THE_HACK_URL
 ) {
 	console.error("Missing environment variables for verification");
@@ -78,10 +76,10 @@ const log = async (client: Client, member: GuildMember) => {
 };
 
 app.post("/verify", async (req: Request, res: Response) => {
-	const { discordId, secretKey } = req.body;
+	const { discordId } = req.body;
 	const requestTimestamp = req.header("x-track-the-hack-timestamp");
 	const requestSignature = req.header("x-track-the-hack-signature");
-	const sharedSecret = INTERNAL_API_SECRET || SECRET_KEY;
+	const sharedSecret = INTERNAL_API_SECRET;
 	const timestamp = Number(requestTimestamp);
 	const rawBody = JSON.stringify(req.body);
 	const signedPayload = `${requestTimestamp ?? ""}.${rawBody}`;
@@ -98,11 +96,8 @@ app.post("/verify", async (req: Request, res: Response) => {
 	);
 	const timestampValid = Number.isFinite(timestamp) && Math.abs(Date.now() - timestamp * 1000) <= 300_000;
 
-	// Keep the legacy body secret during migration. The app should switch to the
-	// timestamped HMAC headers before the old form is removed.
-	const legacyAllowed = ALLOW_LEGACY_API_SECRET.toLowerCase() === "true";
-	if (!signatureValid && !(legacyAllowed && secretKey && secretKey === SECRET_KEY)) {
-		return res.status(403).json({ error: "Invalid secret key" });
+	if (!signatureValid) {
+		return res.status(403).json({ error: "Invalid request signature" });
 	}
 	if (requestSignature && !timestampValid) {
 		return res.status(401).json({ error: "Expired request" });

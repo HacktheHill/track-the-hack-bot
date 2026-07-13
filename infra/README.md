@@ -34,17 +34,6 @@ should expose it to the pinned `cloudflare/cloudflared:2026.7.1` image as
 app needs no ingress, one minimum replica, and access to the same VNet-integrated
 Container Apps environment as `track-the-hack`.
 
-Only after the new connector reports healthy should the maintenance window
-begin. Change the route, verify the hostname through Cloudflare Access, then set
-the repository variable `AZURE_MIGRATION_ACTIVE=true`. The variable is
-intentionally `false` until that controlled cutover; this preserves the VM
-deployment as an immediate rollback.
-
-Keep the GitHub repository variable `AZURE_MIGRATION_ACTIVE` set to `false` (or
-unset) while preparing the new environment. Set it to `true` only after both
-Container Apps pass validation. This disables VM deployment on new pushes and
-enables the ACA deployment workflow; the old VM remains available for rollback.
-
 ## Required existing values
 
 ```bash
@@ -92,14 +81,13 @@ az containerapp env create \
   --logs-workspace-id "<workspace-id>" \
   --logs-workspace-key "<workspace-key>"
 
-Create one RBAC-enabled vault and one user-assigned managed identity per
-workload. Production currently uses separate bot, web, Prisma Studio, tunnel,
-and migration vaults/identities. Grant each identity `Key Vault Secrets User`
-only on its own vault; do not grant workload identities access to the legacy
-shared vault.
+Create one RBAC-enabled vault and managed identity only where a workload needs
+one. Production uses dedicated secrets for the bot, web application, Prisma
+Studio, and tunnel. Grant each identity `Key Vault Secrets User` only on its
+own vault.
 
 ```bash
-for workload in bot web prisma tunnel migrate; do
+for workload in bot web prisma tunnel; do
   az identity create --resource-group "$RG" --name "track-the-hack-${workload}"
   az keyvault create \
     --resource-group "$RG" \
@@ -111,18 +99,9 @@ done
 
 ## Managed databases
 
-Create the managed databases first, but do not cut production traffic over to
-an empty Track the Hack schema. The VM database contains production user,
-hacker, verification, and audit data. Stop the VM web process for the final
-dump, import it into managed MySQL, compare exact per-table row counts, and only
-then change the Cloudflare origin. The executable
-`infra/migrate-track-the-hack-mysql.sh` performs those steps, restarts the old
-web process automatically on failure, and intentionally leaves it stopped after
-success to prevent split-brain writes. It prompts for the managed MySQL password
-without echoing it, or accepts a mode-600 `DESTINATION_PASSWORD_FILE` for an
-automated maintenance window. The script downloads Azure MySQL's public DigiCert
-root CA only for the run and uses hostname-verified TLS for every destination
-connection.
+Production data is in managed MySQL and PostgreSQL Flexible Server instances.
+Their public network access is disabled; retain the VNet peerings and private
+DNS zones that resolve their current private hostnames.
 
 ```bash
 az mysql flexible-server create \
@@ -155,14 +134,7 @@ after authentication before provisioning.
 Use distinct MySQL principals:
 
 - `track_the_hack_app`: runtime DML only; no DDL or grant permissions;
-- `track_the_hack_migrator`: schema migration permissions on the application
-  database only, stored only in the migration vault;
 - `track_the_hack_prisma`: read-only (`SELECT`) for Prisma Studio.
-
-`infra/provision-mysql-users.mjs` creates and verifies these grants over
-hostname-verified TLS. The runtime container must never receive the migrator or
-administrator URL. Rotate the server administrator password after provisioning
-and migration, then securely remove temporary credential files.
 
 ## Container Apps
 
@@ -199,10 +171,9 @@ az containerapp create \
 
 Configure secrets through Key Vault references or Container Apps secret
 bindings. Set `DISCORD_BOT_URL` in the web app to the bot's internal HTTPS
-address and set `INTERNAL_API_SECRET` in both apps. Legacy body-secret
-authentication is disabled by default; enable `ALLOW_LEGACY_API_SECRET=true`
-only for a bounded migration window, then explicitly remove it or set it to
-`false` after signed requests are verified.
+address and set `INTERNAL_API_SECRET` in both apps. The bot accepts only a
+timestamped HMAC request (`x-track-the-hack-timestamp` and
+`x-track-the-hack-signature`) from the web app.
 
 The bot requires its dedicated user-assigned managed identity with:
 
@@ -216,13 +187,10 @@ Production alerting uses the `TrackTheHack-Alerts` action group
 metric alerts for both `track-the-hack` and `track-the-hack-bot`. Keep these
 alerts enabled when changing revision scaling or names.
 
-The web image has separate `runtime` and `migration` targets. Runtime startup
-must not run Prisma migrations. Before updating the web revision, configure and
-run the dedicated Container Apps migration job with
-`track-the-hack/infra/configure-migration-job.sh`; the job alone receives the
-migrator identity and URL. Only deploy the runtime revision after the job exits
-successfully. Configure `/api/healthz` as liveness and `/api/readyz` as readiness
-with `track-the-hack/infra/configure-health-probes.sh`.
+Runtime startup must not make schema changes. Plan and review any future
+database migration as a separate, temporary privileged operation rather than
+keeping a permanent migration workload or credential in production. Configure
+`/api/healthz` as liveness and `/api/readyz` as readiness.
 
 ## Azure task extraction
 
@@ -243,23 +211,14 @@ rate, assignee accuracy, deadline accuracy, token use, and estimated cost. Keep
 `OPENPROJECT_AUTOMATION_MODE=off` until that evaluation is complete, then use
 `shadow` before `review`. Automatic creation is not enabled.
 
-## Cutover and rollback
+## Release checks
 
-1. Deploy both apps with temporary validation URLs.
-2. Initialize fresh MySQL and PostgreSQL schemas.
-3. Test private app-to-bot HTTPS, Discord Gateway, OpenProject, health, and
-   readiness endpoints. Test Azure OpenAI if automation has been enabled.
-4. Start the dedicated ACA `cloudflared` replica with the existing remotely
-   managed tunnel token and confirm that the tunnel remains healthy.
-5. Stop the VM web process and run
-   `infra/migrate-track-the-hack-mysql.sh` on the VM. It takes a consistent
-   dump, recreates the managed schema, imports it, and compares every table.
-6. Change the Cloudflare published application's service URL to
-   `track-the-hack`, validate login and critical flows through Cloudflare
-   Access, then set `AZURE_MIGRATION_ACTIVE=true` in both repositories.
-7. Change web ingress to internal, update the tunnel service URL to the new
-   internal ACA hostname, and validate again.
-8. Keep the old VM deployment and database frozen for the agreed rollback window.
-9. Roll back Cloudflare routing if application or bot validation fails.
-10. After the window, remove the old PM2 processes, self-hosted runner, VM
-   database, and VM only after backups and logs are verified.
+1. Build a versioned image in `trackthehackacr` and deploy the corresponding
+   internal Container App revision.
+2. Verify the web app, bot `/healthz` and `/readyz`, Discord Gateway,
+   OpenProject, and the private web-to-bot HMAC call.
+3. Verify `tracker.hackthehill.com` and `prisma.hackthehill.com` through
+   Cloudflare Access. The remote tunnel ingress rules must set
+   `originRequest.httpHostHeader` to the relevant internal ACA FQDN.
+4. Keep the four Container Apps, managed databases, ACR, private DNS/VNet
+   dependencies, dedicated Key Vaults, and production alerts under monitoring.

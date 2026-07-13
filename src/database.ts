@@ -58,12 +58,6 @@ export class Database {
 				metadata JSONB NOT NULL DEFAULT '{}',
 				created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 			);
-			CREATE TABLE IF NOT EXISTS discord_channel_projects (
-				channel_id TEXT PRIMARY KEY,
-				openproject_project_id INTEGER NOT NULL,
-				updated_by_discord_id TEXT NOT NULL,
-				updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-			);
 			CREATE TABLE IF NOT EXISTS discord_category_projects (
 				category_id TEXT PRIMARY KEY,
 				openproject_project_id INTEGER NOT NULL,
@@ -86,6 +80,7 @@ export class Database {
 			);
 			CREATE INDEX IF NOT EXISTS task_drafts_lookup_idx ON task_drafts(user_id, kind, status, expires_at)
 		`);
+		await this.pool.query("DROP TABLE IF EXISTS discord_channel_projects");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS permitted_reviewer_ids TEXT[] NOT NULL DEFAULT '{}'");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS source_links TEXT[] NOT NULL DEFAULT '{}'");
 		await this.pool.query("ALTER TABLE task_audit_log ADD COLUMN IF NOT EXISTS openproject_work_package_id INTEGER");
