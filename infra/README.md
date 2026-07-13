@@ -224,72 +224,24 @@ migrator identity and URL. Only deploy the runtime revision after the job exits
 successfully. Configure `/api/healthz` as liveness and `/api/readyz` as readiness
 with `track-the-hack/infra/configure-health-probes.sh`.
 
-## Private local task extraction
+## Azure task extraction
 
-The bot uses a local Qwen3 4B GGUF model as its primary task extractor. The
-worker is a separate Docker container on the `track-the-hack` VM and is exposed
-on private address `10.0.0.4:8090` only. `infra/local-model.compose.yml` pins
-the official `llama.cpp` server image by digest, mounts a checksum-verified
-Qwen3 4B model read-only, requires a bearer token, unloads it after five idle
-minutes, limits the worker to 1.5 CPUs and 4 GiB, and allows one request at a
-time.
+The bot uses the `track-the-hack-ai` Azure OpenAI resource through its Container
+App managed identity. Configure `AZURE_OPENAI_ENDPOINT` and one deployment name,
+preferably `AZURE_OPENAI_MINI_DEPLOYMENT`. Do not configure an API key. The
+identity needs only the Cognitive Services OpenAI User role on that resource.
 
-Create the private NSG rule before starting the worker:
-
-```bash
-az network nsg rule create \
-  --resource-group TRACK-THE-HACK \
-  --nsg-name track-the-hack-nsg \
-  --name Allow-ACA-Local-Model \
-  --priority 310 \
-  --direction Inbound \
-  --access Allow \
-  --protocol Tcp \
-  --source-address-prefixes 10.0.4.0/23 \
-  --source-port-ranges '*' \
-  --destination-address-prefixes 10.0.0.4 \
-  --destination-port-ranges 8090
-
-az network nsg rule create \
-  --resource-group TRACK-THE-HACK \
-  --nsg-name track-the-hack-nsg \
-  --name Deny-VNet-Local-Model \
-  --priority 320 \
-  --direction Inbound \
-  --access Deny \
-  --protocol Tcp \
-  --source-address-prefixes VirtualNetwork \
-  --source-port-ranges '*' \
-  --destination-address-prefixes 10.0.0.4 \
-  --destination-port-ranges 8090
-```
-
-On the VM, download the model from its immutable Hugging Face revision and
-verify its SHA-256, create a mode-600 API-key file, and start the worker. Keep
-the same token in the bot's Key Vault-backed `LOCAL_MODEL_API_KEY` secret.
-
-```bash
-sudo MODEL_DIR=/opt/track-the-hack-local-model /path/to/infra/prepare-local-model.sh
-sudo install -d -m 0700 /etc/track-the-hack-local-model
-sudo openssl rand -hex 32 | sudo tee /etc/track-the-hack-local-model/api-key >/dev/null
-sudo chmod 0600 /etc/track-the-hack-local-model/api-key
-sudo LOCAL_MODEL_DIR=/opt/track-the-hack-local-model \
-  LOCAL_MODEL_API_KEY_FILE=/etc/track-the-hack-local-model/api-key \
-  docker compose -f /path/to/infra/local-model.compose.yml up -d
-curl --fail --header "Authorization: Bearer $(sudo cat /etc/track-the-hack-local-model/api-key)" \
-  http://10.0.0.4:8090/health
-```
-
-Set the bot's `LOCAL_MODEL_ENDPOINT` to
-`http://10.0.0.4:8090/v1`, keep `OPENPROJECT_AI_ESCALATION_MODE=ambiguous`
-until evaluation is complete, and leave `OPENPROJECT_AUTOMATION_MODE=off`.
-The bot only sends pseudonymized, non-sensitive ambiguous cases to Azure;
-sensitive cases remain local and require human review.
+The bot bounds and pseudonymizes context before inference. It removes common
+credentials and contact details, omits attachment contents, and rejects the
+entire extraction before requesting Azure when its deterministic sensitive-data
+filter matches. This is risk reduction rather than a guarantee; use manual task
+creation for sensitive discussions.
 
 Before enabling this in production, benchmark at least 100 representative
-conversation windows and record peak RSS, inference latency, swap use, valid
-JSON rate, false-task rate, assignee accuracy, deadline accuracy, and impact on
-the database and Discord services.
+conversation windows and record inference latency, valid JSON rate, false-task
+rate, assignee accuracy, deadline accuracy, token use, and estimated cost. Keep
+`OPENPROJECT_AUTOMATION_MODE=off` until that evaluation is complete, then use
+`shadow` before `review`. Automatic creation is not enabled.
 
 ## Cutover and rollback
 

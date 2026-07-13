@@ -95,11 +95,12 @@ without posting cards, then `review` to post human-review cards after each
 configured idle interval. Automatic task creation is intentionally unavailable
 until the shadow/review accuracy measurements justify adding that policy.
 
-The bot's managed identity needs only inference access to the configured Azure
-OpenAI resource. Prefer a Canadian regional deployment and restrict network
-access through a private endpoint. Keep automation off if no acceptable
-regional model is available unless Global Standard processing is explicitly
-approved.
+The bot uses Azure OpenAI through its managed identity. Conversation context is
+bounded and pseudonymized, and extraction is rejected before any Azure request
+when the deterministic sensitive-content filter matches. Prefer a Canadian
+regional deployment when available; Global Standard processing must be
+explicitly approved because inference can occur outside Canada. Keep automation
+off until the representative evaluation corpus meets the acceptance criteria.
 
 ### Container deployment
 
