@@ -11,14 +11,14 @@ const jsonRecord = <T>(name: string, fallback: T) => {
 };
 
 const envSchema = z.object({
-	OPENPROJECT_BASE_URL: z.string().url(),
+	OPENPROJECT_BASE_URL: z.url(),
 	OPENPROJECT_API_KEY: z.string().min(1),
 	DATABASE_URL: z.string().min(1),
 	ORGANIZER_GUILD_ID: z.string().min(1),
 	ORGANIZER_GUILD_MEMBER_ROLE_ID: z.string().min(1),
 	ORGANIZER_GUILD_ORGANIZER_ROLE_ID: z.string().min(1),
 	ORGANIZER_GUILD_EXECUTIVE_ROLE_ID: z.string().optional(),
-	AZURE_OPENAI_ENDPOINT: z.string().url().optional(),
+	AZURE_OPENAI_ENDPOINT: z.url().optional(),
 	AZURE_OPENAI_API_VERSION: z.string().default("v1"),
 	AZURE_OPENAI_DEPLOYMENT: z.string().optional(),
 	AZURE_OPENAI_MAX_COMPLETION_TOKENS: z.coerce.number().int().min(64).max(4096).default(1024),
