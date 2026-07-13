@@ -1,14 +1,14 @@
 services:
   local-task-model:
-    image: ghcr.io/ggml-org/llama.cpp:server
+    image: ghcr.io/ggml-org/llama.cpp@sha256:ae4883b4bf0814bfe44cb8b4cdc5208412f61599200fb8482a96935cdacc184e
     container_name: track-the-hack-local-task-model
     restart: unless-stopped
     init: true
     ports:
-      - "8090:8080"
+      - "10.0.0.4:8090:8080"
     command:
-      - "-hf"
-      - "Qwen/Qwen3-4B-GGUF:Q4_K_M"
+      - "--model"
+      - "/models/Qwen3-4B-Q4_K_M.gguf"
       - "--host"
       - "0.0.0.0"
       - "--port"
@@ -22,16 +22,25 @@ services:
       - "--reasoning"
       - "off"
       - "--metrics"
-    environment:
-      HOME: /models
-      HF_HOME: /models/huggingface
+      - "--sleep-idle-seconds"
+      - "300"
+      - "--api-key-file"
+      - "/run/secrets/local_model_api_key"
     volumes:
-      - local_model_cache:/models
+      - ${LOCAL_MODEL_DIR:?Set LOCAL_MODEL_DIR to the verified model directory}:/models:ro
+    secrets:
+      - local_model_api_key
     mem_limit: 4g
     cpus: 1.5
     pids_limit: 256
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
 
-volumes:
-  local_model_cache:
+secrets:
+  local_model_api_key:
+    file: ${LOCAL_MODEL_API_KEY_FILE:?Set LOCAL_MODEL_API_KEY_FILE to a root-readable secret file}

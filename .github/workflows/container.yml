@@ -1,44 +1,81 @@
-name: Build and publish bot image
+name: Build and deploy bot image
 
 on:
   push:
     branches: [main]
     tags: ['v*']
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
-  id-token: write
+
+concurrency:
+  group: bot-container-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  build:
-    if: vars.AZURE_MIGRATION_ACTIVE == 'true'
+  validate-image:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: azure/login@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.x
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          push: false
+          tags: track-the-hack-bot:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    if: github.event_name != 'pull_request' && vars.AZURE_MIGRATION_ACTIVE == 'true'
+    needs: validate-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: Production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: azure/login@1384c340ab2dda50fed2bee3041d1d87018aa5e8 # v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-      - uses: azure/docker-login@v2
-        with:
-          login-server: ${{ vars.AZURE_ACR_LOGIN_SERVER }}
-      - uses: docker/build-push-action@v6
+      - name: Log in to Azure Container Registry
+        env:
+          ACR_LOGIN_SERVER: ${{ vars.AZURE_ACR_LOGIN_SERVER }}
+        run: az acr login --name "${ACR_LOGIN_SERVER%%.*}"
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           push: true
-          tags: |
-            ${{ vars.AZURE_ACR_LOGIN_SERVER }}/track-the-hack-bot:${{ github.sha }}
-            ${{ vars.AZURE_ACR_LOGIN_SERVER }}/track-the-hack-bot:latest
+          tags: ${{ vars.AZURE_ACR_LOGIN_SERVER }}/track-the-hack-bot:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - uses: azure/cli@v2
+      - uses: azure/cli@d4515bc8e518874d3c814bf5c307a1cb08ec9b35 # v2
         if: github.ref == 'refs/heads/main'
         with:
           inlineScript: |
+            set -euo pipefail
             az containerapp update \
               --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-              --name "track-the-hack-bot" \
+              --name track-the-hack-bot \
               --image "${{ vars.AZURE_ACR_LOGIN_SERVER }}/track-the-hack-bot:${{ github.sha }}"
+            healthy="$(az containerapp revision list \
+              --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+              --name track-the-hack-bot \
+              --query "[?properties.active && properties.healthState == 'Healthy'] | length(@)" \
+              --output tsv)"
+            test "$healthy" -ge 1

@@ -5,6 +5,7 @@ type Collection<T> = { _embedded: { elements: T[] } };
 
 export type Project = { id: number; name: string; active: boolean; _links: Record<string, HalLink> };
 export type OpenProjectUser = { id: number; name: string; login?: string; status?: string };
+export type ProjectMembership = { id: number; _links: Record<string, HalLink> };
 export type WorkPackage = {
 	id: number;
 	subject: string;
@@ -13,6 +14,12 @@ export type WorkPackage = {
 	dueDate?: string | null;
 	_links: Record<string, HalLink>;
 };
+
+export class OpenProjectRequestError extends Error {
+	constructor(message: string, readonly ambiguous = false) {
+		super(message);
+	}
+}
 export type WorkPackageInput = {
 	projectId: number;
 	subject: string;
@@ -48,6 +55,7 @@ export function titlesLikelyDuplicate(left: string, right: string) {
 export class OpenProjectClient {
 	private readonly base: string;
 	private readonly authorization: string;
+	private readonly cache = new Map<string, { expiresAt: number; value: unknown }>();
 
 	constructor(private readonly config: IntegrationConfig) {
 		this.base = config.OPENPROJECT_BASE_URL.replace(/\/$/, "");
@@ -55,55 +63,102 @@ export class OpenProjectClient {
 	}
 
 	private async request<T>(path: string, init?: RequestInit): Promise<T> {
-		const response = await fetch(path.startsWith("http") ? path : `${this.base}${path}`, {
-			...init,
-			headers: {
-				Authorization: this.authorization,
-				Accept: "application/hal+json",
-				...(init?.body ? { "Content-Type": "application/json" } : {}),
-				...init?.headers,
-			},
-		});
-		if (!response.ok) {
-			const body = await response.text();
-			throw new Error(`OpenProject ${response.status}: ${body.slice(0, 500)}`);
+		const method = init?.method ?? "GET";
+		const attempts = method === "GET" ? 3 : 1;
+		for (let attempt = 0; attempt < attempts; attempt++) {
+			const controller = new AbortController();
+			const timeout = setTimeout(() => controller.abort(), method === "GET" ? 10000 : 30000);
+			try {
+				const response = await fetch(path.startsWith("http") ? path : `${this.base}${path}`, {
+					...init,
+					signal: controller.signal,
+					headers: {
+						Authorization: this.authorization,
+						Accept: "application/hal+json",
+						...(init?.body ? { "Content-Type": "application/json" } : {}),
+						...init?.headers,
+					},
+				});
+				if (!response.ok) {
+					const body = await response.text();
+					if (method === "GET" && response.status >= 500 && attempt + 1 < attempts) continue;
+					throw new OpenProjectRequestError(`OpenProject ${response.status}: ${body.slice(0, 500)}`);
+				}
+				return (await response.json()) as T;
+			} catch (error) {
+				if (error instanceof OpenProjectRequestError) throw error;
+				if (method === "GET" && attempt + 1 < attempts) continue;
+				throw new OpenProjectRequestError(
+					`OpenProject ${method} failed: ${(error as Error).message}`,
+					method !== "GET",
+				);
+			} finally {
+				clearTimeout(timeout);
+			}
 		}
-		return (await response.json()) as T;
+		throw new OpenProjectRequestError("OpenProject request failed.");
+	}
+
+	private async cached<T>(key: string, loader: () => Promise<T>) {
+		const cached = this.cache.get(key);
+		if (cached && cached.expiresAt > Date.now()) return cached.value as T;
+		const value = await loader();
+		this.cache.set(key, { value, expiresAt: Date.now() + this.config.OPENPROJECT_CACHE_TTL_MS });
+		return value;
+	}
+
+	invalidateCache() {
+		this.cache.clear();
 	}
 
 	async projects() {
-		const data = await this.request<Collection<Project>>("/api/v3/projects?pageSize=100");
-		return data._embedded.elements.filter(project => project.active);
+		return this.cached("projects", async () => {
+			const data = await this.request<Collection<Project>>("/api/v3/projects?pageSize=100");
+			return data._embedded.elements.filter(project => project.active);
+		});
 	}
 
 	async priorities() {
-		return (await this.request<Collection<{ id: number; name: string; isDefault: boolean }>>(
+		return this.cached("priorities", async () => (await this.request<Collection<{ id: number; name: string; isDefault: boolean }>>(
 			"/api/v3/priorities?pageSize=100",
-		))._embedded.elements;
+		))._embedded.elements);
 	}
 
 	async users() {
-		return (await this.request<Collection<OpenProjectUser>>(
+		return this.cached("users", async () => (await this.request<Collection<OpenProjectUser>>(
 			"/api/v3/users?filters=%5B%7B%22status%22%3A%7B%22operator%22%3A%22%3D%22%2C%22values%22%3A%5B%22active%22%5D%7D%7D%5D&pageSize=200",
-		))._embedded.elements;
+		))._embedded.elements);
+	}
+
+	async projectMemberships(projectId: number) {
+		return this.cached(`memberships:${projectId}`, async () => (await this.request<Collection<ProjectMembership>>(
+			`/api/v3/projects/${projectId}/memberships?pageSize=200`,
+		))._embedded.elements);
+	}
+
+	async isProjectMember(projectId: number, userId: number) {
+		const href = `/api/v3/users/${userId}`;
+		return (await this.projectMemberships(projectId)).some(member => member._links.principal?.href === href);
 	}
 
 	async types() {
-		return (await this.request<Collection<{ id: number; name: string }>>("/api/v3/types?pageSize=100"))._embedded.elements;
+		return this.cached("types", async () => (await this.request<Collection<{ id: number; name: string }>>("/api/v3/types?pageSize=100"))._embedded.elements);
 	}
 
 	async statuses() {
-		return (await this.request<Collection<{ id: number; name: string; isClosed: boolean; isDefault: boolean }>>(
+		return this.cached("statuses", async () => (await this.request<Collection<{ id: number; name: string; isClosed: boolean; isDefault: boolean }>>(
 			"/api/v3/statuses?pageSize=100",
-		))._embedded.elements;
+		))._embedded.elements);
 	}
 
 	async sizeOptions(projectId: number) {
+		return this.cached(`sizes:${projectId}`, async () => {
 		const form = await this.request<{ _embedded: { schema: Record<string, { _embedded?: { allowedValues?: Array<{ id: number; value: string }> } }> } }>(
 			`/api/v3/workspaces/${projectId}/work_packages/form`,
 			{ method: "POST", body: "{}" },
 		);
 		return form._embedded.schema[this.config.OPENPROJECT_SIZE_CUSTOM_FIELD]?._embedded?.allowedValues ?? [];
+		});
 	}
 
 	async createWorkPackage(input: WorkPackageInput) {
@@ -115,9 +170,8 @@ export class OpenProjectClient {
 			description: { format: "markdown", raw: `${input.description}${context}` },
 			_links: {
 				project: { href: `/api/v3/projects/${input.projectId}` },
-				type: { href: `/api/v3/types/${input.typeId ?? 1}` },
-				status: { href: "/api/v3/statuses/1" },
-				priority: { href: `/api/v3/priorities/${input.priorityId ?? 8}` },
+				...(input.typeId ? { type: { href: `/api/v3/types/${input.typeId}` } } : {}),
+				...(input.priorityId ? { priority: { href: `/api/v3/priorities/${input.priorityId}` } } : {}),
 				...(input.assigneeId ? { assignee: { href: `/api/v3/users/${input.assigneeId}` } } : {}),
 				...(input.accountableId ? { responsible: { href: `/api/v3/users/${input.accountableId}` } } : {}),
 			},
@@ -127,7 +181,7 @@ export class OpenProjectClient {
 			...(input.storyPoints !== undefined ? { storyPoints: input.storyPoints } : {}),
 			...(input.sizeHref ? { [this.config.OPENPROJECT_SIZE_CUSTOM_FIELD]: { href: input.sizeHref } } : {}),
 		};
-		const form = await this.request<{ _embedded: { validationErrors: Record<string, { message: string }> } }>(
+		const form = await this.request<{ _embedded: { validationErrors: Record<string, { message: string }>; payload?: Record<string, unknown> } }>(
 			`/api/v3/workspaces/${input.projectId}/work_packages/form`,
 			{ method: "POST", body: JSON.stringify(payload) },
 		);
@@ -135,7 +189,7 @@ export class OpenProjectClient {
 		if (errors.length) throw new Error(errors.join("; "));
 		return this.request<WorkPackage>(
 			`/api/v3/workspaces/${input.projectId}/work_packages`,
-			{ method: "POST", body: JSON.stringify(payload) },
+			{ method: "POST", body: JSON.stringify(form._embedded.payload ?? payload) },
 		);
 	}
 

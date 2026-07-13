@@ -23,7 +23,10 @@ test("minimizeText preserves ordinary task discussion", () => {
 const config = {
 	LOCAL_MODEL_ENDPOINT: "http://10.0.0.4:8090/v1",
 	LOCAL_MODEL_NAME: "qwen3-4b-q4_k_m",
+	LOCAL_MODEL_API_KEY: "a-local-model-secret-token",
 	LOCAL_MODEL_TIMEOUT_MS: 1000,
+	LOCAL_MODEL_MAX_TOKENS: 384,
+	OPENPROJECT_AI_MAX_CONTEXT_CHARS: 16000,
 	AZURE_OPENAI_ENDPOINT: "https://azure.example",
 	AZURE_OPENAI_NANO_DEPLOYMENT: "nano",
 	AZURE_OPENAI_MINI_DEPLOYMENT: undefined,
@@ -31,11 +34,11 @@ const config = {
 	OPENPROJECT_AI_ESCALATION_MODE: "ambiguous",
 };
 
-test("local extractor uses the private OpenAI-compatible endpoint", async () => {
+test("local extractor authenticates, bounds output, and uses the private endpoint", async () => {
 	const originalFetch = globalThis.fetch;
 	let request;
 	globalThis.fetch = async (url, init) => {
-		request = { url: String(url), body: JSON.parse(init.body) };
+		request = { url: String(url), headers: init.headers, body: JSON.parse(init.body) };
 		return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ summary: "", tasks: [], ambiguities: [] }) } }] }), { status: 200 });
 	};
 	try {
@@ -43,9 +46,39 @@ test("local extractor uses the private OpenAI-compatible endpoint", async () => 
 		await extractor.extract([{ id: "m1", authorAlias: "USER_1", text: "Ship it", timestamp: "2026-07-13T00:00:00Z" }]);
 		assert.equal(request.url, "http://10.0.0.4:8090/v1/chat/completions");
 		assert.equal(request.body.model, "qwen3-4b-q4_k_m");
+		assert.equal(request.body.max_tokens, 384);
+		assert.equal(request.headers.Authorization, "Bearer a-local-model-secret-token");
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
+});
+
+test("local extractor retries malformed structured output only once", async () => {
+	const originalFetch = globalThis.fetch;
+	let calls = 0;
+	globalThis.fetch = async () => {
+		calls += 1;
+		const content = calls === 1 ? "not-json" : JSON.stringify({ summary: "", tasks: [], ambiguities: [] });
+		return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
+	};
+	try {
+		await new LocalTaskExtractor(config).extract([
+			{ id: "m1", authorAlias: "USER_1", text: "Ship it", timestamp: "2026-07-13T00:00:00Z" },
+		]);
+		assert.equal(calls, 2);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("a redaction marker remains sensitive after deterministic minimization", () => {
+	const text = minimizeText("token=do-not-send-to-cloud");
+	assert.equal(containsSensitiveContent([
+		{ id: "m1", authorAlias: "USER_1", text, timestamp: "2026-07-13T00:00:00Z" },
+	]), true);
+	assert.equal(shouldEscalateToAzure([
+		{ id: "m1", authorAlias: "USER_1", text, timestamp: "2026-07-13T00:00:00Z" },
+	], config, false), false);
 });
 
 test("sensitive content never qualifies for Azure escalation", () => {

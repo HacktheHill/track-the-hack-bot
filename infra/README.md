@@ -92,11 +92,21 @@ az containerapp env create \
   --logs-workspace-id "<workspace-id>" \
   --logs-workspace-key "<workspace-key>"
 
-az keyvault create \
-  --resource-group "$RG" \
-  --name "<globally-unique-key-vault-name>" \
-  --location "$LOCATION" \
-  --enable-rbac-authorization true
+Create one RBAC-enabled vault and one user-assigned managed identity per
+workload. Production currently uses separate bot, web, Prisma Studio, tunnel,
+and migration vaults/identities. Grant each identity `Key Vault Secrets User`
+only on its own vault; do not grant workload identities access to the legacy
+shared vault.
+
+```bash
+for workload in bot web prisma tunnel migrate; do
+  az identity create --resource-group "$RG" --name "track-the-hack-${workload}"
+  az keyvault create \
+    --resource-group "$RG" \
+    --name "<globally-unique-${workload}-vault-name>" \
+    --location "$LOCATION" \
+    --enable-rbac-authorization true
+done
 ```
 
 ## Managed databases
@@ -142,6 +152,18 @@ Use separate MySQL and PostgreSQL subnets if the selected Azure region/provider
 requires separate delegation. Confirm the current CLI syntax with `az ... -h`
 after authentication before provisioning.
 
+Use distinct MySQL principals:
+
+- `track_the_hack_app`: runtime DML only; no DDL or grant permissions;
+- `track_the_hack_migrator`: schema migration permissions on the application
+  database only, stored only in the migration vault;
+- `track_the_hack_prisma`: read-only (`SELECT`) for Prisma Studio.
+
+`infra/provision-mysql-users.mjs` creates and verifies these grants over
+hostname-verified TLS. The runtime container must never receive the migrator or
+administrator URL. Rotate the server administrator password after provisioning
+and migration, then securely remove temporary credential files.
+
 ## Container Apps
 
 Build and publish the bot image using `.github/workflows/container.yml`. Build
@@ -156,7 +178,7 @@ az containerapp create \
   --registry-server "<acr>.azurecr.io" \
   --registry-identity system \
   --system-assigned \
-  --ingress external \
+  --ingress internal \
   --target-port 3000 \
   --min-replicas 1 \
   --max-replicas 2
@@ -177,25 +199,35 @@ az containerapp create \
 
 Configure secrets through Key Vault references or Container Apps secret
 bindings. Set `DISCORD_BOT_URL` in the web app to the bot's internal HTTPS
-address and set `INTERNAL_API_SECRET` in both apps. During cutover, keep
-`ALLOW_LEGACY_API_SECRET=true`; set it to `false` after the web app sends signed
-requests successfully.
+address and set `INTERNAL_API_SECRET` in both apps. Legacy body-secret
+authentication is disabled by default; enable `ALLOW_LEGACY_API_SECRET=true`
+only for a bounded migration window, then explicitly remove it or set it to
+`false` after signed requests are verified.
 
-The bot requires a system/user-assigned managed identity with:
+The bot requires its dedicated user-assigned managed identity with:
 
 - AcrPull on the registry;
 - inference permission on the Azure OpenAI resource;
 - read access to its Key Vault secrets;
 - PostgreSQL connection access as configured by the database authentication mode.
 
+The web image has separate `runtime` and `migration` targets. Runtime startup
+must not run Prisma migrations. Before updating the web revision, configure and
+run the dedicated Container Apps migration job with
+`track-the-hack/infra/configure-migration-job.sh`; the job alone receives the
+migrator identity and URL. Only deploy the runtime revision after the job exits
+successfully. Configure `/api/healthz` as liveness and `/api/readyz` as readiness
+with `track-the-hack/infra/configure-health-probes.sh`.
+
 ## Private local task extraction
 
 The bot uses a local Qwen3 4B GGUF model as its primary task extractor. The
 worker is a separate Docker container on the `track-the-hack` VM and is exposed
 on private address `10.0.0.4:8090` only. `infra/local-model.compose.yml` pins
-the official `llama.cpp` server image, downloads `Qwen/Qwen3-4B-GGUF:Q4_K_M`
-into a persistent model cache, limits the worker to 1.5 CPUs and 4 GiB, and
-allows one request at a time.
+the official `llama.cpp` server image by digest, mounts a checksum-verified
+Qwen3 4B model read-only, requires a bearer token, unloads it after five idle
+minutes, limits the worker to 1.5 CPUs and 4 GiB, and allows one request at a
+time.
 
 Create the private NSG rule before starting the worker:
 
@@ -212,13 +244,35 @@ az network nsg rule create \
   --source-port-ranges '*' \
   --destination-address-prefixes 10.0.0.4 \
   --destination-port-ranges 8090
+
+az network nsg rule create \
+  --resource-group TRACK-THE-HACK \
+  --nsg-name track-the-hack-nsg \
+  --name Deny-VNet-Local-Model \
+  --priority 320 \
+  --direction Inbound \
+  --access Deny \
+  --protocol Tcp \
+  --source-address-prefixes VirtualNetwork \
+  --source-port-ranges '*' \
+  --destination-address-prefixes 10.0.0.4 \
+  --destination-port-ranges 8090
 ```
 
-On the VM, start the worker with Docker Compose:
+On the VM, download the model from its immutable Hugging Face revision and
+verify its SHA-256, create a mode-600 API-key file, and start the worker. Keep
+the same token in the bot's Key Vault-backed `LOCAL_MODEL_API_KEY` secret.
 
 ```bash
-docker compose -f /path/to/infra/local-model.compose.yml up -d
-curl --fail http://127.0.0.1:8090/health
+sudo MODEL_DIR=/opt/track-the-hack-local-model /path/to/infra/prepare-local-model.sh
+sudo install -d -m 0700 /etc/track-the-hack-local-model
+sudo openssl rand -hex 32 | sudo tee /etc/track-the-hack-local-model/api-key >/dev/null
+sudo chmod 0600 /etc/track-the-hack-local-model/api-key
+sudo LOCAL_MODEL_DIR=/opt/track-the-hack-local-model \
+  LOCAL_MODEL_API_KEY_FILE=/etc/track-the-hack-local-model/api-key \
+  docker compose -f /path/to/infra/local-model.compose.yml up -d
+curl --fail --header "Authorization: Bearer $(sudo cat /etc/track-the-hack-local-model/api-key)" \
+  http://10.0.0.4:8090/health
 ```
 
 Set the bot's `LOCAL_MODEL_ENDPOINT` to

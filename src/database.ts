@@ -29,6 +29,7 @@ export class Database {
 				accountable_discord_id TEXT,
 				due_date DATE,
 				source_message_ids TEXT[] NOT NULL DEFAULT '{}',
+				source_links TEXT[] NOT NULL DEFAULT '{}',
 				source_fingerprint TEXT UNIQUE,
 				classification TEXT,
 				status TEXT NOT NULL DEFAULT 'draft',
@@ -37,6 +38,14 @@ export class Database {
 				model_deployment TEXT,
 				permitted_reviewer_ids TEXT[] NOT NULL DEFAULT '{}',
 				validation_result JSONB,
+				evidence TEXT,
+				ambiguities TEXT[] NOT NULL DEFAULT '{}',
+				latency_ms INTEGER,
+				token_usage JSONB,
+				escalation_reason TEXT,
+				confirmation_message_id TEXT,
+				error TEXT,
+				expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '30 days'),
 				created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 				updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 			);
@@ -54,10 +63,34 @@ export class Database {
 				openproject_project_id INTEGER NOT NULL,
 				updated_by_discord_id TEXT NOT NULL,
 				updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-			)
+			);
+			CREATE TABLE IF NOT EXISTS task_drafts (
+				id UUID PRIMARY KEY,
+				kind TEXT NOT NULL,
+				user_id TEXT NOT NULL,
+				channel_id TEXT NOT NULL,
+				payload JSONB NOT NULL,
+				status TEXT NOT NULL DEFAULT 'pending',
+				openproject_work_package_id INTEGER,
+				claimed_by TEXT,
+				error TEXT,
+				expires_at TIMESTAMPTZ NOT NULL,
+				created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+				updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+			);
+			CREATE INDEX IF NOT EXISTS task_drafts_lookup_idx ON task_drafts(user_id, kind, status, expires_at)
 		`);
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS permitted_reviewer_ids TEXT[] NOT NULL DEFAULT '{}'");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS source_links TEXT[] NOT NULL DEFAULT '{}'");
 		await this.pool.query("ALTER TABLE task_audit_log ADD COLUMN IF NOT EXISTS openproject_work_package_id INTEGER");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS evidence TEXT");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS ambiguities TEXT[] NOT NULL DEFAULT '{}'");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS latency_ms INTEGER");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS token_usage JSONB");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS escalation_reason TEXT");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS confirmation_message_id TEXT");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS error TEXT");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '30 days')");
 		for (const [discordId, openProjectId] of Object.entries(config.userMap)) {
 			await this.pool.query(
 				`INSERT INTO discord_openproject_users(discord_user_id, openproject_user_id)
@@ -103,6 +136,61 @@ export class Database {
 		);
 	}
 
+	async createDraft<T>(kind: string, userId: string, channelId: string, payload: T, ttlMinutes = 15) {
+		const id = randomUUID();
+		await this.pool.query(
+			`INSERT INTO task_drafts(id,kind,user_id,channel_id,payload,expires_at)
+			 VALUES($1,$2,$3,$4,$5,now() + ($6::text || ' minutes')::interval)`,
+			[id, kind, userId, channelId, payload, ttlMinutes],
+		);
+		return id;
+	}
+
+	async draft<T>(id: string, userId: string, kind: string) {
+		const result = await this.pool.query<{ payload: T; expires_at: string; status: string }>(
+			"SELECT payload, expires_at, status FROM task_drafts WHERE id=$1 AND user_id=$2 AND kind=$3",
+			[id, userId, kind],
+		);
+		const row = result.rows[0];
+		if (!row || row.status !== "pending" || new Date(row.expires_at).getTime() <= Date.now()) {
+			if (row) await this.pool.query("DELETE FROM task_drafts WHERE id=$1", [id]);
+			throw new Error("This task draft expired or is already being handled. Start the workflow again.");
+		}
+		return row.payload;
+	}
+
+	async updateDraft<T>(id: string, userId: string, kind: string, payload: T) {
+		const result = await this.pool.query(
+			"UPDATE task_drafts SET payload=$4, updated_at=now() WHERE id=$1 AND user_id=$2 AND kind=$3 AND status='pending' AND expires_at > now()",
+			[id, userId, kind, payload],
+		);
+		if (result.rowCount !== 1) throw new Error("This task draft expired or is already being handled.");
+	}
+
+	async claimDraft(id: string, userId: string, kind: string) {
+		const result = await this.pool.query(
+			`UPDATE task_drafts SET status='creating', claimed_by=$4, updated_at=now()
+			 WHERE id=$1 AND user_id=$2 AND kind=$3 AND status='pending' AND expires_at > now()
+			 RETURNING id`,
+			[id, userId, kind, userId],
+		);
+		return result.rowCount === 1;
+	}
+
+	async completeDraft(id: string, workPackageId: number) {
+		await this.pool.query(
+			"UPDATE task_drafts SET status='created', openproject_work_package_id=$2, updated_at=now() WHERE id=$1 AND status='creating'",
+			[id, workPackageId],
+		);
+	}
+
+	async failDraft(id: string, error: string, status: "failed" | "needs_reconciliation" = "failed") {
+		await this.pool.query(
+			"UPDATE task_drafts SET status=$2, error=$3, updated_at=now() WHERE id=$1 AND status='creating'",
+			[id, status, error.slice(0, 1000)],
+		);
+	}
+
 	async createProposal(input: {
 		requesterId?: string;
 		channelId: string;
@@ -112,26 +200,55 @@ export class Database {
 		assigneeDiscordId?: string;
 		dueDate?: string;
 		sourceMessageIds: string[];
+		sourceLinks?: string[];
 		classification: string;
 		modelDeployment: string;
 		permittedReviewerIds?: string[];
+		evidence?: string;
+		ambiguities?: string[];
+		latencyMs?: number;
+		tokenUsage?: Record<string, number | undefined>;
+		escalationReason?: string;
+		retentionDays?: number;
 	}) {
 		const id = randomUUID();
 		const fingerprint = [...input.sourceMessageIds].sort().join(":") + `:${input.title.toLowerCase()}`;
 		const result = await this.pool.query<{ id: string }>(
 			`INSERT INTO task_proposals
 			(id, requester_discord_id, channel_id, project_id, title, description,
-			 assignee_discord_id, due_date, source_message_ids, source_fingerprint,
-			 classification, status, model_deployment, permitted_reviewer_ids)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending_review',$12,$13)
-			ON CONFLICT(source_fingerprint) DO UPDATE SET updated_at=now()
+			 assignee_discord_id, due_date, source_message_ids, source_fingerprint, source_links,
+			 classification, status, model_deployment, permitted_reviewer_ids,
+			 evidence, ambiguities, latency_ms, token_usage, escalation_reason, expires_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending_review',$13,$14,$15,$16,$17,$18,$19,
+			 now() + ($20::text || ' days')::interval)
+			ON CONFLICT(source_fingerprint) DO UPDATE SET
+			 requester_discord_id=excluded.requester_discord_id, channel_id=excluded.channel_id,
+			 project_id=excluded.project_id, title=excluded.title, description=excluded.description,
+			 assignee_discord_id=excluded.assignee_discord_id, due_date=excluded.due_date,
+				 source_message_ids=excluded.source_message_ids, source_links=excluded.source_links, classification=excluded.classification,
+			 status='pending_review', model_deployment=excluded.model_deployment,
+			 permitted_reviewer_ids=excluded.permitted_reviewer_ids, evidence=excluded.evidence,
+			 ambiguities=excluded.ambiguities, latency_ms=excluded.latency_ms,
+			 token_usage=excluded.token_usage, escalation_reason=excluded.escalation_reason,
+			 reviewer_discord_id=NULL, openproject_work_package_id=NULL,
+				 confirmation_message_id=NULL, error=NULL, expires_at=excluded.expires_at, updated_at=now()
+			WHERE task_proposals.status IN ('dismissed','duplicate','failed')
 			RETURNING id`,
 			[id, input.requesterId, input.channelId, input.projectId ?? null, input.title,
 			 input.description, input.assigneeDiscordId ?? null, input.dueDate ?? null,
-			 input.sourceMessageIds, fingerprint, input.classification, input.modelDeployment,
-			 input.permittedReviewerIds ?? (input.requesterId ? [input.requesterId] : [])],
+			 input.sourceMessageIds, fingerprint, input.sourceLinks ?? [], input.classification, input.modelDeployment,
+				input.permittedReviewerIds ?? (input.requesterId ? [input.requesterId] : []),
+				input.evidence ?? null, input.ambiguities ?? [], input.latencyMs ?? null,
+				input.tokenUsage ?? null, input.escalationReason ?? null,
+				input.retentionDays ?? 30],
 		);
-		return result.rows[0].id;
+		if (result.rows[0]) return { id: result.rows[0].id, reused: false };
+		const existing = await this.pool.query<{ id: string }>(
+			"SELECT id FROM task_proposals WHERE source_fingerprint=$1",
+			[fingerprint],
+		);
+		if (!existing.rows[0]) throw new Error("Proposal idempotency conflict could not be reconciled.");
+		return { id: existing.rows[0].id, reused: true };
 	}
 
 	async proposal(id: string) {
@@ -139,27 +256,66 @@ export class Database {
 			id: string; requester_discord_id: string | null; channel_id: string;
 			project_id: number | null; title: string; description: string;
 			assignee_discord_id: string | null; due_date: string | null;
-			source_message_ids: string[]; status: string; permitted_reviewer_ids: string[];
+			 source_message_ids: string[]; source_links: string[]; status: string; permitted_reviewer_ids: string[];
+			 expires_at: string; openproject_work_package_id: number | null;
 		}>("SELECT * FROM task_proposals WHERE id=$1", [id]);
 		return result.rows[0];
 	}
 
 	async setProposalStatus(id: string, status: string, reviewerId: string) {
-		await this.pool.query(
-			"UPDATE task_proposals SET status=$2, reviewer_discord_id=$3, updated_at=now() WHERE id=$1",
+		const result = await this.pool.query(
+			"UPDATE task_proposals SET status=$2, reviewer_discord_id=$3, updated_at=now() WHERE id=$1 AND status='pending_review' AND expires_at > now()",
 			[id, status, reviewerId],
 		);
+		return result.rowCount === 1;
 	}
 
-	async markProposalCreated(id: string, reviewerId: string, workPackageId: number) {
+	async claimProposal(id: string, reviewerId: string) {
+		const result = await this.pool.query(
+			`UPDATE task_proposals SET status='creating', reviewer_discord_id=$2, updated_at=now()
+			 WHERE id=$1 AND status='pending_review' AND expires_at > now() RETURNING id`,
+			[id, reviewerId],
+		);
+		return result.rowCount === 1;
+	}
+
+	async markProposalCreated(id: string, reviewerId: string, workPackageId: number, confirmationMessageId?: string) {
 		await this.pool.query(
 			`UPDATE task_proposals SET status='created', reviewer_discord_id=$2,
-			 openproject_work_package_id=$3, updated_at=now() WHERE id=$1`,
-			[id, reviewerId, workPackageId],
+				 openproject_work_package_id=$3, confirmation_message_id=$4, error=NULL, updated_at=now() WHERE id=$1 AND status='creating'`,
+			[id, reviewerId, workPackageId, confirmationMessageId ?? null],
 		);
 		await this.pool.query(
 			"INSERT INTO task_audit_log(proposal_id,event,actor_discord_id,metadata) VALUES($1,'created',$2,$3)",
 			[id, reviewerId, { workPackageId }],
+		);
+	}
+
+	async markProposalFailed(id: string, status: "failed" | "needs_reconciliation", reviewerId: string, error: string) {
+		await this.pool.query(
+			"UPDATE task_proposals SET status=$2, reviewer_discord_id=$3, error=$4, updated_at=now() WHERE id=$1 AND status='creating'",
+			[id, status, reviewerId, error.slice(0, 1000)],
+		);
+	}
+
+	async cleanup(config: IntegrationConfig) {
+		await this.pool.query(
+			`DELETE FROM task_proposals WHERE openproject_work_package_id IS NULL
+			 AND status <> 'needs_reconciliation'
+			 AND (expires_at < now() OR (
+				 status IN ('dismissed','duplicate','failed')
+				 AND updated_at < now() - ($1::text || ' days')::interval
+			 ))`,
+			[config.OPENPROJECT_PROPOSAL_RETENTION_DAYS],
+		);
+		await this.pool.query(
+			`DELETE FROM task_drafts WHERE status IN ('created','failed')
+			 AND updated_at < now() - ($1::text || ' days')::interval`,
+			[config.OPENPROJECT_PROPOSAL_RETENTION_DAYS],
+		);
+		await this.pool.query(
+			`DELETE FROM task_audit_log WHERE created_at < now() - ($1::text || ' days')::interval`,
+			[config.OPENPROJECT_AUDIT_RETENTION_DAYS],
 		);
 	}
 

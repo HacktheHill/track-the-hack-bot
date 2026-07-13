@@ -10,7 +10,7 @@ import {
 import express, { Request, Response } from "express";
 import bodyParser from "body-parser";
 import { config } from "dotenv";
-import { getClient } from "./bot.js";
+import { getClient, isIntegrationReady } from "./bot.js";
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 config();
@@ -29,7 +29,7 @@ const {
 	SECRET_KEY,
 	TRACK_THE_HACK_URL,
 	INTERNAL_API_SECRET,
-	ALLOW_LEGACY_API_SECRET = "true",
+	ALLOW_LEGACY_API_SECRET = "false",
 } = process.env;
 
 if (
@@ -134,7 +134,7 @@ app.get("/healthz", (_req, res) => {
 });
 
 app.get("/readyz", (_req, res) => {
-	if (!getClient().isReady()) {
+	if (!getClient().isReady() || !isIntegrationReady()) {
 		return res.status(503).json({ status: "not_ready" });
 	}
 	return res.json({ status: "ready" });

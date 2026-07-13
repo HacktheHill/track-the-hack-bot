@@ -46,7 +46,10 @@ if (
 	process.exit(1);
 }
 
-client.once("ready", async () => {
+let integrationDb: Database | undefined;
+let integrationReady = false;
+
+client.once("clientReady", async () => {
 	console.log(`Logged in as ${client.user?.tag ?? "Unknown"}`);
 
 	registerHelpCommand(client);
@@ -58,7 +61,9 @@ client.once("ready", async () => {
 	const integrationConfig = loadIntegrationConfig();
 	if (integrationConfig) {
 		const db = new Database(integrationConfig.DATABASE_URL);
+		integrationDb = db;
 		await db.migrate(integrationConfig);
+		await db.cleanup(integrationConfig);
 		const services = {
 			config: integrationConfig,
 			db,
@@ -67,14 +72,32 @@ client.once("ready", async () => {
 		};
 		registerTaskInteractions(client, services);
 		registerAutomaticTaskDetection(client, services);
+		integrationReady = true;
+		setInterval(() => void db.cleanup(integrationConfig).catch(error => console.error("Proposal cleanup failed", error)), 24 * 60 * 60 * 1000).unref();
 		console.log("OpenProject task integration enabled");
 	} else {
 		console.warn("OpenProject task integration disabled: required configuration is missing");
+		integrationReady = true;
 	}
 });
+
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+	process.once(signal, () => {
+		void (async () => {
+			integrationReady = false;
+			client.destroy();
+			await integrationDb?.close();
+			process.exit(0);
+		})();
+	});
+}
 
 client.login(DISCORD_TOKEN);
 
 export function getClient() {
 	return client;
+}
+
+export function isIntegrationReady() {
+	return integrationReady;
 }

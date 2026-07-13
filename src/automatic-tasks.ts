@@ -1,5 +1,5 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, Message } from "discord.js";
-import { minimizeText, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
+import { containsSensitiveContent, minimizeText, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 import type { IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient } from "./openproject.js";
@@ -27,40 +27,53 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			}
 			return alias;
 		};
-		const minimized: MinimizedMessage[] = source.map(message => ({
-			id: message.id,
-			authorAlias: aliasFor(message.author.id),
-			text: minimizeText(message.content.replace(/<@!?(\d+)>/g, (_, id: string) => aliasFor(id))),
-			timestamp: message.createdAt.toISOString(),
-			replyTo: message.reference?.messageId,
-		}));
+		const minimized: MinimizedMessage[] = source.map(message => {
+			const raw = message.content.replace(/<@!?(\d+)>/g, (_, id: string) => aliasFor(id));
+			return {
+				id: message.id,
+				channelId: message.channelId,
+				authorAlias: aliasFor(message.author.id),
+				text: minimizeText(raw),
+				timestamp: message.createdAt.toISOString(),
+				replyTo: message.reference?.messageId,
+				containedSensitiveData: containsSensitiveContent([{ id: message.id, authorAlias: "", text: raw, timestamp: "" }]),
+			};
+		});
 		try {
-			const { result, deployment } = await services.extractor.extract(minimized);
+			const extraction = await services.extractor.extract(minimized);
+			const { result, deployment } = extraction;
 			for (const task of result.tasks.filter(item => item.classification === "explicit_commitment" || item.classification === "direct_assignment")) {
 				if (!task.source_message_ids.every(id => source.some(message => message.id === id))) continue;
 				const assigneeId = task.assignee_alias ? reverse.get(task.assignee_alias) : undefined;
 				const projectId = await services.db.channelProject(channelId) ?? services.config.channelProjects[channelId];
 				if (projectId && await services.openProject.possibleDuplicate(projectId, task.title)) continue;
-				const reviewers = new Set<string>(source.map(message => message.author.id));
+				const citedIds = new Set(task.source_message_ids);
+				const reviewers = new Set<string>(source.filter(message => citedIds.has(message.id)).map(message => message.author.id));
 				if (assigneeId) reviewers.add(assigneeId);
 				for (const reviewer of [...reviewers]) {
 					if (!await services.db.openProjectUserId(reviewer)) reviewers.delete(reviewer);
 				}
-				const proposalId = await services.db.createProposal({
+				const proposal = await services.db.createProposal({
 					channelId, projectId, title: task.title,
 					description: task.description, assigneeDiscordId: assigneeId,
-					dueDate: task.due_date ?? undefined, sourceMessageIds: task.source_message_ids,
+						dueDate: task.due_date ?? undefined, sourceMessageIds: task.source_message_ids,
+						sourceLinks: task.source_message_ids.map(id => `https://discord.com/channels/${source[0]?.guildId ?? ""}/${source.find(item => item.id === id)?.channelId ?? channelId}/${id}`),
 					classification: task.classification, modelDeployment: deployment,
 					permittedReviewerIds: [...reviewers],
+					evidence: task.evidence, ambiguities: result.ambiguities,
+					latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+					escalationReason: extraction.escalationReason,
+					retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS,
 				});
+				if (proposal.reused) continue;
 				if (services.config.OPENPROJECT_AUTOMATION_MODE === "review") {
 					const channel = source.at(-1)?.channel;
 					if (channel?.isSendable()) {
 						await channel.send({
 							content: `Proposed OpenProject task: **${task.title}**\n${task.description}`,
 							components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
-								new ButtonBuilder().setCustomId(`op-review:${proposalId}`).setLabel("Review and edit").setStyle(ButtonStyle.Primary),
-								new ButtonBuilder().setCustomId(`op-dismiss:${proposalId}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
+								new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and edit").setStyle(ButtonStyle.Primary),
+								new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
 							)],
 							allowedMentions: { parse: [] },
 						});
