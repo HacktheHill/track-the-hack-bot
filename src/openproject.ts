@@ -34,6 +34,7 @@ export type WorkPackageInput = {
 	storyPoints?: number;
 	sourceLinks: string[];
 	typeId?: number;
+	correlationId?: string;
 };
 
 export function normalizeTaskTitle(value: string) {
@@ -165,9 +166,10 @@ export class OpenProjectClient {
 		const context = input.sourceLinks.length
 			? `\n\n---\nDiscord context:\n${input.sourceLinks.map(link => `- ${link}`).join("\n")}`
 			: "";
+		const correlation = input.correlationId ? `\n\n<!-- track-the-hack-correlation:${input.correlationId} -->` : "";
 		const payload: Record<string, unknown> = {
 			subject: input.subject,
-			description: { format: "markdown", raw: `${input.description}${context}` },
+			description: { format: "markdown", raw: `${input.description}${context}${correlation}` },
 			_links: {
 				project: { href: `/api/v3/projects/${input.projectId}` },
 				...(input.typeId ? { type: { href: `/api/v3/types/${input.typeId}` } } : {}),

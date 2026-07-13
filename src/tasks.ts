@@ -75,6 +75,12 @@ export const taskCommand = new SlashCommandBuilder()
 		.addIntegerOption(option => option.setName("id").setDescription("OpenProject task ID").setRequired(true).setMinValue(1)))
 	.addSubcommand(command => command.setName("reopen").setDescription("Reopen an existing task")
 		.addIntegerOption(option => option.setName("id").setDescription("OpenProject task ID").setRequired(true).setMinValue(1)))
+	.addSubcommand(command => command.setName("reconcile").setDescription("Reconcile an ambiguous task creation")
+		.addStringOption(option => option.setName("proposal").setDescription("Proposal UUID").setRequired(true))
+		.addIntegerOption(option => option.setName("work_package_id").setDescription("OpenProject work package ID").setRequired(true).setMinValue(1)))
+	.addSubcommand(command => command.setName("announce").setDescription("Retry a Discord task announcement")
+		.addIntegerOption(option => option.setName("id").setDescription("OpenProject task ID").setRequired(true).setMinValue(1))
+		.addUserOption(option => option.setName("assignee").setDescription("Optional user to ping")))
 	.addSubcommand(command => command.setName("link-user").setDescription("Map a Discord user to an OpenProject user")
 		.addUserOption(option => option.setName("discord_user").setDescription("Discord user").setRequired(true))
 		.addStringOption(option => option.setName("openproject_user").setDescription("OpenProject user").setRequired(true).setAutocomplete(true)))
@@ -300,6 +306,7 @@ async function createAndAnnounce(args: {
 		storyPoints: args.storyPoints,
 		sourceLinks: args.sourceLinks,
 		typeId: type?.id,
+		correlationId: args.draftId,
 	});
 	// Persist completion immediately after the non-idempotent OpenProject POST.
 	// Discord response/announcement failures must never make a successful POST
@@ -374,6 +381,16 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 	if (interaction.commandName !== "task") return;
 	const subcommand = interaction.options.getSubcommand();
 	await interaction.deferReply({ ephemeral: true });
+	if (subcommand === "reconcile") {
+		requireOrganizer(interaction);
+		await services.db.reconcileProposal(
+			interaction.options.getString("proposal", true),
+			interaction.user.id,
+			interaction.options.getInteger("work_package_id", true),
+		);
+		await interaction.editReply("Proposal reconciled; no second OpenProject task was created.");
+		return;
+	}
 	if (subcommand === "link-user") {
 		requireOrganizer(interaction);
 		const discordUser = interaction.options.getUser("discord_user", true);
@@ -399,6 +416,15 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 		const id = interaction.options.getInteger("id", true);
 		const existingTask = await services.openProject.workPackage(id);
 		await requireProjectAccess(interaction, projectIdFromWorkPackage(existingTask), services);
+		if (subcommand === "announce") {
+			const assignee = interaction.options.getUser("assignee");
+			const content = `${assignee ? `<@${assignee.id}> ` : ""}OpenProject task: **${existingTask.subject}**\n${services.openProject.workPackageUrl(id)}`;
+			if (!interaction.channel?.isSendable()) throw new Error("This channel cannot receive announcements.");
+			await interaction.channel.send({ content, allowedMentions: assignee ? { users: [assignee.id] } : { parse: [] } });
+			await services.db.logTaskEvent(id, "announcement_retried", interaction.user.id, { assigneeDiscordId: assignee?.id });
+			await interaction.editReply(`Announcement posted for ${services.openProject.workPackageUrl(id)}.`);
+			return;
+		}
 		if (subcommand === "view") {
 			const task = existingTask;
 			const status = task._links.status?.title ?? "Unknown";
@@ -688,6 +714,9 @@ async function handleFinalCreationButton(interaction: ButtonInteraction, service
 			await services.db.markProposalFailed(draft.proposalId, ambiguous ? "needs_reconciliation" : "failed", interaction.user.id, (error as Error).message);
 		}
 		await services.db.failDraft(id, (error as Error).message, error instanceof OpenProjectRequestError && error.ambiguous ? "needs_reconciliation" : "failed");
+		if (error instanceof OpenProjectRequestError && error.ambiguous) {
+			throw new Error(`${error.message} Reconciliation ID: ${draft.proposalId ?? id}. Use /task reconcile after checking OpenProject.`);
+		}
 		throw error;
 	}
 	return true;
