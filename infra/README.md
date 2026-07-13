@@ -228,7 +228,7 @@ with `track-the-hack/infra/configure-health-probes.sh`.
 
 The bot uses the `track-the-hack-ai` Azure OpenAI resource through its Container
 App managed identity. Configure `AZURE_OPENAI_ENDPOINT` and one deployment name,
-preferably `AZURE_OPENAI_MINI_DEPLOYMENT`. Do not configure an API key. The
+`AZURE_OPENAI_DEPLOYMENT`. Do not configure an API key. The
 identity needs only the Cognitive Services OpenAI User role on that resource.
 
 The bot bounds and pseudonymizes context before inference. It removes common

@@ -24,8 +24,7 @@ const config = {
 	AZURE_OPENAI_MAX_COMPLETION_TOKENS: 1024,
 	OPENPROJECT_AI_MAX_CONTEXT_CHARS: 16000,
 	AZURE_OPENAI_ENDPOINT: "https://azure.example",
-	AZURE_OPENAI_NANO_DEPLOYMENT: "nano",
-	AZURE_OPENAI_MINI_DEPLOYMENT: undefined,
+	AZURE_OPENAI_DEPLOYMENT: "task-extractor",
 	AZURE_OPENAI_API_VERSION: "v1",
 };
 
@@ -40,7 +39,7 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 		const extractor = new AzureTaskExtractor(config, async () => "managed-identity-token");
 		await extractor.extract([{ id: "m1", authorAlias: "USER_1", text: "Ship it", timestamp: "2026-07-13T00:00:00Z" }]);
 		assert.equal(request.url, "https://azure.example/openai/v1/chat/completions");
-		assert.equal(request.body.model, "nano");
+		assert.equal(request.body.model, "task-extractor");
 		assert.equal(request.body.max_completion_tokens, 1024);
 		assert.equal("max_tokens" in request.body, false);
 		assert.equal("temperature" in request.body, false);

@@ -200,11 +200,11 @@ export class AzureTaskExtractor implements TaskExtractor {
 	}
 
 	get enabled() {
-		return Boolean(this.config.AZURE_OPENAI_ENDPOINT && (this.config.AZURE_OPENAI_MINI_DEPLOYMENT || this.config.AZURE_OPENAI_NANO_DEPLOYMENT));
+		return Boolean(this.config.AZURE_OPENAI_ENDPOINT && this.config.AZURE_OPENAI_DEPLOYMENT);
 	}
 
 	async extract(messages: MinimizedMessage[]) {
-		const deployment = this.config.AZURE_OPENAI_MINI_DEPLOYMENT ?? this.config.AZURE_OPENAI_NANO_DEPLOYMENT;
+		const deployment = this.config.AZURE_OPENAI_DEPLOYMENT;
 		if (!this.config.AZURE_OPENAI_ENDPOINT || !deployment) {
 			throw new Error("Azure OpenAI extraction is not configured.");
 		}
