@@ -112,7 +112,10 @@ then change the Cloudflare origin. The executable
 `infra/migrate-track-the-hack-mysql.sh` performs those steps, restarts the old
 web process automatically on failure, and intentionally leaves it stopped after
 success to prevent split-brain writes. It prompts for the managed MySQL password
-without echoing it.
+without echoing it, or accepts a mode-600 `DESTINATION_PASSWORD_FILE` for an
+automated maintenance window. The script downloads Azure MySQL's public DigiCert
+root CA only for the run and uses hostname-verified TLS for every destination
+connection.
 
 ```bash
 az mysql flexible-server create \
