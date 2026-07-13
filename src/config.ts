@@ -18,7 +18,7 @@ const envSchema = z.object({
 	ORGANIZER_GUILD_ORGANIZER_ROLE_ID: z.string().min(1),
 	ORGANIZER_GUILD_EXECUTIVE_ROLE_ID: z.string().optional(),
 	AZURE_OPENAI_ENDPOINT: z.string().url().optional(),
-	AZURE_OPENAI_API_VERSION: z.string().default("2025-04-01-preview"),
+	AZURE_OPENAI_API_VERSION: z.string().default("v1"),
 	AZURE_OPENAI_NANO_DEPLOYMENT: z.string().optional(),
 	AZURE_OPENAI_MINI_DEPLOYMENT: z.string().optional(),
 	OPENPROJECT_AUTOMATION_MODE: z.enum(["off", "shadow", "review"]).default("off"),
