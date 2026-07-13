@@ -15,6 +15,7 @@ const envSchema = z.object({
 	OPENPROJECT_API_KEY: z.string().min(1),
 	DATABASE_URL: z.string().min(1),
 	ORGANIZER_GUILD_ID: z.string().min(1),
+	ORGANIZER_GUILD_MEMBER_ROLE_ID: z.string().min(1),
 	ORGANIZER_GUILD_ORGANIZER_ROLE_ID: z.string().min(1),
 	ORGANIZER_GUILD_EXECUTIVE_ROLE_ID: z.string().optional(),
 	AZURE_OPENAI_ENDPOINT: z.string().url().optional(),
@@ -46,8 +47,8 @@ export function loadIntegrationConfig() {
 	return {
 		...parsed.data,
 		userMap: jsonRecord<Record<string, number>>("OPENPROJECT_USER_MAP", {}),
-		channelProjects: jsonRecord<Record<string, number>>(
-			"OPENPROJECT_CHANNEL_PROJECT_MAP",
+		categoryProjects: jsonRecord<Record<string, number>>(
+			"OPENPROJECT_CATEGORY_PROJECT_MAP",
 			{},
 		),
 		teamRoles: jsonRecord<Record<string, TeamMapping>>(

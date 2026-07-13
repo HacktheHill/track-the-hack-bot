@@ -5,6 +5,7 @@ import {
 	Client,
 	ContextMenuCommandBuilder,
 	GuildMember,
+	Guild,
 	MessageContextMenuCommandInteraction,
 	ModalBuilder,
 	ModalSubmitInteraction,
@@ -39,7 +40,7 @@ export const taskCommand = new SlashCommandBuilder()
 				option.setName("title").setDescription("Task title").setRequired(true).setMaxLength(255),
 			)
 			.addStringOption(option =>
-				option.setName("description").setDescription("Task description").setRequired(true).setMaxLength(2000),
+				option.setName("description").setDescription("Task description (optional)").setMaxLength(2000),
 			)
 			.addStringOption(option =>
 				option.setName("project").setDescription("OpenProject project").setAutocomplete(true),
@@ -55,10 +56,9 @@ export const taskCommand = new SlashCommandBuilder()
 			.addStringOption(option =>
 				option.setName("size").setDescription("Task size").setAutocomplete(true),
 			)
-			.addStringOption(option => option.setName("start_date").setDescription("Start date (YYYY-MM-DD)"))
-			.addStringOption(option => option.setName("due_date").setDescription("Due date (YYYY-MM-DD)"))
+			.addStringOption(option => option.setName("start_date").setDescription("Start date").setAutocomplete(true))
+			.addStringOption(option => option.setName("due_date").setDescription("Due date").setAutocomplete(true))
 			.addNumberOption(option => option.setName("estimated_hours").setDescription("Estimated work in hours").setMinValue(0))
-			.addIntegerOption(option => option.setName("story_points").setDescription("Story points").setMinValue(0))
 			.addStringOption(option => option.setName("source_message").setDescription("Discord message link"))
 			.addBooleanOption(option => option.setName("allow_duplicate").setDescription("Create even if a similar open task exists")),
 	)
@@ -84,7 +84,8 @@ export const taskCommand = new SlashCommandBuilder()
 	.addSubcommand(command => command.setName("link-user").setDescription("Map a Discord user to an OpenProject user")
 		.addUserOption(option => option.setName("discord_user").setDescription("Discord user").setRequired(true))
 		.addStringOption(option => option.setName("openproject_user").setDescription("OpenProject user").setRequired(true).setAutocomplete(true)))
-	.addSubcommand(command => command.setName("configure-channel").setDescription("Set this channel's default OpenProject project")
+	.addSubcommand(command => command.setName("configure-category").setDescription("Set a category's default OpenProject project")
+		.addChannelOption(option => option.setName("category").setDescription("Discord category").addChannelTypes(ChannelType.GuildCategory).setRequired(true))
 		.addStringOption(option => option.setName("project").setDescription("OpenProject project").setRequired(true).setAutocomplete(true)),
 	);
 
@@ -106,9 +107,11 @@ type CreationDraft = {
 	userId: string; channelId: string; expiresAt: number; proposalId?: string;
 	title: string; description: string; projectText: string | null;
 	assigneeId?: string; accountableId?: string; priorityId?: number; sizeHref?: string;
-	startDate?: string; dueDate?: string; estimatedHours?: number; storyPoints?: number;
+	startDate?: string; dueDate?: string; estimatedHours?: number;
 	sourceLinks: string[]; allowDuplicate?: boolean;
 };
+
+const organizerGuildId = "1022942414090027008";
 async function contextDraft(id: string, userId: string, services: Services) {
 	return services.db.draft<ContextDraft>(id, userId, "context");
 }
@@ -155,6 +158,18 @@ function validateDateOrder(startDate?: string | null, dueDate?: string | null) {
 	if (startDate && dueDate && startDate > dueDate) throw new Error("The start date cannot be after the due date.");
 }
 
+function dateChoices(query: string) {
+	const today = new Date();
+	const choices: Array<{ name: string; value: string }> = [];
+	for (let offset = 0; offset < 31; offset++) {
+		const date = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + offset));
+		const value = date.toISOString().slice(0, 10);
+		const label = offset === 0 ? `Today — ${value}` : offset === 1 ? `Tomorrow — ${value}` : value;
+		choices.push({ name: label, value });
+	}
+	return choices.filter(choice => choice.value.includes(query) || choice.name.toLowerCase().includes(query.toLowerCase()));
+}
+
 function matchedTeam(member: GuildMember | null, mappings: Record<string, TeamMapping>) {
 	if (!member) return undefined;
 	return Object.entries(mappings)
@@ -186,22 +201,36 @@ async function accountableFor(
 }
 
 async function requireCreator(interaction: ChatInputCommandInteraction | MessageContextMenuCommandInteraction | ModalSubmitInteraction | ButtonInteraction, services: Services) {
-	if (!interaction.inGuild()) throw new Error("Tasks can only be created in a server.");
-	if (services.config.blockedChannels.has(interaction.channelId!)) throw new Error("Task creation is disabled in this channel.");
-	const id = await services.db.openProjectUserId(interaction.user.id);
-	if (!id) throw new Error("Your Discord account is not mapped to an OpenProject user.");
-	const activeUser = (await services.openProject.users()).some(user => user.id === id && user.status !== "locked");
-	if (!activeUser) throw new Error("Your mapped OpenProject account is not active.");
-	const member = await interaction.guild!.members.fetch(interaction.user.id);
-	if (!member.roles.cache.has(services.config.ORGANIZER_GUILD_ORGANIZER_ROLE_ID) && !member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-		throw new Error("Only organizers can create or manage OpenProject tasks.");
+	if (!interaction.inGuild() || interaction.guildId !== organizerGuildId || services.config.ORGANIZER_GUILD_ID !== organizerGuildId) {
+		throw new Error("OpenProject tasks are available only in the Organizer Discord server.");
 	}
+	if (services.config.blockedChannels.has(interaction.channelId!)) throw new Error("Task creation is disabled in this channel.");
+	const member = await interaction.guild!.members.fetch(interaction.user.id);
+	if (!member.roles.cache.has(services.config.ORGANIZER_GUILD_MEMBER_ROLE_ID)) {
+		throw new Error("You need the Members role to create or manage OpenProject tasks.");
+	}
+	return member;
+}
+
+async function categoryIdFor(channelId: string, guild: Guild) {
+	let channel = await guild.channels.fetch(channelId);
+	for (let depth = 0; channel && depth < 3; depth++) {
+		if (channel.type === ChannelType.GuildCategory) return channel.id;
+		if (!channel.parentId) return undefined;
+		channel = await guild.channels.fetch(channel.parentId);
+	}
+	return undefined;
+}
+
+async function categoryProject(channelId: string, guild: Guild, services: Services) {
+	const categoryId = await categoryIdFor(channelId, guild);
+	return categoryId ? await services.db.categoryProject(categoryId) ?? services.config.categoryProjects[categoryId] : undefined;
 }
 
 async function allowedProjectIds(channelId: string, member: GuildMember, services: Services) {
 	const allowed = new Set<number>();
-	const channelProject = await services.db.channelProject(channelId) ?? services.config.channelProjects[channelId];
-	if (channelProject) allowed.add(channelProject);
+	const defaultProject = await categoryProject(channelId, member.guild, services);
+	if (defaultProject) allowed.add(defaultProject);
 	for (const [roleId, mapping] of Object.entries(services.config.teamRoles)) {
 		if (member.roles.cache.has(roleId)) allowed.add(mapping.projectId);
 	}
@@ -213,10 +242,6 @@ async function requireProjectAccess(interaction: TaskInteraction | MessageContex
 	const member = await interaction.guild!.members.fetch(interaction.user.id);
 	const allowed = await allowedProjectIds(interaction.channelId!, member, services);
 	if (!allowed.has(projectId)) throw new Error("This channel or your team is not authorized for that OpenProject project.");
-	const creatorId = await services.db.openProjectUserId(interaction.user.id);
-	if (!creatorId || !await services.openProject.isProjectMember(projectId, creatorId)) {
-		throw new Error("Your mapped OpenProject account is not a member of the selected project.");
-	}
 }
 
 function projectIdFromWorkPackage(task: { _links: Record<string, { href: string }> }) {
@@ -225,8 +250,10 @@ function projectIdFromWorkPackage(task: { _links: Record<string, { href: string 
 	return Number(match[1]);
 }
 
-function requireOrganizer(interaction: ChatInputCommandInteraction) {
-	if (!interaction.inGuild() || !interaction.member || !("roles" in interaction.member)) throw new Error("This command can only be used in a server.");
+function requireOrganizer(interaction: ChatInputCommandInteraction, services: Services) {
+	if (!interaction.inGuild() || interaction.guildId !== organizerGuildId || services.config.ORGANIZER_GUILD_ID !== organizerGuildId || !interaction.member || !("roles" in interaction.member)) {
+		throw new Error("OpenProject configuration is available only in the Organizer Discord server.");
+	}
 	const member = interaction.member as GuildMember;
 	if (!member.roles.cache.has(process.env.ORGANIZER_GUILD_ORGANIZER_ROLE_ID ?? "") && !member.permissions.has(PermissionFlagsBits.ManageGuild)) {
 		throw new Error("Only organizers can change OpenProject mappings.");
@@ -236,12 +263,13 @@ function requireOrganizer(interaction: ChatInputCommandInteraction) {
 async function resolveProject(
 	explicit: string | null,
 	channelId: string,
+	guild: Guild,
 	assignee: GuildMember | null,
 	services: Services,
 ) {
 	if (explicit && /^\d+$/.test(explicit)) return Number(explicit);
-	const channelDefault = await services.db.channelProject(channelId) ?? services.config.channelProjects[channelId];
-	if (channelDefault) return channelDefault;
+	const categoryDefault = await categoryProject(channelId, guild, services);
+	if (categoryDefault) return categoryDefault;
 	return matchedTeam(assignee, services.config.teamRoles)?.[1].projectId;
 }
 
@@ -259,7 +287,6 @@ async function createAndAnnounce(args: {
 	startDate?: string;
 	dueDate?: string;
 	estimatedHours?: number;
-	storyPoints?: number;
 	sourceLinks: string[];
 	allowDuplicate?: boolean;
 }) {
@@ -271,7 +298,7 @@ async function createAndAnnounce(args: {
 	if (assignee && !assigneeOpenProjectId) throw new Error("The assignee is not mapped to OpenProject.");
 	const accountableOverride = args.accountableId ? await services.db.openProjectUserId(args.accountableId) : undefined;
 	if (args.accountableId && !accountableOverride) throw new Error("The accountable user is not mapped to OpenProject.");
-	const projectId = await resolveProject(args.projectText, interaction.channelId!, assignee, services);
+	const projectId = await resolveProject(args.projectText, interaction.channelId!, guild, assignee, services);
 	if (!projectId) throw new Error("Select a project; no channel or assignee-team default is configured.");
 	await requireProjectAccess(interaction, projectId, services);
 	if (assigneeOpenProjectId && !await services.openProject.isProjectMember(projectId, assigneeOpenProjectId)) {
@@ -303,7 +330,6 @@ async function createAndAnnounce(args: {
 		startDate: validIsoDate(args.startDate),
 		dueDate: validIsoDate(args.dueDate),
 		estimatedHours: args.estimatedHours,
-		storyPoints: args.storyPoints,
 		sourceLinks: args.sourceLinks,
 		typeId: type?.id,
 		correlationId: args.draftId,
@@ -343,8 +369,9 @@ async function showCreationPreview(
 	const projectId = draft.projectText && /^\d+$/.test(draft.projectText) ? Number(draft.projectText) : undefined;
 	const project = projectId ? (await services.openProject.projects()).find(item => item.id === projectId) : undefined;
 	const dates = draft.startDate || draft.dueDate ? `\nDates: ${draft.startDate ?? "—"} → ${draft.dueDate ?? "—"}` : "";
+	const description = draft.description.trim() ? `\n\n${draft.description.slice(0, 1200)}` : "";
 	await interaction.editReply({
-		content: `Review before creating:\n**${draft.title}**\nProject: ${project?.name ?? "resolved from channel/team"}${dates}\n\n${draft.description.slice(0, 1200)}`,
+		content: `Review before creating:\n**${draft.title}**\nProject: ${project?.name ?? "resolved from category/team"}${dates}${description}`,
 		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
 			new ButtonBuilder().setCustomId(`op-create-final:${id}`).setLabel("Create").setStyle(ButtonStyle.Success),
 			new ButtonBuilder().setCustomId(`op-edit-final:${id}`).setLabel("Edit").setStyle(ButtonStyle.Primary),
@@ -365,11 +392,13 @@ async function handleAutocomplete(interaction: AutocompleteInteraction, services
 		choices = (await services.openProject.projects()).filter(project => allowed.has(project.id)).map(project => ({ name: project.name, value: String(project.id) }));
 	} else if (focused.name === "priority") {
 		choices = (await services.openProject.priorities()).map(priority => ({ name: priority.name, value: String(priority.id) }));
+	} else if (focused.name === "start_date" || focused.name === "due_date") {
+		choices = dateChoices(query);
 	} else if (focused.name === "size") {
 		const explicitProject = interaction.options.getString("project");
 		const projectId = explicitProject && /^\d+$/.test(explicitProject)
 			? Number(explicitProject)
-			: await services.db.channelProject(interaction.channelId) ?? services.config.channelProjects[interaction.channelId];
+			: await categoryProject(interaction.channelId, interaction.guild!, services);
 		if (projectId) choices = (await services.openProject.sizeOptions(projectId)).map(option => ({ name: option.value, value: `/api/v3/custom_options/${option.id}` }));
 	} else if (focused.name === "openproject_user") {
 		choices = (await services.openProject.users()).map(user => ({ name: user.name, value: String(user.id) }));
@@ -382,7 +411,7 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 	const subcommand = interaction.options.getSubcommand();
 	await interaction.deferReply({ ephemeral: true });
 	if (subcommand === "reconcile") {
-		requireOrganizer(interaction);
+		requireOrganizer(interaction, services);
 		await services.db.reconcileProposal(
 			interaction.options.getString("proposal", true),
 			interaction.user.id,
@@ -392,7 +421,7 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 		return;
 	}
 	if (subcommand === "link-user") {
-		requireOrganizer(interaction);
+		requireOrganizer(interaction, services);
 		const discordUser = interaction.options.getUser("discord_user", true);
 		const openProjectId = Number(interaction.options.getString("openproject_user", true));
 		if (!Number.isInteger(openProjectId)) throw new Error("Select a valid OpenProject user.");
@@ -402,13 +431,15 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 		await interaction.editReply(`Mapped <@${discordUser.id}> to OpenProject user **${user.name}**.`);
 		return;
 	}
-	if (subcommand === "configure-channel") {
-		requireOrganizer(interaction);
+	if (subcommand === "configure-category") {
+		requireOrganizer(interaction, services);
 		const projectId = Number(interaction.options.getString("project", true));
+		const category = interaction.options.getChannel("category", true);
+		if (category.type !== ChannelType.GuildCategory) throw new Error("Select a Discord category.");
 		const project = (await services.openProject.projects()).find(item => item.id === projectId);
 		if (!project) throw new Error("Select a valid active OpenProject project.");
-		await services.db.setChannelProject(interaction.channelId, projectId, interaction.user.id);
-		await interaction.editReply(`This channel now defaults to **${project.name}**.`);
+		await services.db.setCategoryProject(category.id, projectId, interaction.user.id);
+		await interaction.editReply(`Category **${category.name}** now defaults to **${project.name}**.`);
 		return;
 	}
 	await requireCreator(interaction, services);
@@ -471,7 +502,7 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 		: (await services.openProject.priorities()).find(item => item.isDefault)?.id;
 	await showCreationPreview(interaction, services, {
 		title: interaction.options.getString("title", true),
-		description: interaction.options.getString("description", true),
+		description: interaction.options.getString("description") ?? "",
 		projectText: interaction.options.getString("project"),
 		assigneeId: interaction.options.getUser("assignee")?.id,
 		accountableId: interaction.options.getUser("accountable")?.id,
@@ -480,7 +511,6 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 		startDate: interaction.options.getString("start_date") ?? defaults.startDate,
 		dueDate: interaction.options.getString("due_date") ?? defaults.dueDate,
 		estimatedHours: interaction.options.getNumber("estimated_hours") ?? undefined,
-		storyPoints: interaction.options.getInteger("story_points") ?? undefined,
 		sourceLinks: await validatedSourceLink(interaction.options.getString("source_message"), interaction),
 		allowDuplicate: interaction.options.getBoolean("allow_duplicate") ?? false,
 	});
@@ -493,7 +523,7 @@ async function handleContext(interaction: MessageContextMenuCommandInteraction, 
 	const allowed = await allowedProjectIds(interaction.channelId, member, services);
 	const projects = (await services.openProject.projects()).filter(project => allowed.has(project.id));
 	if (!projects.length) throw new Error("No OpenProject project is configured for this channel or your team.");
-	const defaultProject = await resolveProject(null, interaction.channelId, null, services);
+	const defaultProject = await resolveProject(null, interaction.channelId, interaction.guild!, null, services);
 	const payload = {
 		userId: interaction.user.id, channelId: interaction.channelId, targetId: interaction.targetId,
 		title: interaction.targetMessage.content.split("\n")[0].slice(0, 255) || "Discord follow-up",
@@ -534,7 +564,7 @@ async function handleContextContinue(interaction: ButtonInteraction, services: S
 	const modal = new ModalBuilder().setCustomId(`op-task2:${id}`).setTitle("Create OpenProject task");
 	const fields = [
 		new TextInputBuilder().setCustomId("title").setLabel("Title").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(255).setValue(draft.title),
-		new TextInputBuilder().setCustomId("description").setLabel("Description").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(4000).setValue(draft.description),
+		new TextInputBuilder().setCustomId("description").setLabel("Description (optional)").setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(4000).setValue(draft.description),
 		new TextInputBuilder().setCustomId("start_date").setLabel("Start date YYYY-MM-DD (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(defaults.startDate ?? ""),
 		new TextInputBuilder().setCustomId("due_date").setLabel("Due date YYYY-MM-DD (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(defaults.dueDate),
 	];
@@ -614,7 +644,7 @@ async function handleAiContext(interaction: MessageContextMenuCommandInteraction
 	}
 	const assigneeId = candidate.assignee_alias ? context.reverseAliases.get(candidate.assignee_alias) : undefined;
 	const assigneeMember = assigneeId ? await interaction.guild!.members.fetch(assigneeId).catch(() => null) : null;
-	const projectId = await resolveProject(null, interaction.channelId, assigneeMember, services);
+	const projectId = await resolveProject(null, interaction.channelId, interaction.guild!, assigneeMember, services);
 	if (projectId) {
 		const duplicate = await services.openProject.possibleDuplicate(projectId, candidate.title);
 		if (duplicate) {
@@ -664,7 +694,7 @@ async function handleProposalButton(interaction: ButtonInteraction, services: Se
 	const modal = new ModalBuilder().setCustomId(`op-ai:${id}`).setTitle("Review proposed task");
 	const fields = [
 		new TextInputBuilder().setCustomId("title").setLabel("Title").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(255).setValue(proposal.title),
-		new TextInputBuilder().setCustomId("description").setLabel("Description").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(4000).setValue(proposal.description.slice(0, 4000)),
+		new TextInputBuilder().setCustomId("description").setLabel("Description (optional)").setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(4000).setValue(proposal.description.slice(0, 4000)),
 		new TextInputBuilder().setCustomId("project").setLabel("Project ID").setStyle(TextInputStyle.Short).setRequired(true).setValue(proposal.project_id ? String(proposal.project_id) : ""),
 		new TextInputBuilder().setCustomId("assignee").setLabel("Assignee Discord ID (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(proposal.assignee_discord_id ?? ""),
 		new TextInputBuilder().setCustomId("due_date").setLabel("Due date YYYY-MM-DD (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(proposal.due_date ? String(proposal.due_date).slice(0, 10) : ""),
@@ -686,7 +716,7 @@ async function handleFinalCreationButton(interaction: ButtonInteraction, service
 		const modal = new ModalBuilder().setCustomId(`op-edit-create:${id}`).setTitle("Edit task preview");
 		const fields = [
 			new TextInputBuilder().setCustomId("title").setLabel("Title").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(255).setValue(draft.title),
-			new TextInputBuilder().setCustomId("description").setLabel("Description").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(4000).setValue(draft.description.slice(0, 4000)),
+			new TextInputBuilder().setCustomId("description").setLabel("Description (optional)").setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(4000).setValue(draft.description.slice(0, 4000)),
 			new TextInputBuilder().setCustomId("start_date").setLabel("Start date YYYY-MM-DD (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(draft.startDate ?? ""),
 			new TextInputBuilder().setCustomId("due_date").setLabel("Due date YYYY-MM-DD (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(draft.dueDate ?? ""),
 		];

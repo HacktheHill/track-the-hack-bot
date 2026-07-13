@@ -87,6 +87,16 @@ This bot helps manage and coordinate activities across Hack the Hill's Discord s
 								inline: false,
 							},
 							{
+								name: "OpenProject tasks",
+								value: `
+	\`/task create\`: Create a task in this channel's configured category project. Title is required; description, assignee, priority, size, and dates are optional.
+	\`/task view|assign|reschedule|close|reopen\`: Manage an existing task without opening OpenProject.
+	Message → Apps → \`Create OpenProject task\`: Start a task from a message and include its backlink.
+	\`/task configure-category\`: Organizers set a category's default OpenProject project. Members can use task commands only in this Organizer server.
+`,
+								inline: false,
+							},
+							{
 								name: "Commands",
 								value: `
 \`/sync\`: Synchronize roles and nicknames from the organizer guild to the community guild.
@@ -152,6 +162,16 @@ Ce bot aide à gérer et coordonner les activités sur les serveurs Discord de H
 								value:
 									permissions.organizer?.join(", ") ??
 									"Inconnu",
+								inline: false,
+							},
+							{
+								name: "Tâches OpenProject",
+								value: `
+	\`/task create\`: Crée une tâche dans le projet associé à la catégorie de ce canal. Le titre est requis; la description, l'assigné, la priorité, la taille et les dates sont facultatifs.
+	\`/task view|assign|reschedule|close|reopen\`: Gère une tâche existante sans ouvrir OpenProject.
+	Message → Applications → \`Create OpenProject task\`: Démarre une tâche à partir d'un message et ajoute son lien.
+	\`/task configure-category\`: Les organisateurs définissent le projet OpenProject par défaut d'une catégorie. Les membres peuvent utiliser les commandes de tâches uniquement sur ce serveur.
+`,
 								inline: false,
 							},
 							{

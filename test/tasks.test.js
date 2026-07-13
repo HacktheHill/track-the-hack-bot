@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { defaultTaskDates, validIsoDate } from "../dist/tasks.js";
+import { defaultTaskDates, taskCommand, validIsoDate } from "../dist/tasks.js";
 import { normalizeTaskTitle, OpenProjectClient, titlesLikelyDuplicate } from "../dist/openproject.js";
 
 test("task defaults start today and use the configured due offset", () => {
@@ -15,6 +15,18 @@ test("date validation rejects invalid or non-ISO dates", () => {
 	assert.equal(validIsoDate("2026-07-13"), "2026-07-13");
 	assert.throws(() => validIsoDate("07/13/2026"), /YYYY-MM-DD/);
 	assert.throws(() => validIsoDate("2026-02-30"), /YYYY-MM-DD/);
+});
+
+test("task creation exposes selectable fields and keeps description optional", () => {
+	const create = taskCommand.toJSON().options.find(option => option.name === "create");
+	const options = create.options;
+	assert.equal(options.find(option => option.name === "description").required, false);
+	assert.equal(options.find(option => option.name === "priority").autocomplete, true);
+	assert.equal(options.find(option => option.name === "size").autocomplete, true);
+	assert.equal(options.find(option => option.name === "start_date").autocomplete, true);
+	assert.equal(options.find(option => option.name === "due_date").autocomplete, true);
+	assert.equal(options.some(option => option.name === "story_points"), false);
+	assert.equal(taskCommand.toJSON().options.some(option => option.name === "configure-category"), true);
 });
 
 test("duplicate detection normalizes punctuation and compares meaningful words", () => {

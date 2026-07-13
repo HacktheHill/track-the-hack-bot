@@ -64,6 +64,12 @@ export class Database {
 				updated_by_discord_id TEXT NOT NULL,
 				updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 			);
+			CREATE TABLE IF NOT EXISTS discord_category_projects (
+				category_id TEXT PRIMARY KEY,
+				openproject_project_id INTEGER NOT NULL,
+				updated_by_discord_id TEXT NOT NULL,
+				updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+			);
 			CREATE TABLE IF NOT EXISTS task_drafts (
 				id UUID PRIMARY KEY,
 				kind TEXT NOT NULL,
@@ -99,6 +105,14 @@ export class Database {
 				[discordId, openProjectId],
 			);
 		}
+		for (const [categoryId, projectId] of Object.entries(config.categoryProjects)) {
+			await this.pool.query(
+				`INSERT INTO discord_category_projects(category_id,openproject_project_id,updated_by_discord_id)
+				 VALUES($1,$2,'environment') ON CONFLICT(category_id) DO UPDATE SET
+				 openproject_project_id=excluded.openproject_project_id, updated_at=now()`,
+				[categoryId, projectId],
+			);
+		}
 	}
 
 	async openProjectUserId(discordId: string) {
@@ -118,21 +132,21 @@ export class Database {
 		);
 	}
 
-	async channelProject(channelId: string) {
+	async categoryProject(categoryId: string) {
 		const result = await this.pool.query<{ openproject_project_id: number }>(
-			"SELECT openproject_project_id FROM discord_channel_projects WHERE channel_id=$1",
-			[channelId],
+			"SELECT openproject_project_id FROM discord_category_projects WHERE category_id=$1",
+			[categoryId],
 		);
 		return result.rows[0]?.openproject_project_id;
 	}
 
-	async setChannelProject(channelId: string, projectId: number, actorId: string) {
+	async setCategoryProject(categoryId: string, projectId: number, actorId: string) {
 		await this.pool.query(
-			`INSERT INTO discord_channel_projects(channel_id,openproject_project_id,updated_by_discord_id)
-			 VALUES($1,$2,$3) ON CONFLICT(channel_id) DO UPDATE SET
+			`INSERT INTO discord_category_projects(category_id,openproject_project_id,updated_by_discord_id)
+			 VALUES($1,$2,$3) ON CONFLICT(category_id) DO UPDATE SET
 			 openproject_project_id=excluded.openproject_project_id,
 			 updated_by_discord_id=excluded.updated_by_discord_id, updated_at=now()`,
-			[channelId, projectId, actorId],
+			[categoryId, projectId, actorId],
 		);
 	}
 

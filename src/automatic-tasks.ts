@@ -1,4 +1,4 @@
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, Message } from "discord.js";
+import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, Client, Message } from "discord.js";
 import { containsSensitiveContent, minimizeText, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 import type { IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
@@ -6,6 +6,19 @@ import { OpenProjectClient } from "./openproject.js";
 
 type AutomaticServices = { config: IntegrationConfig; db: Database; extractor: TaskExtractor; openProject: OpenProjectClient };
 type Batch = { messages: Message[]; timer: NodeJS.Timeout };
+
+async function categoryProject(message: Message, services: AutomaticServices) {
+	if (!message.inGuild()) return undefined;
+	let channel = await message.guild.channels.fetch(message.channelId);
+	for (let depth = 0; channel && depth < 3; depth++) {
+		if (channel.type === ChannelType.GuildCategory) {
+			return await services.db.categoryProject(channel.id) ?? services.config.categoryProjects[channel.id];
+		}
+		if (!channel.parentId) return undefined;
+		channel = await message.guild.channels.fetch(channel.parentId);
+	}
+	return undefined;
+}
 
 export function registerAutomaticTaskDetection(client: Client, services: AutomaticServices) {
 	if (services.config.OPENPROJECT_AUTOMATION_MODE === "off" || !services.extractor.enabled) return;
@@ -45,7 +58,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			for (const task of result.tasks.filter(item => item.classification === "explicit_commitment" || item.classification === "direct_assignment")) {
 				if (!task.source_message_ids.every(id => source.some(message => message.id === id))) continue;
 				const assigneeId = task.assignee_alias ? reverse.get(task.assignee_alias) : undefined;
-				const projectId = await services.db.channelProject(channelId) ?? services.config.channelProjects[channelId];
+				const projectId = source[0] ? await categoryProject(source[0], services) : undefined;
 				if (projectId && await services.openProject.possibleDuplicate(projectId, task.title)) continue;
 				const citedIds = new Set(task.source_message_ids);
 				const reviewers = new Set<string>(source.filter(message => citedIds.has(message.id)).map(message => message.author.id));

@@ -50,6 +50,10 @@ projects.each do |project|
   member.save!
 end
 
-Token::API.where(user:).where("data ->> 'token_name' = ?", "Track the Hack Discord bot").delete_all
-token = Token::API.create!(user:, token_name: "Track the Hack Discord bot")
-STDOUT.write(token.plain_value)
+if ENV["ROTATE_API_TOKEN"] == "true"
+  Token::API.where(user:).where("data ->> 'token_name' = ?", "Track the Hack Discord bot").delete_all
+  token = Token::API.create!(user:, token_name: "Track the Hack Discord bot")
+  STDOUT.write(token.plain_value)
+else
+  STDOUT.write("OpenProject integration role and memberships reconciled; API token unchanged.\n")
+end

@@ -31,7 +31,6 @@ export type WorkPackageInput = {
 	startDate?: string;
 	dueDate?: string;
 	estimatedHours?: number;
-	storyPoints?: number;
 	sourceLinks: string[];
 	typeId?: number;
 	correlationId?: string;
@@ -164,12 +163,13 @@ export class OpenProjectClient {
 
 	async createWorkPackage(input: WorkPackageInput) {
 		const context = input.sourceLinks.length
-			? `\n\n---\nDiscord context:\n${input.sourceLinks.map(link => `- ${link}`).join("\n")}`
+			? `---\nDiscord context:\n${input.sourceLinks.map(link => `- ${link}`).join("\n")}`
 			: "";
-		const correlation = input.correlationId ? `\n\n<!-- track-the-hack-correlation:${input.correlationId} -->` : "";
+		const correlation = input.correlationId ? `<!-- track-the-hack-correlation:${input.correlationId} -->` : "";
+		const description = [input.description.trim(), context, correlation].filter(Boolean).join("\n\n");
 		const payload: Record<string, unknown> = {
 			subject: input.subject,
-			description: { format: "markdown", raw: `${input.description}${context}${correlation}` },
+			description: { format: "markdown", raw: description },
 			_links: {
 				project: { href: `/api/v3/projects/${input.projectId}` },
 				...(input.typeId ? { type: { href: `/api/v3/types/${input.typeId}` } } : {}),
@@ -180,17 +180,19 @@ export class OpenProjectClient {
 			...(input.startDate ? { startDate: input.startDate } : {}),
 			...(input.dueDate ? { dueDate: input.dueDate } : {}),
 			...(input.estimatedHours !== undefined ? { estimatedTime: `PT${input.estimatedHours}H` } : {}),
-			...(input.storyPoints !== undefined ? { storyPoints: input.storyPoints } : {}),
 			...(input.sizeHref ? { [this.config.OPENPROJECT_SIZE_CUSTOM_FIELD]: { href: input.sizeHref } } : {}),
 		};
-		const form = await this.request<{ _embedded: { validationErrors: Record<string, { message: string }>; payload?: Record<string, unknown> } }>(
+		const form = await this.request<{
+			_embedded: { validationErrors: Record<string, { message: string }>; payload?: Record<string, unknown> };
+			_links?: { commit?: HalLink };
+		}>(
 			`/api/v3/workspaces/${input.projectId}/work_packages/form`,
 			{ method: "POST", body: JSON.stringify(payload) },
 		);
 		const errors = Object.values(form._embedded.validationErrors ?? {}).map(error => error.message);
 		if (errors.length) throw new Error(errors.join("; "));
 		return this.request<WorkPackage>(
-			`/api/v3/workspaces/${input.projectId}/work_packages`,
+			form._links?.commit?.href ?? `/api/v3/projects/${input.projectId}/work_packages`,
 			{ method: "POST", body: JSON.stringify(form._embedded.payload ?? payload) },
 		);
 	}

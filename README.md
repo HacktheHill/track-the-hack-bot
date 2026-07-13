@@ -61,11 +61,13 @@ Track the Hack Bot is a Discord bot designed to automatically assign roles to ve
 - **`/verify`**: Provides a verification link to the user to verify their account in the Community server.
 - **`/sync`**: Synchronizes roles and nicknames between the Organizer and Community servers.
 - **`/help`**: Displays information about the bot's commands and functionalities.
-- **`/task create`**: Creates an OpenProject task for a mapped organizer.
+- **`/task create`**: Creates an OpenProject task for any Organizer-server member
+  with the Members role. Description is optional; date fields offer upcoming-date
+  autocomplete and also accept `YYYY-MM-DD`.
 - **`/task view|assign|reschedule|close|reopen`**: Performs the small set of
   high-frequency task operations that should not require opening OpenProject.
-- **`/task link-user`** and **`/task configure-channel`**: Organizer-only setup
-  commands for persistent Discord user and channel mappings.
+- **`/task link-user`** and **`/task configure-category`**: Organizer-only setup
+  commands for persistent Discord user and category mappings.
 - **Message → Apps → Create OpenProject task**: Creates a task with an automatic backlink.
 - **Message → Apps → Draft OpenProject task with AI**: Produces an ephemeral,
   editable proposal in an explicitly allowlisted channel before creating anything.
@@ -77,7 +79,8 @@ enabled only when `OPENPROJECT_BASE_URL`, `OPENPROJECT_API_KEY`, and
 `DATABASE_URL` are set. On startup the bot creates its small PostgreSQL schema
 and seeds Discord-to-OpenProject identity mappings from `OPENPROJECT_USER_MAP`.
 Organizers can maintain mappings without editing environment variables through
-`/task link-user` and `/task configure-channel`.
+`/task link-user` and `/task configure-category`. Task commands are available
+only in the Organizer server to members with the configured Members role.
 
 New tasks default to today and seven days from today unless overridden with
 `OPENPROJECT_DEFAULT_START_TODAY` and `OPENPROJECT_DEFAULT_DUE_DAYS`. Priorities,
