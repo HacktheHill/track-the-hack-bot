@@ -21,10 +21,27 @@ VNet peering because MySQL provisioning was unavailable in Canada Central), and
 the bot database is `track-the-hack-bot-postgres` in Canada Central.
 
 The ACA endpoints are validated, but the production Cloudflare Access/tunnel
-route for `tracker.hackthehill.com` still points at the VM. Change that route to
-the web ACA hostname, verify the hostname, then set the repository variable
-`AZURE_MIGRATION_ACTIVE=true`. The variable is intentionally `false` until that
-controlled cutover; this preserves the VM deployment as an immediate rollback.
+route for `tracker.hackthehill.com` still points at the VM. The existing tunnel
+is remotely managed. Add its token to Key Vault as `cloudflare-tunnel-token`,
+run a dedicated `track-the-hack-tunnel` Container App as another replica, and
+change the published application's service URL to the web ACA hostname. After
+validation, make the web ingress internal and update the service URL to its
+internal ACA hostname. This keeps Cloudflare Access while preventing clients
+from bypassing Cloudflare and removes the VM from the request path.
+
+Do not copy a tunnel token into a repository, deployment argument, or shell
+history. Retrieve it from **Cloudflare > Networking > Tunnels > Add a replica**
+and enter it directly into Key Vault. A Key Vault-backed Container Apps secret
+should expose it to the pinned `cloudflare/cloudflared:2026.7.1` image as
+`TUNNEL_TOKEN`; run the container with `tunnel --no-autoupdate run`. The tunnel
+app needs no ingress, one minimum replica, and access to the same VNet-integrated
+Container Apps environment as `track-the-hack`.
+
+Only after the new connector reports healthy should the maintenance window
+begin. Change the route, verify the hostname through Cloudflare Access, then set
+the repository variable `AZURE_MIGRATION_ACTIVE=true`. The variable is
+intentionally `false` until that controlled cutover; this preserves the VM
+deployment as an immediate rollback.
 
 Keep the GitHub repository variable `AZURE_MIGRATION_ACTIVE` set to `false` (or
 unset) while preparing the new environment. Set it to `true` only after both
@@ -90,9 +107,12 @@ az keyvault create \
 Create the managed databases first, but do not cut production traffic over to
 an empty Track the Hack schema. The VM database contains production user,
 hacker, verification, and audit data. Stop the VM web process for the final
-dump, import it into managed MySQL, compare per-table row counts, and only then
-change the Cloudflare origin. Choose administrator credentials interactively
-and store application secrets in Key Vault.
+dump, import it into managed MySQL, compare exact per-table row counts, and only
+then change the Cloudflare origin. The executable
+`infra/migrate-track-the-hack-mysql.sh` performs those steps, restarts the old
+web process automatically on failure, and intentionally leaves it stopped after
+success to prevent split-brain writes. It prompts for the managed MySQL password
+without echoing it.
 
 ```bash
 az mysql flexible-server create \
@@ -172,13 +192,19 @@ The bot requires a system/user-assigned managed identity with:
 
 1. Deploy both apps with temporary validation URLs.
 2. Initialize fresh MySQL and PostgreSQL schemas.
-3. Test private app-to-bot HTTPS, Discord Gateway, OpenProject, Azure OpenAI,
-   health, and readiness endpoints.
-4. Stop the VM web process, take a final consistent MySQL dump, import it into
-   managed MySQL, and compare table counts and critical records.
-5. Point the existing Cloudflare hostname at `track-the-hack` and set
-   `AZURE_MIGRATION_ACTIVE=true` in both repositories.
-6. Keep the old VM deployment and database frozen for the agreed rollback window.
-7. Roll back Cloudflare routing if application or bot validation fails.
-8. After the window, remove the old PM2 processes, self-hosted runner, VM
+3. Test private app-to-bot HTTPS, Discord Gateway, OpenProject, health, and
+   readiness endpoints. Test Azure OpenAI if automation has been enabled.
+4. Start the dedicated ACA `cloudflared` replica with the existing remotely
+   managed tunnel token and confirm that the tunnel remains healthy.
+5. Stop the VM web process and run
+   `infra/migrate-track-the-hack-mysql.sh` on the VM. It takes a consistent
+   dump, recreates the managed schema, imports it, and compares every table.
+6. Change the Cloudflare published application's service URL to
+   `track-the-hack`, validate login and critical flows through Cloudflare
+   Access, then set `AZURE_MIGRATION_ACTIVE=true` in both repositories.
+7. Change web ingress to internal, update the tunnel service URL to the new
+   internal ACA hostname, and validate again.
+8. Keep the old VM deployment and database frozen for the agreed rollback window.
+9. Roll back Cloudflare routing if application or bot validation fails.
+10. After the window, remove the old PM2 processes, self-hosted runner, VM
    database, and VM only after backups and logs are verified.

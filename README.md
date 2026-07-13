@@ -35,7 +35,7 @@ Track the Hack Bot is a Discord bot designed to automatically assign roles to ve
 
    Copy `.env.example` for the OpenProject, PostgreSQL, role/project mapping,
    prohibited-channel, and optional Azure OpenAI settings. Azure inference uses
-   the VM's managed identity and does not accept a static API key.
+   the bot workload's managed identity and does not accept a static API key.
 
    - `DISCORD_TOKEN`: Your Discord bot token.
    - `ORGANIZER_GUILD_ID`: The ID of the Organizer server.
@@ -95,9 +95,11 @@ without posting cards, then `review` to post human-review cards after each
 configured idle interval. Automatic task creation is intentionally unavailable
 until the shadow/review accuracy measurements justify adding that policy.
 
-The Azure VM managed identity needs only inference access to the configured
-Azure OpenAI resource. Use Canadian non-Global deployments and restrict network
-access through a private endpoint where available.
+The bot's managed identity needs only inference access to the configured Azure
+OpenAI resource. Prefer a Canadian regional deployment and restrict network
+access through a private endpoint. Keep automation off if no acceptable
+regional model is available unless Global Standard processing is explicitly
+approved.
 
 ### Container deployment
 
