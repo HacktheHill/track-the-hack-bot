@@ -24,10 +24,11 @@ import {
 	StringSelectMenuInteraction,
 	UserSelectMenuInteraction,
 } from "discord.js";
+import { randomUUID } from "node:crypto";
 import type { IntegrationConfig, TeamMapping } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient, OpenProjectRequestError } from "./openproject.js";
-import { containsSensitiveContent, minimizeText, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
+import { containsSensitiveContent, minimizeText, SensitiveContentError, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 
 export const taskCommand = new SlashCommandBuilder()
 	.setName("task")
@@ -76,7 +77,7 @@ export const taskCommand = new SlashCommandBuilder()
 	.addSubcommand(command => command.setName("reopen").setDescription("Reopen an existing task")
 		.addIntegerOption(option => option.setName("id").setDescription("OpenProject task ID").setRequired(true).setMinValue(1)))
 	.addSubcommand(command => command.setName("reconcile").setDescription("Reconcile an ambiguous task creation")
-		.addStringOption(option => option.setName("proposal").setDescription("Proposal UUID").setRequired(true))
+		.addStringOption(option => option.setName("proposal").setDescription("Creation or proposal UUID").setRequired(true))
 		.addIntegerOption(option => option.setName("work_package_id").setDescription("OpenProject work package ID").setRequired(true).setMinValue(1)))
 	.addSubcommand(command => command.setName("announce").setDescription("Retry a Discord task announcement")
 		.addIntegerOption(option => option.setName("id").setDescription("OpenProject task ID").setRequired(true).setMinValue(1))
@@ -110,6 +111,12 @@ type CreationDraft = {
 	startDate?: string; dueDate?: string; estimatedHours?: number;
 	sourceLinks: string[]; allowDuplicate?: boolean;
 };
+type CollectedContext = {
+	messages: MinimizedMessage[];
+	reverseAliases: Map<string, string>;
+	validIds: Set<string>;
+};
+const sensitiveOverrides = new Map<string, { userId: string; context: CollectedContext; expiresAt: number }>();
 
 const organizerGuildId = "1022942414090027008";
 async function contextDraft(id: string, userId: string, services: Services) {
@@ -412,12 +419,15 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 	await interaction.deferReply({ ephemeral: true });
 	if (subcommand === "reconcile") {
 		requireOrganizer(interaction, services);
-		await services.db.reconcileProposal(
+		const workPackageId = interaction.options.getInteger("work_package_id", true);
+		const workPackage = await services.openProject.workPackage(workPackageId);
+		await requireProjectAccess(interaction, projectIdFromWorkPackage(workPackage), services);
+		await services.db.reconcileCreation(
 			interaction.options.getString("proposal", true),
 			interaction.user.id,
-			interaction.options.getInteger("work_package_id", true),
+			workPackageId,
 		);
-		await interaction.editReply("Proposal reconciled; no second OpenProject task was created.");
+		await interaction.editReply("Creation reconciled; no second OpenProject task was created.");
 		return;
 	}
 	if (subcommand === "link-user") {
@@ -632,7 +642,29 @@ async function handleAiContext(interaction: MessageContextMenuCommandInteraction
 	if (!services.extractor.enabled) throw new Error("No task extraction provider is configured.");
 	await interaction.deferReply({ ephemeral: true });
 	const context = await collectContext(interaction.targetMessage, interaction);
-	const extraction = await services.extractor.extract(context.messages);
+	try {
+		await completeAiContext(interaction, services, context);
+	} catch (error) {
+		if (!(error instanceof SensitiveContentError)) throw error;
+		const id = randomUUID();
+		sensitiveOverrides.set(id, { userId: interaction.user.id, context, expiresAt: Date.now() + 10 * 60_000 });
+		setTimeout(() => sensitiveOverrides.delete(id), 10 * 60_000).unref();
+		await interaction.editReply({
+			content: "This context matched the sensitive-data heuristic. Nothing was sent to Azure. If this is a false positive, you can explicitly send the minimized context for this request only.",
+			components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
+				new ButtonBuilder().setCustomId(`op-sensitive-override:${id}`).setLabel("Send minimized context").setStyle(ButtonStyle.Danger),
+			)],
+		});
+	}
+}
+
+async function completeAiContext(
+	interaction: MessageContextMenuCommandInteraction | ButtonInteraction,
+	services: Services,
+	context: CollectedContext,
+	allowSensitiveContent = false,
+) {
+	const extraction = await services.extractor.extract(context.messages, { allowSensitiveContent });
 	const { result, deployment } = extraction;
 	const candidate = result.tasks.find(task =>
 		(task.classification === "explicit_commitment" || task.classification === "direct_assignment") &&
@@ -679,11 +711,27 @@ async function handleAiContext(interaction: MessageContextMenuCommandInteraction
 	});
 }
 
+async function handleSensitiveOverrideButton(interaction: ButtonInteraction, services: Services) {
+	if (!interaction.customId.startsWith("op-sensitive-override:")) return false;
+	const id = interaction.customId.split(":")[1];
+	const override = sensitiveOverrides.get(id);
+	if (override?.userId !== interaction.user.id || override.expiresAt <= Date.now()) {
+		sensitiveOverrides.delete(id);
+		throw new Error("This sensitive-content override expired. Run the message shortcut again.");
+	}
+	await requireCreator(interaction, services);
+	if (!services.config.aiChannels.has(interaction.channelId!)) throw new Error("AI extraction is not enabled in this channel.");
+	sensitiveOverrides.delete(id);
+	await interaction.deferUpdate();
+	await completeAiContext(interaction, services, override.context, true);
+	return true;
+}
+
 async function handleProposalButton(interaction: ButtonInteraction, services: Services) {
 	if (!interaction.customId.startsWith("op-review:") && !interaction.customId.startsWith("op-dismiss:")) return;
 	const id = interaction.customId.split(":")[1];
 	const proposal = await services.db.proposal(id);
-	if (!proposal || proposal.status !== "pending_review" || new Date(proposal.expires_at).getTime() <= Date.now() || (!proposal.permitted_reviewer_ids.includes(interaction.user.id) && proposal.requester_discord_id !== interaction.user.id)) throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
+	if (proposal?.status !== "pending_review" || new Date(proposal.expires_at).getTime() <= Date.now() || (!proposal.permitted_reviewer_ids.includes(interaction.user.id) && proposal.requester_discord_id !== interaction.user.id)) throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
 	if (interaction.customId.startsWith("op-dismiss:")) {
 		if (!await services.db.setProposalStatus(id, "dismissed", interaction.user.id)) {
 			throw new Error("This proposal was already handled by another reviewer.");
@@ -799,7 +847,7 @@ export function registerTaskInteractions(client: Client, services: Services) {
 			}
 			else if (interaction.isStringSelectMenu() || interaction.isUserSelectMenu()) await handleContextSelect(interaction, services);
 			else if (interaction.isButton()) {
-				if (!await handleContextContinue(interaction, services) && !await handleFinalCreationButton(interaction, services)) await handleProposalButton(interaction, services);
+				if (!await handleSensitiveOverrideButton(interaction, services) && !await handleContextContinue(interaction, services) && !await handleFinalCreationButton(interaction, services)) await handleProposalButton(interaction, services);
 			}
 			else if (interaction.isModalSubmit()) await handleModal(interaction, services);
 		} catch (error) {

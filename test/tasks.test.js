@@ -63,3 +63,25 @@ test("OpenProject creation uses dynamic type/size metadata and appends Discord c
 		globalThis.fetch = originalFetch;
 	}
 });
+
+test("OpenProject project membership checks the mapped principal", async () => {
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => new Response(JSON.stringify({
+		_embedded: {
+			elements: [
+				{ id: 1, _links: { principal: { href: "/api/v3/users/17" } } },
+			],
+		},
+	}), { status: 200 });
+	try {
+		const client = new OpenProjectClient({
+			OPENPROJECT_BASE_URL: "https://project.example",
+			OPENPROJECT_API_KEY: "test",
+			OPENPROJECT_CACHE_TTL_MS: 300000,
+		});
+		assert.equal(await client.isProjectMember(3, 17), true);
+		assert.equal(await client.isProjectMember(3, 18), false);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});

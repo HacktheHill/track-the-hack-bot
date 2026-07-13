@@ -93,3 +93,24 @@ test("sensitive content is rejected before an Azure request", async () => {
 		globalThis.fetch = originalFetch;
 	}
 });
+
+test("a manual override permits one explicitly approved sensitive request", async () => {
+	const sensitive = [{ id: "m1", authorAlias: "USER_1", text: "Please send the payroll spreadsheet", timestamp: "2026-07-13T00:00:00Z" }];
+	let requested = false;
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => {
+		requested = true;
+		return new Response(JSON.stringify({
+			choices: [{ message: { content: JSON.stringify({ summary: "", tasks: [], ambiguities: [] }) } }],
+		}), { status: 200 });
+	};
+	try {
+		await new AzureTaskExtractor(config, async () => "managed-identity-token").extract(
+			sensitive,
+			{ allowSensitiveContent: true },
+		);
+		assert.equal(requested, true);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});

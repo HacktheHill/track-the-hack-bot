@@ -129,9 +129,11 @@ Automatic extraction is controlled separately by `OPENPROJECT_AUTOMATION_MODE`:
 Azure OpenAI authentication uses managed identity rather than an API key. The
 bot bounds the context, aliases Discord identities, redacts common credentials
 and contact details, and rejects matching sensitive discussions before making
-an Azure request. This reduces exposure but is not a guarantee; use manual task
-creation for sensitive discussions. Keep automatic extraction off until it has
-been evaluated on representative conversations.
+an Azure request. For a manually requested draft, the requester can explicitly
+override a false positive for that one minimized request; the approval expires
+after ten minutes and is never available to automatic extraction. This reduces
+exposure but is not a guarantee. Keep automatic extraction off until it has been
+evaluated on representative conversations.
 
 ### Local containers
 

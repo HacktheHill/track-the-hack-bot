@@ -56,9 +56,10 @@ export type ExtractionResult = {
 	usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number };
 	escalationReason?: string;
 };
+export type ExtractionOptions = { allowSensitiveContent?: boolean };
 export interface TaskExtractor {
 	readonly enabled: boolean;
-	extract(messages: MinimizedMessage[]): Promise<ExtractionResult>;
+	extract(messages: MinimizedMessage[], options?: ExtractionOptions): Promise<ExtractionResult>;
 }
 
 const credentialPattern = /(?:api[_-]?key|token|password|secret|private[_-]?key|seed phrase|recovery phrase)\s*[:=]?\s*\S+/gi;
@@ -203,12 +204,12 @@ export class AzureTaskExtractor implements TaskExtractor {
 		return Boolean(this.config.AZURE_OPENAI_ENDPOINT && this.config.AZURE_OPENAI_DEPLOYMENT);
 	}
 
-	async extract(messages: MinimizedMessage[]) {
+	async extract(messages: MinimizedMessage[], options: ExtractionOptions = {}) {
 		const deployment = this.config.AZURE_OPENAI_DEPLOYMENT;
 		if (!this.config.AZURE_OPENAI_ENDPOINT || !deployment) {
 			throw new Error("Azure OpenAI extraction is not configured.");
 		}
-		if (containsSensitiveContent(messages)) {
+		if (containsSensitiveContent(messages) && !options.allowSensitiveContent) {
 			throw new SensitiveContentError("AI extraction was skipped because the conversation may contain sensitive information.");
 		}
 		for (let attempt = 0; ; attempt++) {
