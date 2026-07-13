@@ -87,9 +87,12 @@ az keyvault create \
 
 ## Managed databases
 
-Create new empty databases. Existing VM data is intentionally not migrated.
-Choose administrator credentials interactively and store application secrets in
-Key Vault.
+Create the managed databases first, but do not cut production traffic over to
+an empty Track the Hack schema. The VM database contains production user,
+hacker, verification, and audit data. Stop the VM web process for the final
+dump, import it into managed MySQL, compare per-table row counts, and only then
+change the Cloudflare origin. Choose administrator credentials interactively
+and store application secrets in Key Vault.
 
 ```bash
 az mysql flexible-server create \
@@ -171,8 +174,11 @@ The bot requires a system/user-assigned managed identity with:
 2. Initialize fresh MySQL and PostgreSQL schemas.
 3. Test private app-to-bot HTTPS, Discord Gateway, OpenProject, Azure OpenAI,
    health, and readiness endpoints.
-4. Point the existing Cloudflare hostname at `track-the-hack`.
-5. Keep the old VM deployment frozen for the agreed rollback window.
-6. Roll back Cloudflare routing if application or bot validation fails.
-7. After the window, remove the old PM2 processes, self-hosted runner, VM
+4. Stop the VM web process, take a final consistent MySQL dump, import it into
+   managed MySQL, and compare table counts and critical records.
+5. Point the existing Cloudflare hostname at `track-the-hack` and set
+   `AZURE_MIGRATION_ACTIVE=true` in both repositories.
+6. Keep the old VM deployment and database frozen for the agreed rollback window.
+7. Roll back Cloudflare routing if application or bot validation fails.
+8. After the window, remove the old PM2 processes, self-hosted runner, VM
    database, and VM only after backups and logs are verified.
