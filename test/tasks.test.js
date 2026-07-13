@@ -40,7 +40,9 @@ test("OpenProject creation uses dynamic type/size metadata and appends Discord c
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (url, init = {}) => {
 		calls.push({ url: String(url), init });
-		if (String(url).endsWith("/form")) return new Response(JSON.stringify({ _embedded: { validationErrors: {} } }), { status: 200 });
+		if (String(url).endsWith("/form")) return new Response(JSON.stringify({
+			_embedded: { validationErrors: {}, payload: { customField2: "Small" } },
+		}), { status: 200 });
 		return new Response(JSON.stringify({ id: 42, subject: "Ship portal", lockVersion: 1, _links: {} }), { status: 200 });
 	};
 	try {
@@ -52,10 +54,11 @@ test("OpenProject creation uses dynamic type/size metadata and appends Discord c
 			projectId: 3, subject: "Ship portal", description: "Complete it", typeId: 9,
 			sizeHref: "/api/v3/custom_options/7", sourceLinks: ["https://discord.com/channels/1/2/3"],
 		});
-		const payload = JSON.parse(calls[0].init.body);
-		assert.equal(payload._links.type.href, "/api/v3/types/9");
-		assert.equal(payload.customField2.href, "/api/v3/custom_options/7");
-		assert.match(payload.description.raw, /discord\.com\/channels\/1\/2\/3/);
+		const formPayload = JSON.parse(calls[0].init.body);
+		const commitPayload = JSON.parse(calls[1].init.body);
+		assert.equal(formPayload._links.type.href, "/api/v3/types/9");
+		assert.equal(commitPayload.customField2.href, "/api/v3/custom_options/7");
+		assert.match(formPayload.description.raw, /discord\.com\/channels\/1\/2\/3/);
 	} finally {
 		globalThis.fetch = originalFetch;
 	}

@@ -191,9 +191,13 @@ export class OpenProjectClient {
 		);
 		const errors = Object.values(form._embedded.validationErrors ?? {}).map(error => error.message);
 		if (errors.length) throw new Error(errors.join("; "));
+		const commitPayload = {
+			...(form._embedded.payload ?? payload),
+			...(input.sizeHref ? { [this.config.OPENPROJECT_SIZE_CUSTOM_FIELD]: { href: input.sizeHref } } : {}),
+		};
 		return this.request<WorkPackage>(
 			form._links?.commit?.href ?? `/api/v3/projects/${input.projectId}/work_packages`,
-			{ method: "POST", body: JSON.stringify(form._embedded.payload ?? payload) },
+			{ method: "POST", body: JSON.stringify(commitPayload) },
 		);
 	}
 
