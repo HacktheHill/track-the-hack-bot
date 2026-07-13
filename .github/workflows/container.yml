@@ -1,0 +1,44 @@
+name: Build and publish bot image
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    if: vars.AZURE_MIGRATION_ACTIVE == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - uses: azure/docker-login@v2
+        with:
+          login-server: ${{ vars.AZURE_ACR_LOGIN_SERVER }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ vars.AZURE_ACR_LOGIN_SERVER }}/track-the-hack-bot:${{ github.sha }}
+            ${{ vars.AZURE_ACR_LOGIN_SERVER }}/track-the-hack-bot:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: azure/cli@v2
+        if: github.ref == 'refs/heads/main'
+        with:
+          inlineScript: |
+            az containerapp update \
+              --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+              --name "track-the-hack-bot" \
+              --image "${{ vars.AZURE_ACR_LOGIN_SERVER }}/track-the-hack-bot:${{ github.sha }}"

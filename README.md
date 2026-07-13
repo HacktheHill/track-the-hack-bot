@@ -33,6 +33,10 @@ Track the Hack Bot is a Discord bot designed to automatically assign roles to ve
    TRACK_THE_HACK_URL=
    ```
 
+   Copy `.env.example` for the OpenProject, PostgreSQL, role/project mapping,
+   prohibited-channel, and optional Azure OpenAI settings. Azure inference uses
+   the VM's managed identity and does not accept a static API key.
+
    - `DISCORD_TOKEN`: Your Discord bot token.
    - `ORGANIZER_GUILD_ID`: The ID of the Organizer server.
    - `COMMUNITY_GUILD_ID`: The ID of the Community server.
@@ -57,6 +61,53 @@ Track the Hack Bot is a Discord bot designed to automatically assign roles to ve
 - **`/verify`**: Provides a verification link to the user to verify their account in the Community server.
 - **`/sync`**: Synchronizes roles and nicknames between the Organizer and Community servers.
 - **`/help`**: Displays information about the bot's commands and functionalities.
+- **`/task create`**: Creates an OpenProject task for a mapped organizer.
+- **`/task view|assign|reschedule|close|reopen`**: Performs the small set of
+  high-frequency task operations that should not require opening OpenProject.
+- **`/task link-user`** and **`/task configure-channel`**: Organizer-only setup
+  commands for persistent Discord user and channel mappings.
+- **Message → Apps → Create OpenProject task**: Creates a task with an automatic backlink.
+- **Message → Apps → Draft OpenProject task with AI**: Produces an ephemeral,
+  editable proposal in an explicitly allowlisted channel before creating anything.
+
+### OpenProject task integration
+
+Run `npm run register` after changing application commands. The integration is
+enabled only when `OPENPROJECT_BASE_URL`, `OPENPROJECT_API_KEY`, and
+`DATABASE_URL` are set. On startup the bot creates its small PostgreSQL schema
+and seeds Discord-to-OpenProject identity mappings from `OPENPROJECT_USER_MAP`.
+Organizers can maintain mappings without editing environment variables through
+`/task link-user` and `/task configure-channel`.
+
+New tasks default to today and seven days from today unless overridden with
+`OPENPROJECT_DEFAULT_START_TODAY` and `OPENPROJECT_DEFAULT_DUE_DAYS`. Priorities,
+types, projects, and size values are read from OpenProject instead of fixed IDs.
+Potentially duplicate open tasks are rejected with a link; `/task create` can
+explicitly override this with `allow_duplicate`.
+
+Enable the Discord developer portal's **Message Content Intent** for bounded AI
+context collection. Task creation can be prohibited independently from AI
+processing with `OPENPROJECT_BLOCKED_CHANNEL_IDS`; AI processing is opt-in with
+`OPENPROJECT_AI_CHANNEL_IDS`.
+
+Always-on extraction defaults to `off`. Use `shadow` to collect proposal metrics
+without posting cards, then `review` to post human-review cards after each
+configured idle interval. Automatic task creation is intentionally unavailable
+until the shadow/review accuracy measurements justify adding that policy.
+
+The Azure VM managed identity needs only inference access to the configured
+Azure OpenAI resource. Use Canadian non-Global deployments and restrict network
+access through a private endpoint where available.
+
+### Container deployment
+
+The bot has a production Dockerfile and a local PostgreSQL Compose file. The
+production target is Azure Container Apps with PostgreSQL Flexible Server; the
+Compose file is for local development and smoke testing only. The bot exposes
+`/healthz` for liveness and `/readyz` for readiness. The Track the Hack app
+should call `/verify` over private HTTPS using `x-track-the-hack-timestamp` and
+`x-track-the-hack-signature` (HMAC-SHA256 over `timestamp.body`). The legacy
+`secretKey` body is retained temporarily for cutover compatibility.
 
 ### Synchronization
 

@@ -9,6 +9,8 @@ on:
 
 jobs:
     build-and-deploy:
+        # Keep the VM deployment as the rollback path until ACA cutover is complete.
+        if: vars.AZURE_MIGRATION_ACTIVE != 'true'
         runs-on: self-hosted
         environment: Production
         steps:

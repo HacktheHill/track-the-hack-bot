@@ -1,0 +1,28 @@
+services:
+  bot-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: track_the_hack_bot
+      POSTGRES_USER: track_the_hack_bot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - bot_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U track_the_hack_bot -d track_the_hack_bot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://track_the_hack_bot:${POSTGRES_PASSWORD}@bot-db:5432/track_the_hack_bot
+    ports:
+      - "127.0.0.1:4000:4000"
+    depends_on:
+      bot-db:
+        condition: service_healthy
+volumes:
+  bot_pgdata:

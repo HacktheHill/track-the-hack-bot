@@ -2,6 +2,7 @@ import { REST } from "@discordjs/rest";
 import { Routes } from "discord-api-types/v9";
 import { SlashCommandBuilder } from "@discordjs/builders";
 import { config } from "dotenv";
+import { aiTaskMessageCommand, taskCommand, taskMessageCommand } from "./tasks.js";
 
 config();
 
@@ -34,6 +35,9 @@ const organizerCommands = [
 			"Synchronize roles and nicknames | Synchroniser les rôles et les surnoms",
 		)
 		.toJSON(),
+	taskCommand.toJSON(),
+	taskMessageCommand.toJSON(),
+	aiTaskMessageCommand.toJSON(),
 ];
 
 const sharedCommands = [
