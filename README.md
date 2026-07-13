@@ -3,7 +3,13 @@
 Track the Hack Bot verifies hackers, synchronizes organizer roles, and provides
 the Hack the Hill Discord-to-OpenProject task workflow.
 
-## Installation
+## Prerequisites
+
+- Node.js 24
+- A Discord application installed in the Organizer and Community servers
+- PostgreSQL and OpenProject, if the task integration will be enabled
+
+## Local setup
 
 1. **Clone the Repository**
 
@@ -12,116 +18,138 @@ the Hack the Hill Discord-to-OpenProject task workflow.
    cd track-the-hack-bot
    ```
 
-2. **Install Dependencies**
+2. **Install dependencies**
 
    ```bash
-   npm install
+   npm ci
    ```
 
-3. **Set Up Environment Variables**
+3. **Configure the environment**
 
-   Create a `.env` file in the root directory and add the following environment variables:
-
-   ```bash
-   DISCORD_TOKEN=
-   ORGANIZER_GUILD_ID=
-   COMMUNITY_GUILD_ID=
-   COMMUNITY_GUILD_HACKER_ROLE_ID=
-   COMMUNITY_GUILD_ORGANIZER_ROLE_ID=
-   ORGANIZER_GUILD_ORGANIZER_ROLE_ID=
-   LOG_CHANNEL_ID=
-   TRACK_THE_HACK_URL=
-   INTERNAL_API_SECRET=
+   ```sh
+   cp .env.example .env
    ```
 
-   Copy `.env.example` for the OpenProject, PostgreSQL, role/project mapping,
-   prohibited-channel, and optional Azure OpenAI settings. Azure inference uses
-   the bot workload's managed identity and does not accept a static API key.
+   Fill in the core Discord, role, log-channel, Track the Hack URL, and HMAC
+   values in `.env`. `CLIENT_ID` is required when registering commands. The
+   remaining OpenProject, PostgreSQL, mapping, and optional Azure OpenAI values
+   are documented in [.env.example](.env.example).
 
-   - `DISCORD_TOKEN`: Your Discord bot token.
-   - `ORGANIZER_GUILD_ID`: The ID of the Organizer server.
-   - `COMMUNITY_GUILD_ID`: The ID of the Community server.
-   - `COMMUNITY_GUILD_HACKER_ROLE_ID`: The ID of the role to be assigned to verified hackers.
-   - `COMMUNITY_GUILD_ORGANIZER_ROLE_ID`: The ID of the role to be assigned to organizers in the Community server.
-   - `ORGANIZER_GUILD_ORGANIZER_ROLE_ID`: The ID of the role that organizers have in the Organizer server.
-   - `LOG_CHANNEL_ID`: The ID of the channel to log bot activity.
-   - `INTERNAL_API_SECRET`: Shared secret used for timestamped HMAC verification requests from Track the Hack.
-   - `TRACK_THE_HACK_URL`: The URL of the Track the Hack platform.
-   - `PORT`: The port number on which the bot's server should run (default: 4000).
+   The core runtime values are:
 
-4. **Start the Bot**
+   | Variable | Purpose |
+   | --- | --- |
+   | `DISCORD_TOKEN` | Discord bot token |
+   | `COMMUNITY_GUILD_ID` | Community server |
+   | `ORGANIZER_GUILD_ID` | Organizer server |
+   | `COMMUNITY_GUILD_HACKER_ROLE_ID` | Role assigned after verification |
+   | `COMMUNITY_GUILD_ORGANIZER_ROLE_ID` | Organizer role managed in the Community server |
+   | `ORGANIZER_GUILD_ORGANIZER_ROLE_ID` | Source Organizer role and mapping-admin role |
+   | `LOG_CHANNEL_ID` | Community verification log channel |
+   | `TRACK_THE_HACK_URL` | Public Track the Hack application URL |
+   | `INTERNAL_API_SECRET` | Shared secret for signed verification requests |
+
+   `PORT` is optional and defaults to `4000`.
+
+4. **Register Discord commands**
 
    ```bash
+   npm run register
+   ```
+
+   Run this once for a new Discord application and again whenever the command
+   definitions change.
+
+5. **Build and start the bot**
+
+   ```bash
+   npm run build
    npm start
    ```
+
+   For development with automatic restarts, use `npm run dev` instead.
+
+### Discord application setup
+
+Enable the **Server Members Intent** and **Message Content Intent** in the
+Discord Developer Portal. Install the application with the `bot` and
+`applications.commands` scopes in both servers. The bot needs access to the
+channels it operates in, including permission to read message history and send
+messages. It also needs Manage Roles and Manage Nicknames, with its bot role
+above the Hacker and Organizer roles that it manages.
 
 ## Usage
 
 ### Commands
 
-- **`/verify`**: Provides a verification link to the user to verify their account in the Community server.
-- **`/sync`**: Synchronizes roles and nicknames between the Organizer and Community servers.
-- **`/help`**: Displays information about the bot's commands and functionalities.
-- **`/task create`**: Creates an OpenProject task for any Organizer-server member
-  with the Members role. Description is optional; date fields offer upcoming-date
-  autocomplete and also accept `YYYY-MM-DD`.
+- **`/verify`**: Get a Community-server verification link.
+- **`/sync`**: Synchronize the configured Organizer role and nicknames to the
+  Community server.
+- **`/help`**: Show server-specific command help.
+- **`/task create`**: Members-role users in the Organizer server create tasks;
+  the title is required, while the project can be selected explicitly or
+  inferred from the channel category or assignee's team. Description, assignee,
+  accountable user, priority, size, dates, and estimates are optional.
+- **`/task view|assign|reschedule|close|reopen|announce`**: Manage an existing task.
+- **`/task link-user`, `/task configure-category`, `/task reconcile`**: Organizer-only
+  identity, category mapping, and ambiguous-create recovery commands.
+- **Message → Apps → Create OpenProject task**: Create from a message with a backlink.
+- **Message → Apps → Draft OpenProject task with AI**: Create a private, reviewable
+  proposal in an AI-allowlisted channel; it never auto-creates a task.
 
-- **`/task view|assign|reschedule|close|reopen|announce`**: Performs the small set of
-  high-frequency task operations that should not require opening OpenProject.
-- **`/task link-user`** and **`/task configure-category`**: Organizer-only setup
-  commands for persistent Discord user and category mappings.
-- **Message → Apps → Create OpenProject task**: Creates a task with an automatic backlink.
-- **Message → Apps → Draft OpenProject task with AI**: Produces an ephemeral,
-  editable proposal in an explicitly allowlisted channel before creating anything.
-- **`/task reconcile`**: Organizer-only recovery command for an ambiguous
-  OpenProject create request after the created task has been checked.
+The bot also synchronizes the configured Organizer role and nickname when a
+member joins the Community server.
 
 ### OpenProject task integration
 
-Run `npm run register` after changing application commands. The integration is
-enabled only when `OPENPROJECT_BASE_URL`, `OPENPROJECT_API_KEY`, and
-`DATABASE_URL` are set. On startup the bot creates its small PostgreSQL schema
-and seeds Discord-to-OpenProject identity mappings from `OPENPROJECT_USER_MAP`.
-Organizers can maintain mappings without editing environment variables through
-`/task link-user` and `/task configure-category`. Task commands are available
-only in the Organizer server to members with the configured Members role.
+The integration is enabled when `OPENPROJECT_BASE_URL`, `OPENPROJECT_API_KEY`,
+`DATABASE_URL`, `ORGANIZER_GUILD_ID`, `ORGANIZER_GUILD_MEMBER_ROLE_ID`, and
+`ORGANIZER_GUILD_ORGANIZER_ROLE_ID` are valid. If they are not, verification,
+synchronization, and help remain available while task interactions are disabled.
 
-New tasks default to today and seven days from today unless overridden with
-`OPENPROJECT_DEFAULT_START_TODAY` and `OPENPROJECT_DEFAULT_DUE_DAYS`. Priorities,
-types, projects, and size values are read from OpenProject instead of fixed IDs.
-Potentially duplicate open tasks are rejected with a link; `/task create` can
-explicitly override this with `allow_duplicate`.
+On startup, the bot creates or updates its PostgreSQL schema and seeds identity
+and category mappings from the environment. Organizers can then maintain those
+mappings with `/task link-user` and `/task configure-category`. Members can
+access projects associated with their channel category or configured team
+roles. `OPENPROJECT_BLOCKED_CHANNEL_IDS` disables task creation in selected
+channels.
 
-Enable the Discord developer portal's **Message Content Intent** for bounded AI
-context collection. Task creation can be prohibited independently from AI
-processing with `OPENPROJECT_BLOCKED_CHANNEL_IDS`; AI processing is opt-in with
-`OPENPROJECT_AI_CHANNEL_IDS`.
+Projects, priorities, types, users, and sizes are loaded from OpenProject. New
+tasks default to today and seven days ahead. Similar open tasks are rejected;
+manual `/task create` requests can use `allow_duplicate` to override that check.
 
-Always-on extraction defaults to `off`. Use `shadow` to collect proposal metrics
-without posting cards, then `review` to post human-review cards after each
-configured idle interval. Automatic task creation is intentionally unavailable
-until the shadow/review accuracy measurements justify adding that policy.
+Manual AI drafting requires an allowlisted channel in
+`OPENPROJECT_AI_CHANNEL_IDS` and configured Azure OpenAI endpoint/deployment.
+Automatic extraction is controlled separately by `OPENPROJECT_AUTOMATION_MODE`:
 
-The bot uses Azure OpenAI through its managed identity. Conversation context is
-bounded and pseudonymized, and extraction is rejected before any Azure request
-when the deterministic sensitive-content filter matches. Prefer a Canadian
-regional deployment when available; Global Standard processing must be
-explicitly approved because inference can occur outside Canada. Keep automation
-off until the representative evaluation corpus meets the acceptance criteria.
+- `off` disables automatic extraction.
+- `shadow` stores proposals without posting review cards.
+- `review` posts human-review cards after the configured channel idle period.
+
+Azure OpenAI authentication uses managed identity rather than an API key. The
+bot bounds the context, aliases Discord identities, redacts common credentials
+and contact details, and rejects matching sensitive discussions before making
+an Azure request. This reduces exposure but is not a guarantee; use manual task
+creation for sensitive discussions. Keep automatic extraction off until it has
+been evaluated on representative conversations.
+
+### Local containers
+
+The Compose configuration runs the bot with PostgreSQL for local development
+and smoke testing. After configuring `.env`, start it with:
+
+```bash
+POSTGRES_PASSWORD=change-me docker compose -f docker-compose.local.yml up --build
+```
 
 ### Container deployment
 
-The bot has a production Dockerfile and a local PostgreSQL Compose file. The
-production target is Azure Container Apps with PostgreSQL Flexible Server; the
-Compose file is for local development and smoke testing only. The bot exposes
-`/healthz` for liveness and `/readyz` for readiness. The Track the Hack app
-should call `/verify` over private HTTPS using `x-track-the-hack-timestamp` and
-`x-track-the-hack-signature` (HMAC-SHA256 over `timestamp.body`). Requests
-without a valid timestamped signature are rejected.
-
-### Synchronization
-
-When a new member joins the Community server, the bot automatically synchronizes their roles and nickname with those from the Organizer server. This can also be triggered manually using the `/sync` command.
+Production runs as a private Azure Container App with managed PostgreSQL. The
+bot exposes `/healthz` and `/readyz`; Track the Hack calls `/verify` over private
+HTTPS with `x-track-the-hack-timestamp` and `x-track-the-hack-signature`
+(HMAC-SHA256 over `timestamp.body`). Invalid or expired signatures are rejected.
+Bot-specific deployment and release guidance is in
+[infra/README.md](infra/README.md).
 
 ## Contributing
 

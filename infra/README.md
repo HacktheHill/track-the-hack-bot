@@ -1,224 +1,123 @@
-# Azure deployment runbook
+# Bot deployment guide
 
-This repository does not contain subscription-specific resource IDs, so the
-commands below are deliberately parameterized. Authenticate `az`, confirm the
-subscription and existing VNet/subnets, then run them from an operator shell.
-Do not put database passwords or API keys in command history; use Key Vault or
-interactive secret prompts.
+This document covers only the infrastructure owned by the Track the Hack bot.
+Shared web application, Cloudflare, MySQL, and organization-wide platform
+operations belong in the corresponding private operations documentation.
 
-The production Container Apps names are exactly:
+## Production shape
 
-- `track-the-hack` — web application with internal ACA ingress; public access is through Cloudflare Access
-- `track-the-hack-bot` — private bot API and Discord Gateway process
+The production bot runs as a single Azure Container App process with:
 
-The current deployed environment is `hack-the-hill-ca` in Canada Central. The
-web app is available inside the environment at
-`track-the-hack.internal.greenstone-ff9cdbe8.canadacentral.azurecontainerapps.io`;
-the bot uses the internal hostname
-`track-the-hack-bot.internal.greenstone-ff9cdbe8.canadacentral.azurecontainerapps.io`.
-The web database is `track-the-hack-mysql-ce` in Canada East (connected through
-VNet peering because MySQL provisioning was unavailable in Canada Central), and
-the bot database is `track-the-hack-bot-postgres` in Canada Central.
+- an image built from the repository's `Dockerfile` and stored in Azure
+  Container Registry;
+- internal ingress on port 4000;
+- one minimum and one maximum replica, because it maintains a Discord Gateway
+  connection and in-memory message batches;
+- private connectivity to PostgreSQL and the Track the Hack web application;
+- secrets supplied through Container Apps secret bindings or Key Vault
+  references; and
+- an Azure managed identity when Azure OpenAI extraction is enabled.
 
-The production Cloudflare Access/tunnel route for `tracker.hackthehill.com`
-uses the internal web ACA hostname. The existing tunnel is remotely managed
-and runs through the dedicated `track-the-hack-tunnel` Container App. This
-keeps Cloudflare Access while preventing clients from bypassing Cloudflare and
-removes the VM from the request path.
+The Track the Hack web application calls `POST /verify` over the private
+Container Apps network. Both workloads must use the same `INTERNAL_API_SECRET`.
+Requests are authenticated with `x-track-the-hack-timestamp` and
+`x-track-the-hack-signature`, where the signature is HMAC-SHA256 over
+`timestamp.body`.
 
-Do not copy a tunnel token into a repository, deployment argument, or shell
-history. Retrieve it from **Cloudflare > Networking > Tunnels > Add a replica**
-and enter it directly into Key Vault. A Key Vault-backed Container Apps secret
-should expose it to the pinned `cloudflare/cloudflared:2026.7.1` image as
-`TUNNEL_TOKEN`; run the container with `tunnel --no-autoupdate run`. The tunnel
-app needs no ingress, one minimum replica, and access to the same VNet-integrated
-Container Apps environment as `track-the-hack`.
+## Runtime configuration
 
-## Required existing values
+Use [.env.example](../.env.example) as the configuration inventory. Do not put
+production secrets in `.env`, deployment arguments, shell history, or this
+repository. Store at least the following as secret values:
 
-```bash
-az login
-az account set --subscription "$SUBSCRIPTION_ID"
-az account show
+- `DISCORD_TOKEN`
+- `INTERNAL_API_SECRET`
+- `OPENPROJECT_API_KEY`
+- `DATABASE_URL`
 
-export RG="<resource-group>"
-export LOCATION="canadacentral"
-export VNET_ID="/subscriptions/.../virtualNetworks/..."
-export ACA_SUBNET_ID="/subscriptions/.../subnets/aca"
-export DB_SUBNET_ID="/subscriptions/.../subnets/database"
-```
+The other Discord IDs, OpenProject mappings, and feature settings can be normal
+Container App environment variables unless organizational policy requires them
+to be secrets.
 
-The ACA subnet must be delegated to `Microsoft.App/environments`. Database
-subnets must be delegated to the appropriate Flexible Server provider and must
-have private DNS zones configured. Keep ACA and database subnets separate.
+The OpenProject integration is enabled only when all required values accepted by
+`src/config.ts` are present. At startup, the bot creates and alters its small
+PostgreSQL schema and seeds environment-provided mappings. The database principal
+therefore currently requires DDL permissions as well as runtime DML permissions.
+If migrations are separated from application startup in the future, update both
+the implementation and this guide together.
 
-## Shared platform resources
+## Managed identity and Azure OpenAI
 
-```bash
-az provider register --namespace Microsoft.App
-az provider register --namespace Microsoft.ContainerRegistry
-az provider register --namespace Microsoft.DBforMySQL
-az provider register --namespace Microsoft.DBforPostgreSQL
-az provider register --namespace Microsoft.KeyVault
+Azure OpenAI is optional. When configured, set `AZURE_OPENAI_ENDPOINT` and
+`AZURE_OPENAI_DEPLOYMENT`; do not configure an OpenAI API key. The bot uses
+`DefaultAzureCredential`, so either a system-assigned or user-assigned Container
+App identity can be used. For a user-assigned identity, configure its client ID
+as required by the Azure identity environment.
 
-az acr create \
-  --resource-group "$RG" \
-  --name "<globally-unique-acr-name>" \
-  --location "$LOCATION" \
-  --sku Basic \
-  --admin-enabled false
+Grant the selected identity the minimum inference role required by the Azure
+OpenAI resource, such as **Cognitive Services OpenAI User**. Registry pull and
+Key Vault access should likewise be granted only to the identity that needs
+them.
 
-az monitor log-analytics workspace create \
-  --resource-group "$RG" \
-  --workspace-name "hack-the-hill-logs" \
-  --location "$LOCATION"
+Before enabling automatic extraction, evaluate at least 100 representative
+conversation windows and record latency, valid-JSON rate, false-task rate,
+assignee accuracy, deadline accuracy, token usage, and estimated cost. Keep
+`OPENPROJECT_AUTOMATION_MODE=off` during evaluation, then use `shadow` before
+`review`. The bot never creates tasks automatically.
 
-az containerapp env create \
-  --resource-group "$RG" \
-  --name "hack-the-hill-ca" \
-  --location "$LOCATION" \
-  --infrastructure-subnet-resource-id "$ACA_SUBNET_ID" \
-  --logs-workspace-id "<workspace-id>" \
-  --logs-workspace-key "<workspace-key>"
+## Build and deployment workflow
 
-Create one RBAC-enabled vault and managed identity only where a workload needs
-one. Production uses dedicated secrets for the bot, web application, Prisma
-Studio, and tunnel. Grant each identity `Key Vault Secrets User` only on its
-own vault.
+[container.yml](../.github/workflows/container.yml) validates the application,
+runs the tests, and builds the image for pull requests. For non-pull-request
+runs, it publishes an immutable image tagged with the Git commit SHA when the
+repository variable `AZURE_MIGRATION_ACTIVE` is `true`. Pushes to `main` also
+update the `track-the-hack-bot` Container App and verify that an active revision
+is healthy.
 
-```bash
-for workload in bot web prisma tunnel; do
-  az identity create --resource-group "$RG" --name "track-the-hack-${workload}"
-  az keyvault create \
-    --resource-group "$RG" \
-    --name "<globally-unique-${workload}-vault-name>" \
-    --location "$LOCATION" \
-    --enable-rbac-authorization true
-done
-```
+Configure these as repository or Production-environment settings, according to
+the repository's GitHub environment policy:
 
-## Managed databases
+| Kind | Name | Purpose |
+| --- | --- | --- |
+| Secret | `AZURE_CLIENT_ID` | Federated deployment identity |
+| Secret | `AZURE_TENANT_ID` | Azure tenant |
+| Secret | `AZURE_SUBSCRIPTION_ID` | Azure subscription |
+| Variable | `AZURE_ACR_LOGIN_SERVER` | Registry login server |
+| Variable | `AZURE_RESOURCE_GROUP` | Container App resource group |
+| Variable | `AZURE_MIGRATION_ACTIVE` | Enables image publication/deployment |
 
-Production data is in managed MySQL and PostgreSQL Flexible Server instances.
-Their public network access is disabled; retain the VNet peerings and private
-DNS zones that resolve their current private hostnames.
+The federated deployment identity needs permission to push to the registry and
+update the bot Container App. The Container App's runtime identity separately
+needs `AcrPull` on the registry.
 
-```bash
-az mysql flexible-server create \
-  --resource-group "$RG" \
-  --name "track-the-hack-mysql-ce" \
-  --location "canadaeast" \
-  --version 8.0.21 \
-  --sku-name Standard_B1ms \
-  --storage-size 32 \
-  --vnet "<database-vnet-in-canadaeast>" \
-  --subnet "<mysql-subnet-in-canadaeast>" \
-  --private-dns-zone "<mysql-private-dns-zone-id>"
+## Health probes
 
-az postgres flexible-server create \
-  --resource-group "$RG" \
-  --name "track-the-hack-bot-postgres" \
-  --location "$LOCATION" \
-  --version 16 \
-  --sku-name Standard_B1ms \
-  --storage-size 32 \
-  --vnet "$VNET_ID" \
-  --subnet "$DB_SUBNET_ID" \
-  --private-dns-zone "<postgres-private-dns-zone-id>"
-```
+Configure the bot Container App probes against the root-level endpoints:
 
-Use separate MySQL and PostgreSQL subnets if the selected Azure region/provider
-requires separate delegation. Confirm the current CLI syntax with `az ... -h`
-after authentication before provisioning.
+- `GET /healthz` for liveness; and
+- `GET /readyz` for readiness.
 
-Use distinct MySQL principals:
+Readiness returns 200 only after the Discord client is ready and OpenProject
+integration initialization has completed or been intentionally disabled.
 
-- `track_the_hack_app`: runtime DML only; no DDL or grant permissions;
-- `track_the_hack_prisma`: read-only (`SELECT`) for Prisma Studio.
+## OpenProject service account
 
-## Container Apps
-
-Build and publish the bot image using `.github/workflows/container.yml`. Build
-the Track the Hack application from its own repository into a separate image.
-
-```bash
-az containerapp create \
-  --resource-group "$RG" \
-  --name "track-the-hack" \
-  --environment "hack-the-hill-ca" \
-  --image "<acr>.azurecr.io/track-the-hack:<git-sha>" \
-  --registry-server "<acr>.azurecr.io" \
-  --registry-identity system \
-  --system-assigned \
-  --ingress internal \
-  --target-port 3000 \
-  --min-replicas 1 \
-  --max-replicas 2
-
-az containerapp create \
-  --resource-group "$RG" \
-  --name "track-the-hack-bot" \
-  --environment "hack-the-hill-ca" \
-  --image "<acr>.azurecr.io/track-the-hack-bot:<git-sha>" \
-  --registry-server "<acr>.azurecr.io" \
-  --registry-identity system \
-  --system-assigned \
-  --ingress internal \
-  --target-port 4000 \
-  --min-replicas 1 \
-  --max-replicas 1
-```
-
-Configure secrets through Key Vault references or Container Apps secret
-bindings. Set `DISCORD_BOT_URL` in the web app to the bot's internal HTTPS
-address and set `INTERNAL_API_SECRET` in both apps. The bot accepts only a
-timestamped HMAC request (`x-track-the-hack-timestamp` and
-`x-track-the-hack-signature`) from the web app.
-
-The bot requires its dedicated user-assigned managed identity with:
-
-- AcrPull on the registry;
-- inference permission on the Azure OpenAI resource;
-- read access to its Key Vault secrets;
-- PostgreSQL connection access as configured by the database authentication mode.
-
-Production alerting uses the `TrackTheHack-Alerts` action group
-(`development@ctn-rtc.org`) and currently includes restart and zero-replica
-metric alerts for both `track-the-hack` and `track-the-hack-bot`. Keep these
-alerts enabled when changing revision scaling or names.
-
-Runtime startup must not make schema changes. Plan and review any future
-database migration as a separate, temporary privileged operation rather than
-keeping a permanent migration workload or credential in production. Configure
-`/api/healthz` as liveness and `/api/readyz` as readiness.
-
-## Azure task extraction
-
-The bot uses the `track-the-hack-ai` Azure OpenAI resource through its Container
-App managed identity. Configure `AZURE_OPENAI_ENDPOINT` and one deployment name,
-`AZURE_OPENAI_DEPLOYMENT`. Do not configure an API key. The
-identity needs only the Cognitive Services OpenAI User role on that resource.
-
-The bot bounds and pseudonymizes context before inference. It removes common
-credentials and contact details, omits attachment contents, and rejects the
-entire extraction before requesting Azure when its deterministic sensitive-data
-filter matches. This is risk reduction rather than a guarantee; use manual task
-creation for sensitive discussions.
-
-Before enabling this in production, benchmark at least 100 representative
-conversation windows and record inference latency, valid JSON rate, false-task
-rate, assignee accuracy, deadline accuracy, token use, and estimated cost. Keep
-`OPENPROJECT_AUTOMATION_MODE=off` until that evaluation is complete, then use
-`shadow` before `review`. Automatic creation is not enabled.
+[provision-openproject-integration.rb](provision-openproject-integration.rb)
+creates or reconciles a least-privilege OpenProject service account, role, and
+project memberships. Run it through Rails runner inside the OpenProject
+application environment. Set `INTEGRATION_PROJECT_IDS` explicitly rather than
+relying on the script's defaults. When `ROTATE_API_TOKEN=true`, its standard
+output is the newly generated API token; use a restrictive umask, redirect that
+output directly to a mode-600 file, and transfer it to the bot's secret store.
+Never print or commit the token.
 
 ## Release checks
 
-1. Build a versioned image in `trackthehackacr` and deploy the corresponding
-   internal Container App revision.
-2. Verify the web app, bot `/healthz` and `/readyz`, Discord Gateway,
-   OpenProject, and the private web-to-bot HMAC call.
-3. Verify `tracker.hackthehill.com` and `prisma.hackthehill.com` through
-   Cloudflare Access. The remote tunnel ingress rules must set
-   `originRequest.httpHostHeader` to the relevant internal ACA FQDN.
-4. Keep the four Container Apps, managed databases, ACR, private DNS/VNet
-   dependencies, dedicated Key Vaults, and production alerts under monitoring.
+1. Confirm CI tests and the container build pass for the intended commit.
+2. Deploy an immutable commit-SHA image and confirm an active revision is healthy.
+3. Check `/healthz`, `/readyz`, and the Discord Gateway connection.
+4. Exercise an authenticated Track the Hack-to-bot verification request.
+5. If enabled, verify PostgreSQL and OpenProject operations from a permitted
+   Organizer channel.
+6. If enabled, test Azure OpenAI drafting in an allowlisted non-sensitive channel.
+7. Confirm monitoring covers restarts, unhealthy revisions, and zero replicas.
