@@ -7,7 +7,7 @@ import { loadIntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient } from "./openproject.js";
 import { registerTaskInteractions } from "./tasks.js";
-import { AzureTaskExtractor } from "./azure-openai.js";
+import { HybridTaskExtractor } from "./azure-openai.js";
 import { registerAutomaticTaskDetection } from "./automatic-tasks.js";
 
 config();
@@ -63,7 +63,7 @@ client.once("ready", async () => {
 			config: integrationConfig,
 			db,
 			openProject: new OpenProjectClient(integrationConfig),
-			extractor: new AzureTaskExtractor(integrationConfig),
+			extractor: new HybridTaskExtractor(integrationConfig),
 		};
 		registerTaskInteractions(client, services);
 		registerAutomaticTaskDetection(client, services);

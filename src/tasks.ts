@@ -27,7 +27,7 @@ import { randomUUID } from "node:crypto";
 import type { IntegrationConfig, TeamMapping } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient } from "./openproject.js";
-import { AzureTaskExtractor, minimizeText, type MinimizedMessage } from "./azure-openai.js";
+import { minimizeText, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 
 export const taskCommand = new SlashCommandBuilder()
 	.setName("task")
@@ -91,7 +91,7 @@ export const aiTaskMessageCommand = new ContextMenuCommandBuilder()
 	.setName("Draft OpenProject task with AI")
 	.setType(ApplicationCommandType.Message);
 
-type Services = { config: IntegrationConfig; db: Database; openProject: OpenProjectClient; extractor: AzureTaskExtractor };
+type Services = { config: IntegrationConfig; db: Database; openProject: OpenProjectClient; extractor: TaskExtractor };
 type ContextDraft = {
 	userId: string; channelId: string; targetId: string; title: string; description: string;
 	projectId?: number; assigneeId?: string; expiresAt: number;
@@ -469,7 +469,7 @@ async function handleAiContext(interaction: MessageContextMenuCommandInteraction
 	if (interaction.commandName !== aiTaskMessageCommand.name) return;
 	await requireCreator(interaction, services);
 	if (!services.config.aiChannels.has(interaction.channelId)) throw new Error("AI extraction is not enabled in this channel.");
-	if (!services.extractor.enabled) throw new Error("Azure OpenAI is not configured.");
+	if (!services.extractor.enabled) throw new Error("No task extraction provider is configured.");
 	await interaction.deferReply({ ephemeral: true });
 	const context = await collectContext(interaction.targetMessage, interaction);
 	const { result, deployment } = await services.extractor.extract(context.messages);

@@ -1,10 +1,10 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, Message } from "discord.js";
-import { AzureTaskExtractor, minimizeText, type MinimizedMessage } from "./azure-openai.js";
+import { minimizeText, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 import type { IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient } from "./openproject.js";
 
-type AutomaticServices = { config: IntegrationConfig; db: Database; extractor: AzureTaskExtractor; openProject: OpenProjectClient };
+type AutomaticServices = { config: IntegrationConfig; db: Database; extractor: TaskExtractor; openProject: OpenProjectClient };
 type Batch = { messages: Message[]; timer: NodeJS.Timeout };
 
 export function registerAutomaticTaskDetection(client: Client, services: AutomaticServices) {

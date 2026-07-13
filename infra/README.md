@@ -8,26 +8,23 @@ interactive secret prompts.
 
 The production Container Apps names are exactly:
 
-- `track-the-hack` — public web application
+- `track-the-hack` — web application with internal ACA ingress; public access is through Cloudflare Access
 - `track-the-hack-bot` — private bot API and Discord Gateway process
 
 The current deployed environment is `hack-the-hill-ca` in Canada Central. The
-web app is available at its temporary ACA hostname
-`track-the-hack.greenstone-ff9cdbe8.canadacentral.azurecontainerapps.io`; the
-bot uses the internal hostname
+web app is available inside the environment at
+`track-the-hack.internal.greenstone-ff9cdbe8.canadacentral.azurecontainerapps.io`;
+the bot uses the internal hostname
 `track-the-hack-bot.internal.greenstone-ff9cdbe8.canadacentral.azurecontainerapps.io`.
 The web database is `track-the-hack-mysql-ce` in Canada East (connected through
 VNet peering because MySQL provisioning was unavailable in Canada Central), and
 the bot database is `track-the-hack-bot-postgres` in Canada Central.
 
-The ACA endpoints are validated, but the production Cloudflare Access/tunnel
-route for `tracker.hackthehill.com` still points at the VM. The existing tunnel
-is remotely managed. Add its token to Key Vault as `cloudflare-tunnel-token`,
-run a dedicated `track-the-hack-tunnel` Container App as another replica, and
-change the published application's service URL to the web ACA hostname. After
-validation, make the web ingress internal and update the service URL to its
-internal ACA hostname. This keeps Cloudflare Access while preventing clients
-from bypassing Cloudflare and removes the VM from the request path.
+The production Cloudflare Access/tunnel route for `tracker.hackthehill.com`
+uses the internal web ACA hostname. The existing tunnel is remotely managed
+and runs through the dedicated `track-the-hack-tunnel` Container App. This
+keeps Cloudflare Access while preventing clients from bypassing Cloudflare and
+removes the VM from the request path.
 
 Do not copy a tunnel token into a repository, deployment argument, or shell
 history. Retrieve it from **Cloudflare > Networking > Tunnels > Add a replica**
@@ -190,6 +187,50 @@ The bot requires a system/user-assigned managed identity with:
 - inference permission on the Azure OpenAI resource;
 - read access to its Key Vault secrets;
 - PostgreSQL connection access as configured by the database authentication mode.
+
+## Private local task extraction
+
+The bot uses a local Qwen3 4B GGUF model as its primary task extractor. The
+worker is a separate Docker container on the `track-the-hack` VM and is exposed
+on private address `10.0.0.4:8090` only. `infra/local-model.compose.yml` pins
+the official `llama.cpp` server image, downloads `Qwen/Qwen3-4B-GGUF:Q4_K_M`
+into a persistent model cache, limits the worker to 1.5 CPUs and 4 GiB, and
+allows one request at a time.
+
+Create the private NSG rule before starting the worker:
+
+```bash
+az network nsg rule create \
+  --resource-group TRACK-THE-HACK \
+  --nsg-name track-the-hack-nsg \
+  --name Allow-ACA-Local-Model \
+  --priority 310 \
+  --direction Inbound \
+  --access Allow \
+  --protocol Tcp \
+  --source-address-prefixes 10.0.4.0/23 \
+  --source-port-ranges '*' \
+  --destination-address-prefixes 10.0.0.4 \
+  --destination-port-ranges 8090
+```
+
+On the VM, start the worker with Docker Compose:
+
+```bash
+docker compose -f /path/to/infra/local-model.compose.yml up -d
+curl --fail http://127.0.0.1:8090/health
+```
+
+Set the bot's `LOCAL_MODEL_ENDPOINT` to
+`http://10.0.0.4:8090/v1`, keep `OPENPROJECT_AI_ESCALATION_MODE=ambiguous`
+until evaluation is complete, and leave `OPENPROJECT_AUTOMATION_MODE=off`.
+The bot only sends pseudonymized, non-sensitive ambiguous cases to Azure;
+sensitive cases remain local and require human review.
+
+Before enabling this in production, benchmark at least 100 representative
+conversation windows and record peak RSS, inference latency, swap use, valid
+JSON rate, false-task rate, assignee accuracy, deadline accuracy, and impact on
+the database and Discord services.
 
 ## Cutover and rollback
 
