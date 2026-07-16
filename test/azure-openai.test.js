@@ -57,10 +57,29 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 		assert.match(request.body.messages[0].content, /timestamps/);
 		assert.match(request.body.messages[0].content, /priority_name must exactly match one of: High/);
 		assert.match(request.body.messages[0].content, /size_name must exactly match one of: Small/);
-		assert.deepEqual(JSON.parse(request.body.messages[1].content)[0], {
+		assert.deepEqual(JSON.parse(request.body.messages[1].content[0].text)[0], {
 			id: "m1", authorAlias: "USER_1", text: "Ship it",
 			timestamp: "2026-07-13T00:00:00Z", contextRole: "primary",
 		});
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("Azure extractor sends image attachments as multimodal inputs", async () => {
+	const originalFetch = globalThis.fetch;
+	let request;
+	globalThis.fetch = async (url, init) => {
+		request = { url: String(url), body: JSON.parse(init.body) };
+		return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ summary: "", tasks: [], ambiguities: [] }) } }] }), { status: 200 });
+	};
+	try {
+		await new AzureTaskExtractor({ ...config, OPENPROJECT_AI_MAX_IMAGE_ATTACHMENTS: 8 }, async () => "token").extract([{
+			id: "m1", authorAlias: "USER_1", text: "Review this screenshot", timestamp: "2026-07-13T00:00:00Z", contextRole: "primary",
+			attachments: [{ id: "a1", name: "schema.png", contentType: "image/png", url: "https://cdn.discordapp.com/attachments/1/2/schema.png" }],
+		}]);
+		assert.equal(request.body.messages[1].content[1].type, "image_url");
+		assert.equal(request.body.messages[1].content[1].image_url.detail, "high");
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
@@ -79,6 +98,21 @@ test("Azure extractor retries malformed structured output only once", async () =
 			{ id: "m1", authorAlias: "USER_1", text: "Ship it", timestamp: "2026-07-13T00:00:00Z" },
 		]);
 		assert.equal(calls, 2);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("Azure extraction returns one assessment for every supplied message", async () => {
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ summary: "", message_assessments: [{ message_id: "m1", relevance: "relevant", significance_score: 0.8, rationale: "assignment" }], tasks: [], ambiguities: [] }) } }] }), { status: 200 });
+	try {
+		const result = await new AzureTaskExtractor(config, async () => "token").extract([
+			{ id: "m1", authorAlias: "USER_1", text: "Ship it", timestamp: "2026-07-13T00:00:00Z" },
+			{ id: "m2", authorAlias: "USER_2", text: "Unrelated", timestamp: "2026-07-13T00:01:00Z" },
+		]);
+		assert.deepEqual(result.result.message_assessments.map(item => item.message_id), ["m1", "m2"]);
+		assert.equal(result.result.message_assessments[1].relevance, "unclear");
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
