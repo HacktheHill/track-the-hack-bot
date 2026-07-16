@@ -1,9 +1,10 @@
 {
 	"compilerOptions": {
+		"rootDir": "./src",
 		"outDir": "./dist",
-		"module": "ESNext",
-		"target": "ESNext",
-		"moduleResolution": "node",
+		"module": "NodeNext",
+		"target": "ES2024",
+		"moduleResolution": "NodeNext",
 		"strict": true,
 		"esModuleInterop": true,
 		"skipLibCheck": true
