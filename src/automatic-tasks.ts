@@ -22,11 +22,10 @@ async function categoryProject(message: Message, services: AutomaticServices) {
 	return undefined;
 }
 
-async function isExternalChannel(message: Message, services: AutomaticServices) {
-	if (!services.config.externalCategoryId) return false;
+async function isExcludedChannel(message: Message, services: AutomaticServices) {
 	let channel = await message.guild!.channels.fetch(message.channelId).catch(() => null);
 	for (let depth = 0; channel && depth < 5; depth++) {
-		if (channel.id === services.config.externalCategoryId) return true;
+		if (services.config.excludedChannelIds.has(channel.id)) return true;
 		if (!channel.parentId) break;
 		channel = await message.guild!.channels.fetch(channel.parentId).catch(() => null);
 	}
@@ -42,7 +41,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 		if (!batch) return;
 		batches.delete(channelId);
 		const source = batch.messages.slice(-30);
-		if (source[0] && await isExternalChannel(source[0], services)) return;
+		if (source[0] && await isExcludedChannel(source[0], services)) return;
 		const aliases = new Map<string, string>();
 		const reverse = new Map<string, string>();
 		const aliasFor = (id: string) => {
@@ -196,8 +195,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 
 	client.on("messageCreate", async message => {
 		if (!message.inGuild() || !isOrganizerGuild(services.config, message.guildId) || message.author.bot || message.system) return;
-		if (services.config.blockedChannels.has(message.channelId)) return;
-		if (await isExternalChannel(message, services)) return;
+		if (await isExcludedChannel(message, services)) return;
 		const existing = batches.get(message.channelId);
 		if (existing) clearTimeout(existing.timer);
 		const messages = [...(existing?.messages ?? []), message].slice(-30);

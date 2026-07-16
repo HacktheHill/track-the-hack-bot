@@ -33,3 +33,24 @@ test("OpenProject features are restricted to the configured Organizer guild", ()
 	assert.equal(isOrganizerGuild(config, "community"), false);
 	assert.equal(isOrganizerGuild(config, null), false);
 });
+
+test("excluded channel configuration merges legacy blocks and category exclusions", () => {
+	const previous = { ...process.env };
+	Object.assign(process.env, {
+		OPENPROJECT_BASE_URL: "https://project.example",
+		OPENPROJECT_API_KEY: "test",
+		DATABASE_URL: "postgresql://localhost/test",
+		ORGANIZER_GUILD_ID: "1",
+		ORGANIZER_GUILD_MEMBER_ROLE_ID: "2",
+		ORGANIZER_GUILD_ORGANIZER_ROLE_ID: "3",
+		OPENPROJECT_BLOCKED_CHANNEL_IDS: '["blocked"]',
+		OPENPROJECT_EXCLUDED_CHANNEL_IDS: '["external-category","other-channel"]',
+	});
+	try {
+		const config = loadIntegrationConfig();
+		assert.deepEqual([...config.excludedChannelIds].sort(), ["blocked", "external-category", "other-channel"]);
+	} finally {
+		for (const key of Object.keys(process.env)) delete process.env[key];
+		Object.assign(process.env, previous);
+	}
+});

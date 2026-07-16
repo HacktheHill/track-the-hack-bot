@@ -303,9 +303,8 @@ async function requireCreator(interaction: ChatInputCommandInteraction | Message
 	if (!interaction.inGuild() || !isOrganizerGuild(services.config, interaction.guildId)) {
 		throw new Error("OpenProject tasks are available only in the Organizer Discord server.");
 	}
-	if (services.config.blockedChannels.has(interaction.channelId!)) throw new Error("Task creation is disabled in this channel.");
-	if (services.config.externalCategoryId && await isExternalChannel(interaction.channelId!, interaction.guild!, services.config.externalCategoryId)) {
-		throw new Error("Task extraction is disabled in the External category.");
+	if (await isExcludedChannel(interaction.channelId!, interaction.guild!, services.config.excludedChannelIds)) {
+		throw new Error("Task creation and extraction are disabled in this channel or its category.");
 	}
 	const member = await interaction.guild!.members.fetch(interaction.user.id);
 	if (!member.roles.cache.has(services.config.ORGANIZER_GUILD_MEMBER_ROLE_ID)) {
@@ -314,11 +313,10 @@ async function requireCreator(interaction: ChatInputCommandInteraction | Message
 	return member;
 }
 
-async function isExternalChannel(channelId: string, guild: Guild, externalCategoryId?: string) {
-	if (!externalCategoryId) return false;
+export async function isExcludedChannel(channelId: string, guild: Guild, excludedIds: ReadonlySet<string>) {
 	let channel = await guild.channels.fetch(channelId).catch(() => null);
 	for (let depth = 0; channel && depth < 5; depth++) {
-		if (channel.id === externalCategoryId || channel.type === ChannelType.GuildCategory && channel.id === externalCategoryId) return true;
+		if (excludedIds.has(channel.id)) return true;
 		if (!channel.parentId) break;
 		channel = await guild.channels.fetch(channel.parentId).catch(() => null);
 	}
