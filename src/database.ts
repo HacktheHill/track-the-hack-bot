@@ -4,6 +4,20 @@ import { randomUUID } from "node:crypto";
 
 const { Pool } = pg;
 
+export type ScheduledMessage = {
+	id: string;
+	guildId: string;
+	channelId: string;
+	createdByDiscordId: string;
+	schedulerName: string;
+	schedulerAvatarUrl: string | null;
+	content: string;
+	sendAt: string;
+	status: string;
+	attempts: number;
+	error: string | null;
+};
+
 export class Database {
 	readonly pool: pg.Pool;
 
@@ -82,7 +96,26 @@ export class Database {
 				created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 				updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 			);
-			CREATE INDEX IF NOT EXISTS task_drafts_lookup_idx ON task_drafts(user_id, kind, status, expires_at)
+			CREATE INDEX IF NOT EXISTS task_drafts_lookup_idx ON task_drafts(user_id, kind, status, expires_at);
+			CREATE TABLE IF NOT EXISTS scheduled_messages (
+				id UUID PRIMARY KEY,
+				guild_id TEXT NOT NULL,
+				channel_id TEXT NOT NULL,
+				created_by_discord_id TEXT NOT NULL,
+				scheduler_name TEXT NOT NULL,
+				scheduler_avatar_url TEXT,
+				content TEXT NOT NULL,
+				send_at TIMESTAMPTZ NOT NULL,
+				status TEXT NOT NULL DEFAULT 'pending',
+				attempts INTEGER NOT NULL DEFAULT 0,
+				next_attempt_at TIMESTAMPTZ,
+				discord_message_id TEXT,
+				error TEXT,
+				created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+				updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+			);
+			CREATE INDEX IF NOT EXISTS scheduled_messages_due_idx
+				ON scheduled_messages(status, send_at, next_attempt_at)
 		`);
 		await this.pool.query("DROP TABLE IF EXISTS discord_channel_projects");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS permitted_reviewer_ids TEXT[] NOT NULL DEFAULT '{}'");
@@ -157,6 +190,88 @@ export class Database {
 			 openproject_project_id=excluded.openproject_project_id,
 			 updated_by_discord_id=excluded.updated_by_discord_id, updated_at=now()`,
 			[categoryId, projectId, actorId],
+		);
+	}
+
+	async createScheduledMessage(input: {
+		guildId: string;
+		channelId: string;
+		createdByDiscordId: string;
+		schedulerName: string;
+		schedulerAvatarUrl?: string;
+		content: string;
+		sendAt: Date;
+	}) {
+		const id = randomUUID();
+		await this.pool.query(
+			`INSERT INTO scheduled_messages
+			 (id,guild_id,channel_id,created_by_discord_id,scheduler_name,scheduler_avatar_url,content,send_at)
+			 VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+			[id, input.guildId, input.channelId, input.createdByDiscordId, input.schedulerName,
+				input.schedulerAvatarUrl ?? null, input.content, input.sendAt],
+		);
+		return id;
+	}
+
+	async scheduledMessagesForUser(guildId: string, userId: string, limit = 10) {
+		const result = await this.pool.query<ScheduledMessage>(
+			`SELECT id, guild_id AS "guildId", channel_id AS "channelId",
+			 created_by_discord_id AS "createdByDiscordId", scheduler_name AS "schedulerName",
+			 scheduler_avatar_url AS "schedulerAvatarUrl", content, send_at AS "sendAt",
+			 status, attempts, error
+			 FROM scheduled_messages
+			 WHERE guild_id=$1 AND created_by_discord_id=$2 AND status='pending'
+			 ORDER BY send_at ASC LIMIT $3`,
+			[guildId, userId, limit],
+		);
+		return result.rows;
+	}
+
+	async cancelScheduledMessage(id: string, guildId: string, userId: string) {
+		const result = await this.pool.query(
+			`UPDATE scheduled_messages SET status='cancelled', updated_at=now()
+			 WHERE id=$1 AND guild_id=$2 AND created_by_discord_id=$3 AND status='pending'`,
+			[id, guildId, userId],
+		);
+		return result.rowCount === 1;
+	}
+
+	async claimDueScheduledMessages(limit = 10): Promise<ScheduledMessage[]> {
+		const result = await this.pool.query<ScheduledMessage>(
+			`WITH due AS (
+				SELECT id FROM scheduled_messages
+				WHERE (status='pending' AND send_at <= now()
+					AND (next_attempt_at IS NULL OR next_attempt_at <= now()))
+				 OR (status='processing' AND updated_at < now() - interval '5 minutes')
+				ORDER BY send_at ASC FOR UPDATE SKIP LOCKED LIMIT $1
+			)
+			UPDATE scheduled_messages AS message
+			SET status='processing', attempts=attempts + 1, updated_at=now()
+			FROM due WHERE message.id=due.id
+			RETURNING message.id, message.guild_id AS "guildId", message.channel_id AS "channelId",
+			 message.created_by_discord_id AS "createdByDiscordId", message.scheduler_name AS "schedulerName",
+			 message.scheduler_avatar_url AS "schedulerAvatarUrl", message.content,
+			 message.send_at AS "sendAt", message.status, message.attempts, message.error`,
+			[limit],
+		);
+		return result.rows;
+	}
+
+	async markScheduledMessageSent(id: string, discordMessageId: string) {
+		await this.pool.query(
+			`UPDATE scheduled_messages SET status='sent', discord_message_id=$2,
+			 error=NULL, next_attempt_at=NULL, updated_at=now()
+			 WHERE id=$1 AND status='processing'`,
+			[id, discordMessageId],
+		);
+	}
+
+	async markScheduledMessageDeliveryFailed(id: string, error: string, retryAfterSeconds?: number) {
+		await this.pool.query(
+			`UPDATE scheduled_messages SET status=$2, error=$3,
+			 next_attempt_at=CASE WHEN $4::integer IS NULL THEN NULL ELSE now() + ($4::text || ' seconds')::interval END,
+			 updated_at=now() WHERE id=$1 AND status='processing'`,
+			[id, retryAfterSeconds ? "pending" : "failed", error.slice(0, 1000), retryAfterSeconds ?? null],
 		);
 	}
 
@@ -413,6 +528,10 @@ export class Database {
 		await this.pool.query(
 			`DELETE FROM task_audit_log WHERE created_at < now() - ($1::text || ' days')::interval`,
 			[config.OPENPROJECT_AUDIT_RETENTION_DAYS],
+		);
+		await this.pool.query(
+			`DELETE FROM scheduled_messages WHERE status IN ('sent','cancelled','failed')
+			 AND updated_at < now() - interval '30 days'`,
 		);
 	}
 

@@ -94,6 +94,7 @@ This bot helps manage and coordinate activities across Hack the Hill's Discord s
 	Message → Apps → \`Create OpenProject task\`: Start a task from a message, choose a project/assignee, and include its backlink.
 	Message → Apps → \`Draft OpenProject task with AI\`: Create an editable, private proposal in an AI-enabled channel; it never creates a task without review.
 	\`/task configure-category\`, \`/task link-user\`, and \`/task reconcile\` are organizer-only setup/recovery commands.
+	\`/schedule create|list|cancel\`: Schedule a message in the current channel using your saved display name and avatar. Time examples: \`2 hours\`, \`10am\`, \`tomorrow 10am\`, or an ISO timestamp.
 `,
 								inline: false,
 							},
@@ -173,6 +174,7 @@ Les membres de ce serveur d'organisateurs peuvent utiliser les commandes de tâc
 	Message → Applications → \`Create OpenProject task\`: Démarre une tâche à partir d'un message, permet de choisir le projet/l'assigné et ajoute son lien.
 	Message → Applications → \`Draft OpenProject task with AI\`: Produit une proposition privée et modifiable dans un canal autorisé; aucune tâche n'est créée sans révision.
 	\`/task configure-category\`, \`/task link-user\` et \`/task reconcile\` sont des commandes réservées aux organisateurs.
+	\`/schedule create|list|cancel\`: Planifie un message dans le canal actuel avec votre nom d'affichage et votre avatar enregistrés. Exemples: \`2 hours\`, \`10am\`, \`tomorrow 10am\` ou une date ISO.
 `,
 								inline: false,
 							},

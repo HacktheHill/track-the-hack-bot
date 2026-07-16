@@ -9,6 +9,7 @@ import { OpenProjectClient } from "./openproject.js";
 import { registerTaskInteractions } from "./tasks.js";
 import { AzureTaskExtractor } from "./azure-openai.js";
 import { registerAutomaticTaskDetection } from "./automatic-tasks.js";
+import { registerMessageScheduler } from "./scheduler.js";
 
 config();
 
@@ -79,6 +80,7 @@ client.once("clientReady", async () => {
 		console.warn("OpenProject task integration disabled: required configuration is missing");
 		integrationReady = true;
 	}
+	registerMessageScheduler(client, integrationDb, ORGANIZER_GUILD_ID, integrationConfig?.BOT_TIME_ZONE);
 });
 
 for (const signal of ["SIGTERM", "SIGINT"] as const) {

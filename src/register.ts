@@ -3,6 +3,7 @@ import { Routes } from "discord-api-types/v9";
 import { SlashCommandBuilder } from "@discordjs/builders";
 import { config } from "dotenv";
 import { aiTaskMessageCommand, taskCommand, taskMessageCommand } from "./tasks.js";
+import { scheduleCommand } from "./scheduler.js";
 
 config();
 
@@ -36,6 +37,7 @@ const organizerCommands = [
 		)
 		.toJSON(),
 	taskCommand.toJSON(),
+	scheduleCommand.toJSON(),
 	taskMessageCommand.toJSON(),
 	aiTaskMessageCommand.toJSON(),
 ];
