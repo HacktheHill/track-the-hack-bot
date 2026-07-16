@@ -2,6 +2,7 @@ import { REST } from "@discordjs/rest";
 import { Routes } from "discord-api-types/v9";
 import { SlashCommandBuilder } from "@discordjs/builders";
 import { config } from "dotenv";
+import { taskCommand, taskMessageCommand } from "./tasks.js";
 
 config();
 
@@ -34,6 +35,8 @@ const organizerCommands = [
 			"Synchronize roles and nicknames | Synchroniser les rôles et les surnoms",
 		)
 		.toJSON(),
+	taskCommand.toJSON(),
+	taskMessageCommand.toJSON(),
 ];
 
 const sharedCommands = [
@@ -45,30 +48,28 @@ const sharedCommands = [
 
 const rest = new REST().setToken(DISCORD_TOKEN);
 
-(async () => {
-	try {
-		console.log("Started refreshing application (/) commands.");
+try {
+	console.log("Started refreshing application (/) commands.");
 
-		await rest.put(
-			Routes.applicationGuildCommands(CLIENT_ID, COMMUNITY_GUILD_ID),
-			{
-				body: communityCommands,
-			},
-		);
+	await rest.put(
+		Routes.applicationGuildCommands(CLIENT_ID, COMMUNITY_GUILD_ID),
+		{
+			body: communityCommands,
+		},
+	);
 
-		await rest.put(
-			Routes.applicationGuildCommands(CLIENT_ID, ORGANIZER_GUILD_ID),
-			{
-				body: organizerCommands,
-			},
-		);
+	await rest.put(
+		Routes.applicationGuildCommands(CLIENT_ID, ORGANIZER_GUILD_ID),
+		{
+			body: organizerCommands,
+		},
+	);
 
-		await rest.put(Routes.applicationCommands(CLIENT_ID), {
-			body: sharedCommands,
-		});
+	await rest.put(Routes.applicationCommands(CLIENT_ID), {
+		body: sharedCommands,
+	});
 
-		console.log("Successfully reloaded application (/) commands.");
-	} catch (error) {
-		console.error(error);
-	}
-})();
+	console.log("Successfully reloaded application (/) commands.");
+} catch (error) {
+	console.error(error);
+}

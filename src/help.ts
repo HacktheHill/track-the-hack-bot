@@ -87,6 +87,16 @@ This bot helps manage and coordinate activities across Hack the Hill's Discord s
 								inline: false,
 							},
 							{
+								name: "OpenProject tasks",
+								value: `
+	Members can use task commands only in this Organizer server. \`/task create\` uses this channel category's project by default; title is required and description, people, priority, size, and dates are optional. Choose from the listed project, priority, and size values. Dates offer Today and the next 30 days as autocomplete suggestions (Discord has no native date picker).
+	\`/task view|assign|reschedule|close|reopen|announce\`: Manage or re-post an existing task without opening OpenProject.
+	Message → Apps → \`Create OpenProject task\`: Start a task from a message, choose a project/assignee, and include its backlink.
+	\`/task configure-category\`, \`/task link-user\`, and \`/task reconcile\` are organizer-only setup/recovery commands.
+`,
+								inline: false,
+							},
+							{
 								name: "Commands",
 								value: `
 \`/sync\`: Synchronize roles and nicknames from the organizer guild to the community guild.
@@ -152,6 +162,16 @@ Ce bot aide à gérer et coordonner les activités sur les serveurs Discord de H
 								value:
 									permissions.organizer?.join(", ") ??
 									"Inconnu",
+								inline: false,
+							},
+							{
+								name: "Tâches OpenProject",
+								value: `
+Les membres de ce serveur d'organisateurs peuvent utiliser les commandes de tâches. \`/task create\` utilise par défaut le projet associé à la catégorie du canal; le titre est requis et la description, les personnes, la priorité, la taille et les dates sont facultatives. Choisissez parmi les projets, priorités et tailles proposés. Les dates proposent aujourd'hui et les 30 prochains jours par autocomplétion (sans sélecteur de date natif).
+	\`/task view|assign|reschedule|close|reopen|announce\`: Gère ou republie une tâche existante sans ouvrir OpenProject.
+	Message → Applications → \`Create OpenProject task\`: Démarre une tâche à partir d'un message, permet de choisir le projet/l'assigné et ajoute son lien.
+	\`/task configure-category\`, \`/task link-user\` et \`/task reconcile\` sont des commandes réservées aux organisateurs.
+`,
 								inline: false,
 							},
 							{
