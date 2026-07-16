@@ -4,6 +4,41 @@ import { randomUUID } from "node:crypto";
 
 const { Pool } = pg;
 
+export const correctionFields = [
+	"title", "description", "project", "assignee", "accountable",
+	"priority", "size", "startDate", "dueDate", "estimate",
+] as const;
+export type CorrectionField = typeof correctionFields[number];
+export type CorrectionFlags = Record<CorrectionField, boolean>;
+
+export type ProposalMetrics = {
+	days: number;
+	proposals: number;
+	approved: number;
+	dismissed: number;
+	duplicates: number;
+	failures: number;
+	reconciliations: number;
+	approvalRate: number;
+	duplicateRate: number;
+	assigneeAcceptanceRate: number;
+	deadlineAcceptanceRate: number;
+	averageReviewDurationMs: number;
+	averageExtractionLatencyMs: number;
+	totalTokens: number;
+	invalidOutputs: number;
+	correctionRates: Record<CorrectionField, number>;
+};
+
+export type SimilarWorkPackage = {
+	workPackageId: number;
+	projectId: number;
+	lockVersion: number;
+	subject: string;
+	description: string;
+	similarity: number;
+};
+
 export type ScheduledMessage = {
 	id: string;
 	guildId: string;
@@ -26,6 +61,8 @@ export class Database {
 	}
 
 	async migrate(config: IntegrationConfig) {
+		await this.pool.query("SELECT pg_advisory_lock(hashtext('track-the-hack-bot-schema'))");
+		try {
 		await this.pool.query(`
 			CREATE TABLE IF NOT EXISTS discord_openproject_users (
 				discord_user_id TEXT PRIMARY KEY,
@@ -63,6 +100,12 @@ export class Database {
 				escalation_reason TEXT,
 				confirmation_message_id TEXT,
 				error TEXT,
+				review_started_at TIMESTAMPTZ,
+				reviewed_at TIMESTAMPTZ,
+				review_duration_ms INTEGER,
+				review_outcome TEXT,
+				correction_flags JSONB NOT NULL DEFAULT '{}',
+				review_failure_count INTEGER NOT NULL DEFAULT 0,
 				expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '30 days'),
 				created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 				updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -97,6 +140,41 @@ export class Database {
 				updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 			);
 			CREATE INDEX IF NOT EXISTS task_drafts_lookup_idx ON task_drafts(user_id, kind, status, expires_at);
+			CREATE TABLE IF NOT EXISTS ai_extraction_events (
+				id BIGSERIAL PRIMARY KEY,
+				source TEXT NOT NULL,
+				outcome TEXT NOT NULL,
+				model_deployment TEXT,
+				task_count INTEGER NOT NULL DEFAULT 0,
+				latency_ms INTEGER,
+				token_usage JSONB,
+				trigger_id TEXT,
+				input_snapshot JSONB,
+				message_assessments JSONB,
+				decision JSONB,
+				schema_version TEXT NOT NULL DEFAULT 'v2',
+				created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+			);
+			CREATE INDEX IF NOT EXISTS ai_extraction_events_created_idx ON ai_extraction_events(created_at)
+		;
+			CREATE TABLE IF NOT EXISTS task_proposal_revisions (
+				id BIGSERIAL PRIMARY KEY,
+				proposal_id UUID NOT NULL REFERENCES task_proposals(id) ON DELETE CASCADE,
+				revision INTEGER NOT NULL,
+				phase TEXT NOT NULL,
+				payload JSONB NOT NULL,
+				created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+				UNIQUE(proposal_id, revision)
+			);
+			CREATE TABLE IF NOT EXISTS task_confirmation_queue (
+				work_package_id INTEGER PRIMARY KEY,
+				channel_id TEXT NOT NULL,
+				assignee_discord_id TEXT,
+				attempts INTEGER NOT NULL DEFAULT 0,
+				last_error TEXT,
+				created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+				updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+			);
 			CREATE TABLE IF NOT EXISTS scheduled_messages (
 				id UUID PRIMARY KEY,
 				guild_id TEXT NOT NULL,
@@ -133,6 +211,40 @@ export class Database {
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS size_href TEXT");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS start_date DATE");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS estimated_hours NUMERIC");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS review_started_at TIMESTAMPTZ");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS review_duration_ms INTEGER");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS review_outcome TEXT");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS correction_flags JSONB NOT NULL DEFAULT '{}'");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS review_failure_count INTEGER NOT NULL DEFAULT 0");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS action TEXT NOT NULL DEFAULT 'create'");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS target_work_package_id INTEGER");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS target_lock_version INTEGER");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS revision INTEGER NOT NULL DEFAULT 1");
+		await this.pool.query("ALTER TABLE ai_extraction_events ADD COLUMN IF NOT EXISTS trigger_id TEXT");
+		await this.pool.query("ALTER TABLE ai_extraction_events ADD COLUMN IF NOT EXISTS input_snapshot JSONB");
+		await this.pool.query("ALTER TABLE ai_extraction_events ADD COLUMN IF NOT EXISTS message_assessments JSONB");
+		await this.pool.query("ALTER TABLE ai_extraction_events ADD COLUMN IF NOT EXISTS decision JSONB");
+		await this.pool.query("ALTER TABLE ai_extraction_events ADD COLUMN IF NOT EXISTS schema_version TEXT NOT NULL DEFAULT 'v2'");
+		if (config.OPENPROJECT_RAG_MODE !== "off") {
+			if (!config.AZURE_OPENAI_EMBEDDING_DIMENSIONS) throw new Error("AZURE_OPENAI_EMBEDDING_DIMENSIONS is required when OPENPROJECT_RAG_MODE is enabled.");
+			await this.pool.query("CREATE EXTENSION IF NOT EXISTS vector");
+			await this.pool.query(`CREATE TABLE IF NOT EXISTS openproject_embeddings (
+				work_package_id INTEGER PRIMARY KEY,
+				project_id INTEGER NOT NULL,
+				lock_version INTEGER NOT NULL,
+				subject TEXT NOT NULL,
+				description TEXT NOT NULL,
+				content_hash TEXT NOT NULL,
+				embedding_model TEXT NOT NULL,
+				embedding_dimensions INTEGER NOT NULL,
+				embedding vector(${config.AZURE_OPENAI_EMBEDDING_DIMENSIONS}),
+				updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+				indexed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+			)`);
+			await this.pool.query("CREATE INDEX IF NOT EXISTS openproject_embeddings_project_idx ON openproject_embeddings(project_id)");
+			await this.pool.query("CREATE TABLE IF NOT EXISTS openproject_embedding_sync (id BOOLEAN PRIMARY KEY DEFAULT TRUE, last_run_at TIMESTAMPTZ, last_error TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())");
+		}
 		for (const [discordId, openProjectId] of Object.entries(config.userMap)) {
 			await this.pool.query(
 				`INSERT INTO discord_openproject_users(discord_user_id, openproject_user_id)
@@ -148,6 +260,9 @@ export class Database {
 				 openproject_project_id=excluded.openproject_project_id, updated_at=now()`,
 				[categoryId, projectId],
 			);
+		}
+		} finally {
+			await this.pool.query("SELECT pg_advisory_unlock(hashtext('track-the-hack-bot-schema'))");
 		}
 	}
 
@@ -172,24 +287,6 @@ export class Database {
 			 VALUES ($1,$2) ON CONFLICT(discord_user_id) DO UPDATE
 			 SET openproject_user_id=excluded.openproject_user_id, updated_at=now()`,
 			[discordId, openProjectId],
-		);
-	}
-
-	async categoryProject(categoryId: string) {
-		const result = await this.pool.query<{ openproject_project_id: number }>(
-			"SELECT openproject_project_id FROM discord_category_projects WHERE category_id=$1",
-			[categoryId],
-		);
-		return result.rows[0]?.openproject_project_id;
-	}
-
-	async setCategoryProject(categoryId: string, projectId: number, actorId: string) {
-		await this.pool.query(
-			`INSERT INTO discord_category_projects(category_id,openproject_project_id,updated_by_discord_id)
-			 VALUES($1,$2,$3) ON CONFLICT(category_id) DO UPDATE SET
-			 openproject_project_id=excluded.openproject_project_id,
-			 updated_by_discord_id=excluded.updated_by_discord_id, updated_at=now()`,
-			[categoryId, projectId, actorId],
 		);
 	}
 
@@ -240,10 +337,14 @@ export class Database {
 		const result = await this.pool.query<ScheduledMessage>(
 			`WITH due AS (
 				SELECT id FROM scheduled_messages
-				WHERE (status='pending' AND send_at <= now()
-					AND (next_attempt_at IS NULL OR next_attempt_at <= now()))
-				 OR (status='processing' AND updated_at < now() - interval '5 minutes')
-				ORDER BY send_at ASC FOR UPDATE SKIP LOCKED LIMIT $1
+				WHERE (
+					status='pending'
+					AND send_at <= now()
+					AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+				) OR (status='processing' AND updated_at < now() - interval '5 minutes')
+				ORDER BY send_at ASC
+				FOR UPDATE SKIP LOCKED
+				LIMIT $1
 			)
 			UPDATE scheduled_messages AS message
 			SET status='processing', attempts=attempts + 1, updated_at=now()
@@ -272,6 +373,24 @@ export class Database {
 			 next_attempt_at=CASE WHEN $4::integer IS NULL THEN NULL ELSE now() + ($4::text || ' seconds')::interval END,
 			 updated_at=now() WHERE id=$1 AND status='processing'`,
 			[id, retryAfterSeconds ? "pending" : "failed", error.slice(0, 1000), retryAfterSeconds ?? null],
+		);
+	}
+
+	async categoryProject(categoryId: string) {
+		const result = await this.pool.query<{ openproject_project_id: number }>(
+			"SELECT openproject_project_id FROM discord_category_projects WHERE category_id=$1",
+			[categoryId],
+		);
+		return result.rows[0]?.openproject_project_id;
+	}
+
+	async setCategoryProject(categoryId: string, projectId: number, actorId: string) {
+		await this.pool.query(
+			`INSERT INTO discord_category_projects(category_id,openproject_project_id,updated_by_discord_id)
+			 VALUES($1,$2,$3) ON CONFLICT(category_id) DO UPDATE SET
+			 openproject_project_id=excluded.openproject_project_id,
+			 updated_by_discord_id=excluded.updated_by_discord_id, updated_at=now()`,
+			[categoryId, projectId, actorId],
 		);
 	}
 
@@ -368,7 +487,11 @@ export class Database {
 		latencyMs?: number;
 		tokenUsage?: Record<string, number | undefined>;
 		escalationReason?: string;
-		retentionDays?: number;
+			retentionDays?: number;
+		action?: "create" | "update" | "complete" | "reopen";
+		targetWorkPackageId?: number;
+		targetLockVersion?: number;
+		initialSnapshot?: Record<string, unknown>;
 	}) {
 		const id = randomUUID();
 		const fingerprint = [...input.sourceMessageIds].sort().join(":") + `:${input.title.toLowerCase()}`;
@@ -377,10 +500,10 @@ export class Database {
 			(id, requester_discord_id, channel_id, project_id, title, description,
 			 assignee_discord_id, accountable_discord_id, priority_id, size_href, start_date, due_date, estimated_hours,
 			 source_message_ids, source_fingerprint, source_links,
-			 classification, status, model_deployment, permitted_reviewer_ids,
+			 classification, status, model_deployment, permitted_reviewer_ids, action, target_work_package_id, target_lock_version,
 			 evidence, ambiguities, latency_ms, token_usage, escalation_reason, expires_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'pending_review',$18,$19,$20,$21,$22,$23,$24,
-			 now() + ($25::text || ' days')::interval)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'pending_review',$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,
+			 now() + ($28::text || ' days')::interval)
 			ON CONFLICT(source_fingerprint) DO UPDATE SET
 			 requester_discord_id=excluded.requester_discord_id, channel_id=excluded.channel_id,
 			 project_id=excluded.project_id, title=excluded.title, description=excluded.description,
@@ -389,6 +512,7 @@ export class Database {
 			 size_href=excluded.size_href, start_date=excluded.start_date, due_date=excluded.due_date,
 			 estimated_hours=excluded.estimated_hours,
 				 source_message_ids=excluded.source_message_ids, source_links=excluded.source_links, classification=excluded.classification,
+				action=excluded.action, target_work_package_id=excluded.target_work_package_id, target_lock_version=excluded.target_lock_version,
 			 status='pending_review', model_deployment=excluded.model_deployment,
 			 permitted_reviewer_ids=excluded.permitted_reviewer_ids, evidence=excluded.evidence,
 			 ambiguities=excluded.ambiguities, latency_ms=excluded.latency_ms,
@@ -402,12 +526,15 @@ export class Database {
 			 input.priorityId ?? null, input.sizeHref ?? null,
 			 input.startDate ?? null, input.dueDate ?? null, input.estimatedHours ?? null,
 			 input.sourceMessageIds, fingerprint, input.sourceLinks ?? [], input.classification, input.modelDeployment,
-				input.permittedReviewerIds ?? (input.requesterId ? [input.requesterId] : []),
-				input.evidence ?? null, input.ambiguities ?? [], input.latencyMs ?? null,
-				input.tokenUsage ?? null, input.escalationReason ?? null,
-				input.retentionDays ?? 30],
+			 input.permittedReviewerIds ?? (input.requesterId ? [input.requesterId] : []), input.action ?? "create", input.targetWorkPackageId ?? null, input.targetLockVersion ?? null,
+			 input.evidence ?? null, input.ambiguities ?? [], input.latencyMs ?? null,
+			 input.tokenUsage ?? null, input.escalationReason ?? null,
+			 input.retentionDays ?? 30],
 		);
-		if (result.rows[0]) return { id: result.rows[0].id, reused: false };
+		if (result.rows[0]) {
+			if (input.initialSnapshot) await this.recordProposalRevision(result.rows[0].id, 1, "initial", input.initialSnapshot);
+			return { id: result.rows[0].id, reused: false };
+		}
 		const existing = await this.pool.query<{ id: string }>(
 			"SELECT id FROM task_proposals WHERE source_fingerprint=$1",
 			[fingerprint],
@@ -425,16 +552,44 @@ export class Database {
 			start_date: string | null; due_date: string | null; estimated_hours: number | null;
 			 source_message_ids: string[]; source_links: string[]; status: string; permitted_reviewer_ids: string[];
 			 expires_at: string; openproject_work_package_id: number | null;
+			 action: "create" | "update" | "complete" | "reopen"; target_work_package_id: number | null; target_lock_version: number | null;
 		}>("SELECT * FROM task_proposals WHERE id=$1", [id]);
 		return result.rows[0];
 	}
 
 	async setProposalStatus(id: string, status: string, reviewerId: string) {
 		const result = await this.pool.query(
-			"UPDATE task_proposals SET status=$2, reviewer_discord_id=$3, updated_at=now() WHERE id=$1 AND status='pending_review' AND expires_at > now()",
+			`UPDATE task_proposals SET status=$2, reviewer_discord_id=$3,
+			 review_outcome=$2, reviewed_at=now(),
+			 review_duration_ms=GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(review_started_at, created_at))) * 1000)::integer,
+			 updated_at=now() WHERE id=$1 AND status='pending_review' AND expires_at > now()`,
 			[id, status, reviewerId],
 		);
 		return result.rowCount === 1;
+	}
+
+	async startProposalReview(id: string, reviewerId: string) {
+		const result = await this.pool.query(
+			`UPDATE task_proposals SET review_started_at=COALESCE(review_started_at, now()),
+			 reviewer_discord_id=$2, updated_at=now()
+			 WHERE id=$1 AND status='pending_review' AND expires_at > now() RETURNING id`,
+			[id, reviewerId],
+		);
+		return result.rowCount === 1;
+	}
+
+	async updateProposalMetadata(id: string, reviewerId: string, fields: {
+		accountableId?: string | null; priorityId?: number | null; sizeHref?: string | null;
+		startDate?: string | null; estimatedHours?: number | null;
+	}) {
+		const result = await this.pool.query<{ revision: number }>(
+			`UPDATE task_proposals SET accountable_discord_id=$2, priority_id=$3, size_href=$4, start_date=$5,
+			 estimated_hours=$6, revision=revision + 1, reviewer_discord_id=$7, updated_at=now()
+			 WHERE id=$1 AND status='pending_review' AND expires_at > now() RETURNING revision`,
+			[id, fields.accountableId ?? null, fields.priorityId ?? null, fields.sizeHref ?? null, fields.startDate ?? null, fields.estimatedHours ?? null, reviewerId],
+		);
+		if (result.rowCount !== 1) throw new Error("This proposal is no longer editable.");
+		await this.recordProposalRevision(id, result.rows[0].revision, "edit", fields);
 	}
 
 	async claimProposal(id: string, reviewerId: string) {
@@ -449,16 +604,20 @@ export class Database {
 	async releaseProposal(id: string, error: string) {
 		await this.pool.query(
 			`UPDATE task_proposals SET status='pending_review', reviewer_discord_id=NULL,
-			 error=$2, updated_at=now() WHERE id=$1 AND status='creating' AND expires_at > now()`,
+			 error=$2, review_failure_count=review_failure_count + 1, updated_at=now()
+			 WHERE id=$1 AND status='creating' AND expires_at > now()`,
 			[id, error.slice(0, 1000)],
 		);
 	}
 
-	async markProposalCreated(id: string, reviewerId: string, workPackageId: number, confirmationMessageId?: string) {
+	async markProposalCreated(id: string, reviewerId: string, workPackageId: number, confirmationMessageId?: string, corrections?: CorrectionFlags) {
 		await this.pool.query(
 			`UPDATE task_proposals SET status='created', reviewer_discord_id=$2,
-				 openproject_work_package_id=$3, confirmation_message_id=$4, error=NULL, updated_at=now() WHERE id=$1 AND status='creating'`,
-			[id, reviewerId, workPackageId, confirmationMessageId ?? null],
+				 openproject_work_package_id=$3, confirmation_message_id=$4, error=NULL,
+				 review_outcome='approved', reviewed_at=now(), correction_flags=$5,
+				 review_duration_ms=GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(review_started_at, created_at))) * 1000)::integer,
+				 updated_at=now() WHERE id=$1 AND status='creating'`,
+			[id, reviewerId, workPackageId, confirmationMessageId ?? null, corrections ?? {}],
 		);
 		await this.pool.query(
 			"INSERT INTO task_audit_log(proposal_id,event,actor_discord_id,metadata) VALUES($1,'created',$2,$3)",
@@ -466,9 +625,26 @@ export class Database {
 		);
 	}
 
+	async markProposalUpdated(id: string, reviewerId: string, workPackageId: number, corrections?: CorrectionFlags) {
+		await this.pool.query(
+			`UPDATE task_proposals SET status='created', reviewer_discord_id=$2, openproject_work_package_id=$3,
+			 review_outcome='updated', reviewed_at=now(), correction_flags=$4,
+			 review_duration_ms=GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(review_started_at, created_at))) * 1000)::integer,
+			 updated_at=now() WHERE id=$1 AND status='creating'`,
+			[id, reviewerId, workPackageId, corrections ?? {}],
+		);
+		await this.pool.query(
+			"INSERT INTO task_audit_log(proposal_id,event,actor_discord_id,metadata) VALUES($1,'updated',$2,$3)",
+			[id, reviewerId, { workPackageId }],
+		);
+	}
+
 	async markProposalFailed(id: string, status: "failed" | "needs_reconciliation", reviewerId: string, error: string) {
 		await this.pool.query(
-			"UPDATE task_proposals SET status=$2, reviewer_discord_id=$3, error=$4, updated_at=now() WHERE id=$1 AND status='creating'",
+			`UPDATE task_proposals SET status=$2, reviewer_discord_id=$3, error=$4,
+			 review_outcome=$2, reviewed_at=now(), review_failure_count=review_failure_count + 1,
+			 review_duration_ms=GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(review_started_at, created_at))) * 1000)::integer,
+			 updated_at=now() WHERE id=$1 AND status='creating'`,
 			[id, status, reviewerId, error.slice(0, 1000)],
 		);
 	}
@@ -484,6 +660,10 @@ export class Database {
 				[id, actorId, workPackageId],
 			);
 			if (proposal.rowCount === 1) {
+				await client.query(
+					"UPDATE task_proposals SET review_outcome='reconciled', reviewed_at=COALESCE(reviewed_at, now()) WHERE id=$1",
+					[id],
+				);
 				await client.query(
 					"INSERT INTO task_audit_log(proposal_id,event,actor_discord_id,metadata) VALUES($1,'reconciled',$2,$3)",
 					[id, actorId, { workPackageId }],
@@ -510,6 +690,143 @@ export class Database {
 		}
 	}
 
+	async recordExtraction(input: {
+		source: "manual" | "automatic";
+		outcome: "proposal" | "no_task" | "duplicate" | "invalid_output" | "sensitive_block" | "error";
+		modelDeployment?: string;
+		taskCount?: number;
+		latencyMs?: number;
+		tokenUsage?: Record<string, number | undefined>;
+		triggerId?: string;
+		inputSnapshot?: unknown;
+		messageAssessments?: unknown;
+		decision?: Record<string, unknown>;
+	}) {
+		await this.pool.query(
+			`INSERT INTO ai_extraction_events(source,outcome,model_deployment,task_count,latency_ms,token_usage,trigger_id,input_snapshot,message_assessments,decision)
+			 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+			[input.source, input.outcome, input.modelDeployment ?? null, input.taskCount ?? 0,
+				input.latencyMs ?? null, input.tokenUsage ?? null, input.triggerId ?? null, input.inputSnapshot ?? null,
+				input.messageAssessments ?? null, input.decision ?? null],
+		);
+	}
+
+	async recordProposalRevision(proposalId: string, revision: number, phase: "initial" | "edit" | "final", payload: Record<string, unknown>) {
+		await this.pool.query(
+			`INSERT INTO task_proposal_revisions(proposal_id,revision,phase,payload) VALUES($1,$2,$3,$4)
+			 ON CONFLICT(proposal_id,revision) DO UPDATE SET phase=excluded.phase,payload=excluded.payload,created_at=now()`,
+			[proposalId, revision, phase, payload],
+		);
+	}
+
+	async recordFinalProposalRevision(proposalId: string, payload: Record<string, unknown>) {
+		const result = await this.pool.query<{ revision: number }>(
+			"UPDATE task_proposals SET revision=revision + 1 WHERE id=$1 AND status='created' RETURNING revision",
+			[proposalId],
+		);
+		if (result.rowCount !== 1) throw new Error("Could not finalize proposal revision telemetry.");
+		await this.recordProposalRevision(proposalId, result.rows[0].revision, "final", payload);
+	}
+
+	async upsertEmbedding(input: {
+		workPackageId: number; projectId: number; lockVersion: number; subject: string; description: string;
+		contentHash: string; model: string; dimensions: number; embedding: number[];
+	}) {
+		const vector = `[${input.embedding.join(",")}]`;
+		await this.pool.query(
+			`INSERT INTO openproject_embeddings(work_package_id,project_id,lock_version,subject,description,content_hash,embedding_model,embedding_dimensions,embedding,updated_at,indexed_at)
+			 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::vector,now(),now())
+			 ON CONFLICT(work_package_id) DO UPDATE SET project_id=excluded.project_id, lock_version=excluded.lock_version,
+			 subject=excluded.subject, description=excluded.description, content_hash=excluded.content_hash,
+			 embedding_model=excluded.embedding_model, embedding_dimensions=excluded.embedding_dimensions, embedding=excluded.embedding,
+			 updated_at=now(), indexed_at=now()`,
+			[input.workPackageId, input.projectId, input.lockVersion, input.subject, input.description, input.contentHash, input.model, input.dimensions, vector],
+		);
+	}
+
+	async embeddingIsCurrent(workPackageId: number, contentHash: string, lockVersion: number) {
+		const result = await this.pool.query(
+			"SELECT 1 FROM openproject_embeddings WHERE work_package_id=$1 AND content_hash=$2 AND lock_version=$3",
+			[workPackageId, contentHash, lockVersion],
+		);
+		return result.rowCount === 1;
+	}
+
+	async deleteEmbeddingsExcept(projectId: number, workPackageIds: number[]) {
+		if (!workPackageIds.length) {
+			await this.pool.query("DELETE FROM openproject_embeddings WHERE project_id=$1", [projectId]);
+			return;
+		}
+		await this.pool.query(
+			"DELETE FROM openproject_embeddings WHERE project_id=$1 AND NOT (work_package_id = ANY($2::integer[]))",
+			[projectId, workPackageIds],
+		);
+	}
+
+	async similarEmbeddings(projectId: number, embedding: number[], limit = 5): Promise<SimilarWorkPackage[]> {
+		const vector = `[${embedding.join(",")}]`;
+		const result = await this.pool.query<SimilarWorkPackage & { distance: number }>(
+			`SELECT work_package_id AS "workPackageId", project_id AS "projectId", lock_version AS "lockVersion", subject, description,
+				1 - (embedding <=> $2::vector) AS similarity, embedding <=> $2::vector AS distance
+			 FROM openproject_embeddings WHERE project_id=$1 AND embedding IS NOT NULL ORDER BY embedding <=> $2::vector LIMIT $3`,
+			[projectId, vector, limit],
+		);
+		return result.rows;
+	}
+
+	async proposalMetrics(days: 7 | 30 | 90): Promise<ProposalMetrics> {
+		const proposal = await this.pool.query<{
+			proposals: string; approved: string; dismissed: string; duplicates: string;
+			failures: string; reconciliations: string; review_failures: string;
+			average_review_duration_ms: string | null;
+			correction_flags: Record<string, number> | null;
+		}>(
+			`SELECT COUNT(*)::text AS proposals,
+			 COUNT(*) FILTER (WHERE review_outcome='approved')::text AS approved,
+			 COUNT(*) FILTER (WHERE review_outcome='dismissed')::text AS dismissed,
+			 COUNT(*) FILTER (WHERE review_outcome='duplicate')::text AS duplicates,
+			 COUNT(*) FILTER (WHERE review_outcome IN ('failed','needs_reconciliation'))::text AS failures,
+			 COUNT(*) FILTER (WHERE review_outcome='reconciled')::text AS reconciliations,
+			 COALESCE(SUM(review_failure_count),0)::text AS review_failures,
+			 AVG(review_duration_ms)::text AS average_review_duration_ms,
+				 jsonb_build_object(${correctionFields.map(field => `'${field}', COALESCE(SUM(CASE WHEN correction_flags->>'${field}'='true' THEN 1 ELSE 0 END),0)`).join(", ")}) AS correction_flags
+			 FROM task_proposals WHERE created_at >= now() - ($1::text || ' days')::interval`,
+			[days],
+		);
+		const extraction = await this.pool.query<{
+			average_latency_ms: string | null; total_tokens: string; invalid_outputs: string;
+		}>(
+			`SELECT AVG(latency_ms)::text AS average_latency_ms,
+			 COALESCE(SUM(COALESCE((token_usage->>'totalTokens')::bigint,0)),0)::text AS total_tokens,
+			 COUNT(*) FILTER (WHERE outcome='invalid_output')::text AS invalid_outputs
+			 FROM ai_extraction_events WHERE created_at >= now() - ($1::text || ' days')::interval`,
+			[days],
+		);
+		const p = proposal.rows[0];
+		const e = extraction.rows[0];
+		const proposals = Number(p?.proposals ?? 0);
+		const approved = Number(p?.approved ?? 0);
+		const reviewed = approved + Number(p?.dismissed ?? 0) + Number(p?.duplicates ?? 0) + Number(p?.failures ?? 0);
+		const correctionCounts = p?.correction_flags ?? {};
+		const rate = (count: number, total = reviewed) => total ? count / total : 0;
+		return {
+			days, proposals, approved,
+			dismissed: Number(p?.dismissed ?? 0),
+			duplicates: Number(p?.duplicates ?? 0),
+			failures: Number(p?.failures ?? 0) + Number(p?.review_failures ?? 0),
+			reconciliations: Number(p?.reconciliations ?? 0),
+			approvalRate: rate(approved),
+			duplicateRate: rate(Number(p?.duplicates ?? 0), proposals),
+			assigneeAcceptanceRate: approved ? 1 - rate(Number(correctionCounts.assignee ?? 0), approved) : 0,
+			deadlineAcceptanceRate: approved ? 1 - rate(Number(correctionCounts.dueDate ?? 0), approved) : 0,
+			averageReviewDurationMs: Number(p?.average_review_duration_ms ?? 0),
+			averageExtractionLatencyMs: Number(e?.average_latency_ms ?? 0),
+			totalTokens: Number(e?.total_tokens ?? 0),
+			invalidOutputs: Number(e?.invalid_outputs ?? 0),
+			correctionRates: Object.fromEntries(correctionFields.map(field => [field, rate(Number(correctionCounts[field] ?? 0), approved)])) as Record<CorrectionField, number>,
+		};
+	}
+
 	async cleanup(config: IntegrationConfig) {
 		await this.pool.query(
 			`DELETE FROM task_proposals WHERE openproject_work_package_id IS NULL
@@ -530,6 +847,14 @@ export class Database {
 			[config.OPENPROJECT_AUDIT_RETENTION_DAYS],
 		);
 		await this.pool.query(
+			`DELETE FROM ai_extraction_events WHERE created_at < now() - ($1::text || ' days')::interval`,
+			[config.OPENPROJECT_AI_EVALUATION_RETENTION_DAYS],
+		);
+		await this.pool.query(
+			`DELETE FROM task_proposal_revisions WHERE created_at < now() - ($1::text || ' days')::interval`,
+			[config.OPENPROJECT_AI_EVALUATION_RETENTION_DAYS],
+		);
+		await this.pool.query(
 			`DELETE FROM scheduled_messages WHERE status IN ('sent','cancelled','failed')
 			 AND updated_at < now() - interval '30 days'`,
 		);
@@ -540,6 +865,29 @@ export class Database {
 			"INSERT INTO task_audit_log(openproject_work_package_id,event,actor_discord_id,metadata) VALUES($1,$2,$3,$4)",
 			[workPackageId, event, actorId, metadata],
 		);
+	}
+
+	async queueConfirmation(workPackageId: number, channelId: string, assigneeDiscordId: string | undefined, error: string) {
+		await this.pool.query(
+			`INSERT INTO task_confirmation_queue(work_package_id,channel_id,assignee_discord_id,attempts,last_error)
+			 VALUES($1,$2,$3,1,$4)
+			 ON CONFLICT(work_package_id) DO UPDATE SET channel_id=excluded.channel_id,
+			 assignee_discord_id=excluded.assignee_discord_id, attempts=task_confirmation_queue.attempts + 1,
+			 last_error=excluded.last_error, updated_at=now()`,
+			[workPackageId, channelId, assigneeDiscordId ?? null, error.slice(0, 1000)],
+		);
+	}
+
+	async pendingConfirmation(workPackageId: number) {
+		const result = await this.pool.query<{ assignee_discord_id: string | null }>(
+			"SELECT assignee_discord_id FROM task_confirmation_queue WHERE work_package_id=$1",
+			[workPackageId],
+		);
+		return result.rows[0];
+	}
+
+	async clearConfirmation(workPackageId: number) {
+		await this.pool.query("DELETE FROM task_confirmation_queue WHERE work_package_id=$1", [workPackageId]);
 	}
 
 	async close() {

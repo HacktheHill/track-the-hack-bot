@@ -102,3 +102,38 @@ test("AI proposal metadata is persisted for reviewed task creation", async () =>
 	assert.match(inserted.sql, /priority_id, size_href, start_date, due_date, estimated_hours/);
 	assert.deepEqual(inserted.values.slice(7, 13), ["accountable", 4, "/api/v3/custom_options/5", "2026-07-14", "2026-07-21", 6]);
 });
+
+test("proposal review start and completion persist timing and correction metadata", async () => {
+	const queries = [];
+	const db = databaseWithPool({
+		async query(sql, values) {
+			queries.push({ sql, values });
+			return { rowCount: 1, rows: [{ id: "proposal" }] };
+		},
+	});
+	assert.equal(await db.startProposalReview("proposal", "reviewer"), true);
+	const corrections = {
+		title: true, description: false, project: false, assignee: false, accountable: false,
+		priority: false, size: false, startDate: false, dueDate: true, estimate: false,
+	};
+	await db.markProposalCreated("proposal", "reviewer", 42, "confirmation", corrections);
+	assert.match(queries[0].sql, /review_started_at=COALESCE/);
+	assert.match(queries[1].sql, /review_outcome='approved'/);
+	assert.deepEqual(queries[1].values[4], corrections);
+});
+
+test("extraction events retain structured metrics but no message content", async () => {
+	let inserted;
+	const db = databaseWithPool({
+		async query(sql, values) {
+			inserted = { sql, values };
+			return { rowCount: 1, rows: [] };
+		},
+	});
+	await db.recordExtraction({
+		source: "automatic", outcome: "proposal", modelDeployment: "model",
+		taskCount: 1, latencyMs: 250, tokenUsage: { totalTokens: 123 },
+	});
+	assert.match(inserted.sql, /ai_extraction_events/);
+	assert.deepEqual(inserted.values, ["automatic", "proposal", "model", 1, 250, { totalTokens: 123 }, null, null, null, null]);
+});
