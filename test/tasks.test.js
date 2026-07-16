@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, calendarDate, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, isExcludedChannel, precedingUntilGap, proposalCorrections, taskCommand, validIsoDate } from "../dist/tasks.js";
+import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, isExcludedChannel, precedingUntilGap, proposalCorrections, taskCommand, validIsoDate } from "../dist/tasks.js";
 import { normalizeTaskTitle, OpenProjectClient, titlesLikelyDuplicate } from "../dist/openproject.js";
 
 test("task defaults start today and use the configured due offset", () => {
@@ -128,6 +128,12 @@ test("AI task descriptions retain attachment links without verbatim source text"
 	assert.match(description, /schema\.png/);
 });
 
+test("proposal cards stay within Discord's message limit", () => {
+	const content = boundedDiscordContent("x".repeat(4000));
+	assert.equal(content.length <= 2000, true);
+	assert.match(content, /Preview truncated/);
+});
+
 test("task creation exposes selectable fields and keeps description optional", () => {
 	const create = taskCommand.toJSON().options.find(option => option.name === "create");
 	const options = create.options;
@@ -182,7 +188,7 @@ test("duplicate detection normalizes punctuation and compares meaningful words",
 	assert.equal(titlesLikelyDuplicate("Book venue", "Update Discord roles"), false);
 });
 
-test("OpenProject creation uses dynamic type/size metadata and appends Discord context", async () => {
+test("OpenProject creation uses dynamic type/size metadata and appends source links", async () => {
 	const calls = [];
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (url, init = {}) => {

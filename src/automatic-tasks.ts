@@ -3,8 +3,8 @@ import { containsSensitiveContent, minimizeText, StructuredOutputError, type Min
 import { isOrganizerGuild, type IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient } from "./openproject.js";
-import { appendSourceLinks, defaultAiDueDate } from "./tasks.js";
-import type { OpenProjectRag } from "./rag.js";
+import { appendSourceLinks, boundedDiscordContent, defaultAiDueDate } from "./tasks.js";
+import { resolveProposedAction, type OpenProjectRag } from "./rag.js";
 
 type AutomaticServices = { config: IntegrationConfig; db: Database; extractor: TaskExtractor; openProject: OpenProjectClient; rag?: OpenProjectRag };
 type Batch = { messages: Message[]; timer: NodeJS.Timeout };
@@ -74,8 +74,10 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 		try {
 			const extraction = await services.extractor.extract(minimized);
 			const { result, deployment } = extraction;
+			const priorities = await services.openProject.priorities();
 			let createdProposals = 0;
 			let duplicates = 0;
+			const ragEvaluations: Array<{ title: string; proposedAction: string; workPackageId?: number; similarity?: number }> = [];
 			const sourceRecords = new Map(source.map(message => [message.id, {
 				author: message.member?.displayName ?? message.author.username,
 				timestamp: message.createdAt.toISOString(),
@@ -88,42 +90,66 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				})),
 			}]));
 			for (const task of result.tasks.filter(item =>
-				item.proposed_action === "create" &&
-				item.completion_state === "incomplete" &&
+				item.proposed_action !== "no_action" &&
+				(item.proposed_action !== "create" || item.completion_state === "incomplete") &&
+				(item.proposed_action !== "complete" || item.completion_state === "completed") &&
 				item.significance_score >= services.config.OPENPROJECT_AI_SIGNIFICANCE_THRESHOLD &&
-				["new_assignment", "clarification", "additional_requirements", "unclear"].includes(item.context_relation))) {
+				["new_assignment", "clarification", "additional_requirements", "status_update", "completion_evidence", "unclear"].includes(item.context_relation))) {
 				if (!task.source_message_ids.every(id => source.some(message => message.id === id))) continue;
 				const assigneeId = task.assignee_alias ? reverse.get(task.assignee_alias) : undefined;
 				const accountableId = source.find(message => task.source_message_ids.includes(message.id))?.author.id;
 				const projectId = source[0] ? await categoryProject(source[0], services) : undefined;
+				const priority = task.priority_name ? priorities.find(item => item.name.toLocaleLowerCase() === task.priority_name!.toLocaleLowerCase()) : undefined;
+				const sizes = projectId ? await services.openProject.sizeOptions(projectId) : [];
+				const size = task.size_name ? sizes.find(item => item.value.toLocaleLowerCase() === task.size_name!.toLocaleLowerCase()) : undefined;
+				const dueDate = task.due_date ?? defaultAiDueDate(new Date(), priority?.name, size?.value, services.config.BOT_TIME_ZONE);
+				const sourceLinks = task.source_message_ids.map(id => `https://discord.com/channels/${source[0]?.guildId ?? ""}/${source.find(item => item.id === id)?.channelId ?? channelId}/${id}`);
 				const description = appendSourceLinks(task.description, sourceRecords, task.source_message_ids);
 				const similar = projectId && services.rag ? await services.rag.findSimilar(projectId, task.title, description) : [];
-				const match = similar[0];
-				if (match && match.similarity >= services.config.OPENPROJECT_RAG_SIMILARITY_THRESHOLD) {
+				ragEvaluations.push({
+					title: task.title, proposedAction: task.proposed_action,
+					workPackageId: similar[0]?.workPackageId, similarity: similar[0]?.similarity,
+				});
+				const match = services.config.OPENPROJECT_RAG_MODE === "review" && similar[0]?.similarity >= services.config.OPENPROJECT_RAG_SIMILARITY_THRESHOLD ? similar[0] : undefined;
+				const action = resolveProposedAction(task.proposed_action, services.config.OPENPROJECT_RAG_MODE, Boolean(match));
+				if (action === "no_action") continue;
+				if (action !== "create" && !match) continue;
+				if (match && action !== "create") {
 					const reviewers = new Set<string>(source.filter(message => task.source_message_ids.includes(message.id)).map(message => message.author.id));
 					if (assigneeId) reviewers.add(assigneeId);
 					if (accountableId) reviewers.add(accountableId);
 					for (const reviewer of [...reviewers]) if (!await services.db.openProjectUserId(reviewer)) reviewers.delete(reviewer);
 					const proposal = await services.db.createProposal({
 						channelId, projectId, title: task.title, description, assigneeDiscordId: assigneeId, accountableDiscordId: accountableId,
-						dueDate: task.due_date ?? defaultAiDueDate(new Date(), undefined, undefined, services.config.BOT_TIME_ZONE),
-						sourceMessageIds: task.source_message_ids, sourceLinks: task.source_message_ids.map(id => `https://discord.com/channels/${source[0]?.guildId ?? ""}/${source.find(item => item.id === id)?.channelId ?? channelId}/${id}`),
+						priorityId: priority?.id, sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined,
+						startDate: task.start_date ?? undefined, dueDate, estimatedHours: task.estimated_hours ?? undefined,
+						sourceMessageIds: task.source_message_ids, sourceLinks,
 						classification: task.classification, modelDeployment: deployment, permittedReviewerIds: [...reviewers], evidence: task.evidence,
 						ambiguities: [...result.ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
-						action: "update", targetWorkPackageId: match.workPackageId, targetLockVersion: match.lockVersion,
-						initialSnapshot: { title: task.title, description, action: "update", targetWorkPackageId: match.workPackageId },
+						action, targetWorkPackageId: match.workPackageId, targetLockVersion: match.lockVersion,
+						initialSnapshot: {
+							title: task.title, description, projectId, assigneeId, accountableId, priorityId: priority?.id,
+							sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate: task.start_date,
+							dueDate, estimatedHours: task.estimated_hours, action, targetWorkPackageId: match.workPackageId,
+							sourceMessageIds: task.source_message_ids, sourceLinks,
+						},
 						retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS,
 					});
 					if (!proposal.reused && services.config.OPENPROJECT_AUTOMATION_MODE === "review") {
 						const channel = source.at(-1)?.channel;
-						if (channel?.isSendable()) await channel.send({
-							content: `${assigneeId ? `<@${assigneeId}> ` : ""}${accountableId && accountableId !== assigneeId ? `<@${accountableId}> ` : ""}Proposed update to OpenProject task #${match.workPackageId}: **${task.title}**`,
+						if (channel?.isSendable()) try {
+							await channel.send({
+							content: boundedDiscordContent(`${assigneeId ? `<@${assigneeId}> ` : ""}${accountableId && accountableId !== assigneeId ? `<@${accountableId}> ` : ""}Proposed ${action} for OpenProject task #${match.workPackageId}: **${task.title}**`),
 							components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
 								new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and apply").setStyle(ButtonStyle.Primary),
 								new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
 								new ButtonBuilder().setCustomId(`op-more-fields:${proposal.id}`).setLabel("More fields").setStyle(ButtonStyle.Secondary),
 							)], allowedMentions: { users: [assigneeId, accountableId].filter((id): id is string => Boolean(id)) },
-						});
+							});
+						} catch (error) {
+							await services.db.markProposalDeliveryFailed(proposal.id, (error as Error).message);
+							throw error;
+						}
 					}
 					createdProposals++;
 					continue;
@@ -141,15 +167,21 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				}
 				const proposal = await services.db.createProposal({
 					channelId, projectId, title: task.title,
-					description, assigneeDiscordId: assigneeId, accountableDiscordId: accountableId,
-						dueDate: task.due_date ?? defaultAiDueDate(new Date(), undefined, undefined, services.config.BOT_TIME_ZONE), sourceMessageIds: task.source_message_ids,
-						sourceLinks: task.source_message_ids.map(id => `https://discord.com/channels/${source[0]?.guildId ?? ""}/${source.find(item => item.id === id)?.channelId ?? channelId}/${id}`),
+						description, assigneeDiscordId: assigneeId, accountableDiscordId: accountableId,
+						priorityId: priority?.id, sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined,
+						startDate: task.start_date ?? undefined, dueDate, estimatedHours: task.estimated_hours ?? undefined,
+						sourceMessageIds: task.source_message_ids, sourceLinks,
 					classification: task.classification, modelDeployment: deployment,
 					permittedReviewerIds: [...reviewers],
 					evidence: task.evidence, ambiguities: result.ambiguities,
 					latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
 						escalationReason: extraction.escalationReason,
-						initialSnapshot: { title: task.title, description, action: "create" },
+						initialSnapshot: {
+							title: task.title, description, projectId, assigneeId, accountableId, priorityId: priority?.id,
+							sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate: task.start_date,
+							dueDate, estimatedHours: task.estimated_hours, action: "create",
+							sourceMessageIds: task.source_message_ids, sourceLinks,
+						},
 						retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS,
 				});
 				if (proposal.reused) {
@@ -160,8 +192,9 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				if (services.config.OPENPROJECT_AUTOMATION_MODE === "review") {
 					const channel = source.at(-1)?.channel;
 					if (channel?.isSendable()) {
+						try {
 						await channel.send({
-					content: `${assigneeId ? `<@${assigneeId}> ` : ""}${accountableId && accountableId !== assigneeId ? `<@${accountableId}> ` : ""}Proposed OpenProject task: **${task.title}**\n${task.description}`,
+					content: boundedDiscordContent(`${assigneeId ? `<@${assigneeId}> ` : ""}${accountableId && accountableId !== assigneeId ? `<@${accountableId}> ` : ""}Proposed OpenProject task: **${task.title}**\n${description}`),
 							components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
 								new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and edit").setStyle(ButtonStyle.Primary),
 								new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
@@ -170,6 +203,10 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 							)],
 							allowedMentions: { users: [assigneeId, accountableId].filter((id): id is string => Boolean(id)) },
 						});
+						} catch (error) {
+							await services.db.markProposalDeliveryFailed(proposal.id, (error as Error).message);
+							throw error;
+						}
 					}
 				}
 			}
@@ -180,14 +217,17 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				 taskCount: result.tasks.length,
 				latencyMs: extraction.latencyMs,
 				tokenUsage: extraction.usage,
+				triggerId: source.at(-1)?.id,
 				inputSnapshot: minimized.map(({ id, authorAlias, text, timestamp, contextRole }) => ({ id, authorAlias, text, timestamp, contextRole })),
 				messageAssessments: result.message_assessments,
-				decision: { taskCount: result.tasks.length, proposalCount: createdProposals, duplicateCount: duplicates },
+				decision: { taskCount: result.tasks.length, proposalCount: createdProposals, duplicateCount: duplicates, ragEvaluations },
 			});
 		} catch (error) {
 			await services.db.recordExtraction({
 				source: "automatic",
 				outcome: error instanceof StructuredOutputError ? "invalid_output" : "error",
+				triggerId: source.at(-1)?.id,
+				decision: { errorType: error instanceof StructuredOutputError ? "invalid_output" : "provider_error" },
 			}).catch(auditError => console.error("Automatic task extraction metrics failed", { channelId, error: (auditError as Error).message }));
 			console.error("Automatic task extraction failed", { channelId, error: (error as Error).message });
 		}

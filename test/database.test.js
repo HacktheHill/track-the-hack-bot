@@ -133,7 +133,74 @@ test("extraction events retain structured metrics but no message content", async
 	await db.recordExtraction({
 		source: "automatic", outcome: "proposal", modelDeployment: "model",
 		taskCount: 1, latencyMs: 250, tokenUsage: { totalTokens: 123 },
+		inputSnapshot: [{ id: "message", text: "minimized" }],
+		messageAssessments: [{ message_id: "message", relevance: "relevant" }],
+		decision: { outcome: "proposal" },
 	});
 	assert.match(inserted.sql, /ai_extraction_events/);
-	assert.deepEqual(inserted.values, ["automatic", "proposal", "model", 1, 250, { totalTokens: 123 }, null, null, null, null]);
+	assert.deepEqual(inserted.values, ["automatic", "proposal", "model", 1, 250, '{"totalTokens":123}', null, '[{"id":"message","text":"minimized"}]', '[{"message_id":"message","relevance":"relevant"}]', '{"outcome":"proposal"}']);
+});
+
+test("proposal delivery failures become retryable failed proposals", async () => {
+	let query;
+	const db = databaseWithPool({ async query(sql, values) { query = { sql, values }; return { rowCount: 1, rows: [] }; } });
+	await db.markProposalDeliveryFailed("proposal", "Discord rejected the message");
+	assert.match(query.sql, /status='failed'/);
+	assert.match(query.sql, /delivery_failed/);
+	assert.deepEqual(query.values, ["proposal", "Discord rejected the message"]);
+});
+
+test("handled proposal revisions use AI evaluation retention instead of proposal expiry", async () => {
+	const queries = [];
+	const db = databaseWithPool({ async query(sql, values) { queries.push({ sql, values }); return { rowCount: 0, rows: [] }; } });
+	await db.cleanup({ OPENPROJECT_PROPOSAL_RETENTION_DAYS: 30, OPENPROJECT_AI_EVALUATION_RETENTION_DAYS: 90, OPENPROJECT_AUDIT_RETENTION_DAYS: 365 });
+	assert.match(queries[0].sql, /status='pending_review' AND expires_at/);
+	assert.deepEqual(queries[0].values, [90]);
+});
+
+test("scheduled messages persist the scheduler identity snapshot", async () => {
+	let inserted;
+	const db = databaseWithPool({
+		async query(sql, values) {
+			inserted = { sql, values };
+			return { rowCount: 1, rows: [] };
+		},
+	});
+	await db.createScheduledMessage({
+		guildId: "guild", channelId: "channel", createdByDiscordId: "user",
+		schedulerName: "Display Name", schedulerAvatarUrl: "https://cdn.example/avatar.png",
+		content: "Scheduled content", sendAt: new Date("2026-07-17T12:00:00Z"),
+	});
+	assert.match(inserted.sql, /scheduler_name,scheduler_avatar_url/);
+	assert.deepEqual(inserted.values.slice(1, 7), [
+		"guild", "channel", "user", "Display Name", "https://cdn.example/avatar.png", "Scheduled content",
+	]);
+});
+
+test("due scheduled messages are claimed with row locking", async () => {
+	let query;
+	const db = databaseWithPool({
+		async query(sql, values) {
+			query = { sql, values };
+			return { rowCount: 1, rows: [{ id: "schedule", attempts: 1 }] };
+		},
+	});
+	const claimed = await db.claimDueScheduledMessages(5);
+	assert.equal(claimed[0].id, "schedule");
+	assert.match(query.sql, /FOR UPDATE SKIP LOCKED/);
+	assert.match(query.sql, /status='processing'/);
+	assert.deepEqual(query.values, [5]);
+});
+
+test("failed scheduled delivery can return to the pending queue", async () => {
+	let update;
+	const db = databaseWithPool({
+		async query(sql, values) {
+			update = { sql, values };
+			return { rowCount: 1, rows: [] };
+		},
+	});
+	await db.markScheduledMessageDeliveryFailed("schedule", "Discord unavailable", 30);
+	assert.match(update.sql, /next_attempt_at/);
+	assert.deepEqual(update.values, ["schedule", "pending", "Discord unavailable", 30]);
 });

@@ -174,6 +174,7 @@ function normalizeExtraction(result: ExtractedTasks): ExtractedTasks {
 		message_assessments: result.message_assessments,
 		tasks: result.tasks.map(task => ({
 			...task,
+			title: sanitizeGeneratedDescription(task.title).slice(0, 255),
 			description: sanitizeGeneratedDescription(task.description),
 			evidence: sanitizeGeneratedDescription(task.evidence),
 		})),
@@ -275,6 +276,8 @@ async function invokeCompatible(options: {
 						"Use timestamps and replyTo relationships literally. Do not merge discussions separated in time or infer that an old topic continues merely because it appears in the context.",
 						"If supporting messages contain another topic, owner, or task, ignore it. If the primary message cannot be interpreted without mixing topics, classify it as insufficient_context and explain the ambiguity rather than extracting an unrelated task.",
 						"For automatic batches with no primary message, extract significant incomplete work even when nobody is explicitly assigned; do not create tasks for trivial suggestions, completed work, cancellations, or superseded work.",
+						"Set proposed_action=create only for significant incomplete new work. Use update for material new requirements on existing work, complete when the discussion confirms completion, reopen when work must resume, and no_action for cancelled, superseded, trivial, or already-resolved work.",
+						"For complete or reopen, still return the task-shaped record with the existing work's best title and description so retrieval can locate it. Never turn completion, cancellation, or supersession into a new create action.",
 						"Cite a subsequent message when it confirms completion, clarifies the task, or supplies its deliverable URL. Include every relevant non-Discord URL from cited messages in the task description. Resolve an assignee only from an explicit assignment or commitment to a supplied USER alias.",
 						"Assess every supplied message exactly once in message_assessments, including unrelated messages. Use source_message_ids only for messages assessed as relevant, supporting, or completion evidence.",
 						"Include every relevant source_message_id and relevant_attachment_id needed to support the task. Do not cite messages or attachments that are unrelated.",

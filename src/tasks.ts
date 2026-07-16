@@ -18,6 +18,7 @@ import {
 	ButtonStyle,
 	ButtonInteraction,
 	Message,
+	MessageFlags,
 	PermissionFlagsBits,
 	StringSelectMenuBuilder,
 	UserSelectMenuBuilder,
@@ -29,7 +30,7 @@ import { isOrganizerGuild, type IntegrationConfig, type TeamMapping } from "./co
 import { correctionFields, Database, type CorrectionFlags, type ProposalMetrics } from "./database.js";
 import { OpenProjectClient, OpenProjectRequestError } from "./openproject.js";
 import { containsSensitiveContent, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, StructuredOutputError, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
-import type { OpenProjectRag } from "./rag.js";
+import { resolveProposedAction, type OpenProjectRag } from "./rag.js";
 
 export const taskCommand = new SlashCommandBuilder()
 	.setName("task")
@@ -177,6 +178,34 @@ export function formatProposalMetrics(metrics: ProposalMetrics) {
 		`Average review: ${Math.round(metrics.averageReviewDurationMs / 1000)}s · extraction: ${Math.round(metrics.averageExtractionLatencyMs)}ms · tokens: ${metrics.totalTokens} · invalid outputs: ${metrics.invalidOutputs}`,
 		`Field edit rates — ${edits}`,
 	].join("\n");
+}
+
+export function boundedDiscordContent(value: string, limit = 2000) {
+	if (value.length <= limit) return value;
+	return `${value.slice(0, Math.max(0, limit - 24)).trimEnd()}\n\n[Preview truncated]`;
+}
+
+function proposalSnapshot(input: {
+	title: string; description: string; projectId?: number | null; assigneeId?: string | null;
+	accountableId?: string | null; priorityId?: number | null; sizeHref?: string | null;
+	startDate?: string | null; dueDate?: string | null; estimatedHours?: number | null;
+	action: string; targetWorkPackageId?: number | null; sourceMessageIds?: string[]; sourceLinks?: string[];
+}) {
+	return input;
+}
+
+async function deliverProposalReply(
+	interaction: MessageContextMenuCommandInteraction | ChatInputCommandInteraction | ButtonInteraction,
+	services: Services,
+	proposalId: string,
+	payload: Parameters<typeof interaction.editReply>[0],
+) {
+	try {
+		await interaction.editReply(payload);
+	} catch (error) {
+		await services.db.markProposalDeliveryFailed(proposalId, (error as Error).message);
+		throw error;
+	}
 }
 
 async function contextDraft(id: string, userId: string, services: Services) {
@@ -631,6 +660,7 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 	}
 	await requireCreator(interaction, services);
 	if (subcommand === "extract") {
+		requireOrganizer(interaction, services);
 		if (!services.extractor.enabled) throw new Error("No task extraction provider is configured.");
 		const limit = interaction.options.getInteger("message_count") ?? 20;
 		const context = await collectRecentContext(interaction, limit);
@@ -642,6 +672,10 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 				await interaction.editReply("This channel matched the sensitive-content heuristic. Nothing was sent to Azure.");
 				return;
 			}
+			await services.db.recordExtraction({
+				source: "manual", outcome: error instanceof StructuredOutputError ? "invalid_output" : "error",
+				triggerId: context.primaryId, decision: { trigger: "slash", errorType: error instanceof StructuredOutputError ? "invalid_output" : "provider_error" },
+			}).catch(() => undefined);
 			throw error;
 		}
 		return;
@@ -1139,10 +1173,12 @@ async function handleAiContext(interaction: MessageContextMenuCommandInteraction
 			await services.db.recordExtraction({
 				source: "manual",
 				outcome: error instanceof StructuredOutputError ? "invalid_output" : "error",
+				triggerId: context.primaryId,
+				decision: { trigger: "context_menu", errorType: error instanceof StructuredOutputError ? "invalid_output" : "provider_error" },
 			}).catch(auditError => console.error("AI extraction metrics failed", { error: (auditError as Error).message }));
 			throw error;
 		}
-		await services.db.recordExtraction({ source: "manual", outcome: "sensitive_block" })
+		await services.db.recordExtraction({ source: "manual", outcome: "sensitive_block", triggerId: context.primaryId, decision: { trigger: "context_menu" } })
 			.catch(auditError => console.error("AI extraction metrics failed", { error: (auditError as Error).message }));
 		const id = randomUUID();
 		sensitiveOverrides.set(id, { userId: interaction.user.id, context, expiresAt: Date.now() + 10 * 60_000 });
@@ -1171,19 +1207,20 @@ async function completeAiContext(
 	});
 	const { result, deployment } = extraction;
 	const inputSnapshot = context.messages.map(({ id, authorAlias, text, timestamp, contextRole }) => ({ id, authorAlias, text, timestamp, contextRole }));
-	const decisionTelemetry = { taskCount: result.tasks.length, action: "create", primaryMessageId: context.primaryId };
+	const decisionTelemetry = { taskCount: result.tasks.length, primaryMessageId: context.primaryId };
 	const candidate = result.tasks.find(task =>
-		task.proposed_action === "create" &&
-		(task.completion_state === "incomplete" || task.completion_state === "unknown") &&
-		task.significance_score >= services.config.OPENPROJECT_AI_SIGNIFICANCE_THRESHOLD * 0.7 &&
-		["new_assignment", "clarification", "additional_requirements", "question", "unclear"].includes(task.context_relation) &&
+		task.proposed_action !== "no_action" &&
+		(task.proposed_action !== "create" || task.completion_state === "incomplete" || task.completion_state === "unknown") &&
+		(task.proposed_action !== "complete" || task.completion_state === "completed") &&
+		task.significance_score >= services.config.OPENPROJECT_AI_SIGNIFICANCE_THRESHOLD * (task.proposed_action === "create" ? 0.7 : 0.5) &&
+		["new_assignment", "clarification", "additional_requirements", "status_update", "completion_evidence", "question", "unclear"].includes(task.context_relation) &&
 		task.source_message_ids.includes(context.primaryId) &&
 		task.source_message_ids.every(id => context.validIds.has(id)) &&
 		task.relevant_attachment_ids.every(id => [...context.sourceRecords.values()].some(record => record.attachments.some(attachment => attachment.id === id))),
 	);
 	if (!candidate) {
 		await services.db.recordExtraction({
-			source: "manual", outcome: "no_task", modelDeployment: deployment,
+			source: "manual", outcome: "no_task", modelDeployment: deployment, triggerId: context.primaryId,
 			 taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
 			inputSnapshot, messageAssessments: result.message_assessments, decision: { ...decisionTelemetry, outcome: "no_task" },
 		});
@@ -1212,28 +1249,70 @@ async function completeAiContext(
 		context.sourceRecords,
 		candidate.source_message_ids,
 	);
-	let similar = services.rag && await services.rag.findSimilar(projectId ?? 0, candidate.title, description);
-	if (projectId && services.config.OPENPROJECT_RAG_MODE === "review" && similar?.[0] && similar[0].similarity >= services.config.OPENPROJECT_RAG_SIMILARITY_THRESHOLD) {
-		const match = similar[0];
+	const sourceLinks = candidate.source_message_ids.map(id => {
+		const source = context.messages.find(message => message.id === id);
+		return messageUrl(interaction.guildId!, source?.channelId ?? interaction.channelId!, id);
+	});
+	const similar = projectId && services.rag ? await services.rag.findSimilar(projectId, candidate.title, description) : [];
+	const match = services.config.OPENPROJECT_RAG_MODE === "review" && similar[0]?.similarity >= services.config.OPENPROJECT_RAG_SIMILARITY_THRESHOLD ? similar[0] : undefined;
+	const action = resolveProposedAction(candidate.proposed_action, services.config.OPENPROJECT_RAG_MODE, Boolean(match));
+	if (action === "no_action") {
+		await services.db.recordExtraction({
+			source: "manual", outcome: "no_task", modelDeployment: deployment, triggerId: context.primaryId,
+			taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+			inputSnapshot, messageAssessments: result.message_assessments,
+			decision: { ...decisionTelemetry, requestedAction: candidate.proposed_action, outcome: "no_existing_match" },
+		});
+		await interaction.editReply("The discussion suggests an existing-task change, but no sufficiently close OpenProject task was found.");
+		return;
+	}
+	if (action !== "create" && !match) {
+		await services.db.recordExtraction({
+			source: "manual", outcome: "no_task", modelDeployment: deployment, triggerId: context.primaryId,
+			taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+			inputSnapshot, messageAssessments: result.message_assessments,
+			decision: { ...decisionTelemetry, requestedAction: candidate.proposed_action, outcome: "no_existing_match" },
+		});
+		await interaction.editReply("The discussion suggests an existing-task change, but no sufficiently close OpenProject task was found.");
+		return;
+	}
+	if (projectId && match && action !== "create") {
 		const proposal = await services.db.createProposal({
 			requesterId: interaction.user.id, channelId: interaction.channelId, projectId,
 			title: candidate.title, description, assigneeDiscordId: assigneeId, accountableDiscordId: accountableId,
 			priorityId: priority?.id, sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate, dueDate,
 			estimatedHours: candidate.estimated_hours ?? undefined, sourceMessageIds: candidate.source_message_ids,
-			sourceLinks: candidate.source_message_ids.map(id => messageUrl(interaction.guildId!, context.messages.find(message => message.id === id)?.channelId ?? interaction.channelId!, id)),
+			sourceLinks,
 			classification: candidate.classification, modelDeployment: deployment, evidence: candidate.evidence,
 			ambiguities: [...result.ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: extraction.latencyMs,
 			tokenUsage: extraction.usage, escalationReason: extraction.escalationReason,
-			retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS, action: "update",
+			retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS, action,
 			targetWorkPackageId: match.workPackageId, targetLockVersion: match.lockVersion,
-			initialSnapshot: { title: candidate.title, description, action: "update", targetWorkPackageId: match.workPackageId },
+			initialSnapshot: proposalSnapshot({
+				title: candidate.title, description, projectId, assigneeId, accountableId, priorityId: priority?.id,
+				sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate, dueDate,
+				estimatedHours: candidate.estimated_hours, action, targetWorkPackageId: match.workPackageId,
+				sourceMessageIds: candidate.source_message_ids, sourceLinks,
+			}),
 		});
 		if (proposal.reused) {
+			await services.db.recordExtraction({
+				source: "manual", outcome: "duplicate", modelDeployment: deployment, triggerId: context.primaryId,
+				taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+				inputSnapshot, messageAssessments: result.message_assessments,
+				decision: { ...decisionTelemetry, action, targetWorkPackageId: match.workPackageId, outcome: "duplicate" },
+			});
 			await interaction.editReply(`This discussion already has a pending task update proposal.`);
 			return;
 		}
-		await interaction.editReply({
-			content: `**Possible update to #${match.workPackageId}**\n${candidate.title}\n${description}\n\nSimilarity: ${Math.round(match.similarity * 100)}%`,
+		await services.db.recordExtraction({
+			source: "manual", outcome: "proposal", modelDeployment: deployment, triggerId: context.primaryId,
+			taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+			inputSnapshot, messageAssessments: result.message_assessments,
+			decision: { ...decisionTelemetry, action, targetWorkPackageId: match.workPackageId, similarity: match.similarity, outcome: "proposal" },
+		});
+		await deliverProposalReply(interaction, services, proposal.id, {
+			content: boundedDiscordContent(`**Possible ${action} for #${match.workPackageId}**\n${candidate.title}\n${description}\n\nSimilarity: ${Math.round(match.similarity * 100)}%`),
 			components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
 				new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and apply").setStyle(ButtonStyle.Primary),
 				new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
@@ -1248,7 +1327,9 @@ async function completeAiContext(
 			await services.db.recordExtraction({
 				source: "manual", outcome: "duplicate", modelDeployment: deployment,
 				taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
-				inputSnapshot, messageAssessments: result.message_assessments, decision: { ...decisionTelemetry, outcome: "duplicate" },
+			inputSnapshot, messageAssessments: result.message_assessments, decision: {
+				...decisionTelemetry, outcome: "duplicate", ragMatch: similar[0] ? { workPackageId: similar[0].workPackageId, similarity: similar[0].similarity } : null,
+			},
 			});
 			await interaction.editReply(`A similar open task already exists: ${services.openProject.workPackageUrl(duplicate.id)}`);
 			return;
@@ -1265,12 +1346,13 @@ async function completeAiContext(
 		evidence: candidate.evidence, ambiguities: result.ambiguities,
 		latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
 					escalationReason: extraction.escalationReason,
-					sourceLinks: candidate.source_message_ids.map(id => {
-						const source = context.messages.find(message => message.id === id);
-						return messageUrl(interaction.guildId!, source?.channelId ?? interaction.channelId!, id);
-					}),
+					sourceLinks,
 					retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS,
-					initialSnapshot: { title: candidate.title, description, action: "create" },
+			initialSnapshot: proposalSnapshot({
+				title: candidate.title, description, projectId, assigneeId, accountableId, priorityId: priority?.id,
+				sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate, dueDate,
+				estimatedHours: candidate.estimated_hours, action: "create", sourceMessageIds: candidate.source_message_ids, sourceLinks,
+			}),
 	});
 	if (proposal.reused) {
 		await services.db.recordExtraction({
@@ -1282,8 +1364,11 @@ async function completeAiContext(
 		return;
 	}
 	await services.db.recordExtraction({
-		source: "manual", outcome: "proposal", modelDeployment: deployment,
+		source: "manual", outcome: "proposal", modelDeployment: deployment, triggerId: context.primaryId,
 		taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+		inputSnapshot, messageAssessments: result.message_assessments, decision: {
+			...decisionTelemetry, action: "create", outcome: "proposal", ragMatch: similar[0] ? { workPackageId: similar[0].workPackageId, similarity: similar[0].similarity } : null,
+		},
 	});
 	const review = new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and edit").setStyle(ButtonStyle.Primary);
 	const dismiss = new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary);
@@ -1298,8 +1383,8 @@ async function completeAiContext(
 		`Dates: ${startDate ?? "Not set"} → ${dueDate}`,
 		`Estimate: ${candidate.estimated_hours !== null ? `${candidate.estimated_hours}h` : "Not inferred"}`,
 	].join("\n");
-	await interaction.editReply({
-		content: `**${candidate.title}**\n${description}${details ? `\n\n${details}` : ""}\n\nClassification: ${candidate.classification}${result.ambiguities.length ? `\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`,
+	await deliverProposalReply(interaction, services, proposal.id, {
+		content: boundedDiscordContent(`**${candidate.title}**\n${description}${details ? `\n\n${details}` : ""}\n\nClassification: ${candidate.classification}${result.ambiguities.length ? `\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`),
 		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(review, dismiss, duplicate, moreFields)],
 	});
 }
@@ -1328,8 +1413,12 @@ async function handleProposalButton(interaction: ButtonInteraction, services: Se
 		if (!await services.db.setProposalStatus(id, "dismissed", interaction.user.id)) {
 			throw new Error("This proposal was already handled by another reviewer.");
 		}
-		await interaction.message.delete().catch(() => undefined);
-		await interaction.reply({ content: "Proposal dismissed.", ephemeral: true });
+		if (interaction.message.flags.has(MessageFlags.Ephemeral)) {
+			await interaction.update({ content: "Proposal dismissed.", components: [] });
+		} else {
+			await interaction.message.delete().catch(() => interaction.update({ content: "This proposal is no longer pending.", components: [] }));
+			if (!interaction.replied && !interaction.deferred) await interaction.reply({ content: "Proposal dismissed.", ephemeral: true });
+		}
 		return;
 	}
 	if (interaction.customId.startsWith("op-duplicate:")) {
@@ -1440,8 +1529,13 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 		const priorityText = interaction.fields.getTextInputValue("priority").trim();
 		const priorityId = priorityText ? Number(priorityText) : null;
 		if (priorityText && !Number.isInteger(priorityId)) throw new Error("Priority ID must be an integer.");
+		if (priorityId && !(await services.openProject.priorities()).some(priority => priority.id === priorityId)) throw new Error("Select a valid OpenProject priority.");
 		const sizeText = interaction.fields.getTextInputValue("size").trim();
 		if (sizeText && !/^\/api\/v3\/custom_options\/\d+$/.test(sizeText)) throw new Error("Size must use an OpenProject custom option href.");
+		if (sizeText && proposal.project_id) {
+			const sizeId = Number(sizeText.split("/").at(-1));
+			if (!(await services.openProject.sizeOptions(proposal.project_id)).some(size => size.id === sizeId)) throw new Error("Select a valid OpenProject size.");
+		}
 		const startDate = validIsoDate(interaction.fields.getTextInputValue("start_date") || undefined) ?? null;
 		const estimateText = interaction.fields.getTextInputValue("estimate").trim();
 		const estimatedHours = estimateText ? Number(estimateText) : null;
@@ -1490,18 +1584,29 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 		};
 		if (!await services.db.claimProposal(proposal.id, interaction.user.id)) throw new Error("This proposal is already being handled.");
 		try {
-			if (proposal.action === "update" && proposal.target_work_package_id) {
+			if (proposal.action !== "create" && proposal.target_work_package_id) {
 				const assigneeOpenProjectId = args.assigneeId ? await services.db.openProjectUserId(args.assigneeId) : undefined;
 				const accountableOpenProjectId = args.accountableId ? await services.db.openProjectUserId(args.accountableId) : undefined;
 				if (args.assigneeId && !assigneeOpenProjectId) throw new Error("The assignee is not mapped to OpenProject.");
 				if (args.accountableId && !accountableOpenProjectId) throw new Error("The accountable user is not mapped to OpenProject.");
+				const assigneeMember = args.assigneeId ? await interaction.guild!.members.fetch(args.assigneeId).catch(() => null) : null;
+				const reviewedProjectId = await resolveProject(args.projectText, interaction.channelId!, interaction.guild!, assigneeMember, services);
+				if (!reviewedProjectId) throw new Error("Select an OpenProject project.");
+				await requireProjectAccess(interaction, reviewedProjectId, services);
+				const statuses = proposal.action === "complete" || proposal.action === "reopen" ? await services.openProject.statuses() : [];
+				const status = proposal.action === "complete"
+					? statuses.find(item => item.isClosed)
+					: proposal.action === "reopen" ? statuses.find(item => !item.isClosed && item.isDefault) ?? statuses.find(item => !item.isClosed) : undefined;
+				if ((proposal.action === "complete" || proposal.action === "reopen") && !status) throw new Error(`OpenProject has no status available for ${proposal.action}.`);
 				const updated = await services.openProject.updateWorkPackage(proposal.target_work_package_id, {
 					subject: args.title,
 					description: { format: "markdown", raw: args.description },
 					_links: {
+						project: { href: `/api/v3/projects/${reviewedProjectId}` },
 						...(assigneeOpenProjectId ? { assignee: { href: `/api/v3/users/${assigneeOpenProjectId}` } } : {}),
 						...(accountableOpenProjectId ? { responsible: { href: `/api/v3/users/${accountableOpenProjectId}` } } : {}),
 						...(args.priorityId ? { priority: { href: `/api/v3/priorities/${args.priorityId}` } } : {}),
+						...(status ? { status: { href: `/api/v3/statuses/${status.id}` } } : {}),
 					},
 					...(args.startDate !== undefined ? { startDate: args.startDate } : {}),
 					...(args.dueDate !== undefined ? { dueDate: args.dueDate } : {}),
@@ -1511,9 +1616,19 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 				await services.db.markProposalUpdated(proposal.id, interaction.user.id, updated.id, proposalCorrections({
 					original: { title: proposal.title, description: proposal.description, assigneeId: proposal.assignee_discord_id, accountableId: proposal.accountable_discord_id, priorityId: proposal.priority_id, sizeHref: proposal.size_href, startDate: proposal.start_date, dueDate: proposal.due_date, estimatedHours: proposal.estimated_hours },
 					reviewed: { title: args.title, description: args.description, assigneeId: args.assigneeId, accountableId: args.accountableId, priorityId: args.priorityId, sizeHref: args.sizeHref, startDate: args.startDate, dueDate: args.dueDate, estimatedHours: args.estimatedHours },
+				}), proposal.action);
+				await services.db.recordFinalProposalRevision(proposal.id, proposalSnapshot({
+					title: args.title, description: args.description, projectId: reviewedProjectId, assigneeId: args.assigneeId,
+					accountableId: args.accountableId, priorityId: args.priorityId, sizeHref: args.sizeHref,
+					startDate: args.startDate, dueDate: args.dueDate, estimatedHours: args.estimatedHours,
+					action: proposal.action, targetWorkPackageId: updated.id, sourceLinks: args.sourceLinks,
 				}));
-				await services.db.recordFinalProposalRevision(proposal.id, { title: args.title, description: args.description, action: "update", targetWorkPackageId: updated.id });
-				await interaction.editReply(`Updated ${services.openProject.workPackageUrl(updated.id)}.`);
+				const owners = [args.assigneeId, args.accountableId].filter((id): id is string => Boolean(id));
+				if (interaction.channel?.isSendable()) await interaction.channel.send({
+					content: `${owners.map(id => `<@${id}>`).join(" ")}${owners.length ? " " : ""}OpenProject task updated: **${updated.subject}**\n${services.openProject.workPackageUrl(updated.id)}`,
+					allowedMentions: owners.length ? { users: owners } : { parse: [] },
+				});
+				await interaction.editReply(`${proposal.action === "complete" ? "Completed" : proposal.action === "reopen" ? "Reopened" : "Updated"} ${services.openProject.workPackageUrl(updated.id)}.`);
 				return;
 			}
 			const created = await createAndAnnounce(args);
@@ -1540,7 +1655,12 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 						},
 					}),
 				);
-				await services.db.recordFinalProposalRevision(proposal.id, { title: args.title, description: args.description, action: "create", workPackageId: created.workPackage.id });
+				await services.db.recordFinalProposalRevision(proposal.id, proposalSnapshot({
+					title: args.title, description: args.description, projectId: proposal.project_id, assigneeId: args.assigneeId,
+					accountableId: args.accountableId, priorityId: args.priorityId, sizeHref: args.sizeHref,
+					startDate: args.startDate, dueDate: args.dueDate, estimatedHours: args.estimatedHours,
+					action: "create", targetWorkPackageId: created.workPackage.id, sourceLinks: args.sourceLinks,
+				}));
 			} catch (error) {
 				throw new OpenProjectRequestError(`OpenProject task ${created.workPackage.id} was created, but its proposal could not be finalized: ${(error as Error).message}`, true);
 			}
