@@ -68,6 +68,7 @@ export function loadIntegrationConfig() {
 			{},
 		),
 		blockedChannels: new Set(jsonRecord<string[]>("OPENPROJECT_BLOCKED_CHANNEL_IDS", [])),
+		externalCategoryId: parsed.data.OPENPROJECT_EXTERNAL_CATEGORY_ID,
 		excludedChannelIds: new Set([
 			...jsonRecord<string[]>("OPENPROJECT_BLOCKED_CHANNEL_IDS", []),
 			...jsonRecord<string[]>("OPENPROJECT_EXCLUDED_CHANNEL_IDS", []),

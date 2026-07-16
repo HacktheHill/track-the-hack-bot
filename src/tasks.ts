@@ -26,9 +26,10 @@ import {
 } from "discord.js";
 import { randomUUID } from "node:crypto";
 import { isOrganizerGuild, type IntegrationConfig, type TeamMapping } from "./config.js";
-import { Database } from "./database.js";
+import { correctionFields, Database, type CorrectionFlags, type ProposalMetrics } from "./database.js";
 import { OpenProjectClient, OpenProjectRequestError } from "./openproject.js";
-import { containsSensitiveContent, minimizeText, normalizeExtractedDate, SensitiveContentError, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
+import { containsSensitiveContent, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, StructuredOutputError, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
+import type { OpenProjectRag } from "./rag.js";
 
 export const taskCommand = new SlashCommandBuilder()
 	.setName("task")
@@ -82,6 +83,15 @@ export const taskCommand = new SlashCommandBuilder()
 	.addSubcommand(command => command.setName("announce").setDescription("Retry a Discord task announcement")
 		.addIntegerOption(option => option.setName("id").setDescription("OpenProject task ID").setRequired(true).setMinValue(1))
 		.addUserOption(option => option.setName("assignee").setDescription("Optional user to ping")))
+	.addSubcommand(command => command.setName("metrics").setDescription("Show AI proposal quality metrics")
+		.addIntegerOption(option => option.setName("period").setDescription("Reporting period").setRequired(true)
+			.addChoices(
+				{ name: "Last 7 days", value: 7 },
+				{ name: "Last 30 days", value: 30 },
+				{ name: "Last 90 days", value: 90 },
+			)))
+	.addSubcommand(command => command.setName("extract").setDescription("Force AI extraction from recent channel messages")
+		.addIntegerOption(option => option.setName("message_count").setDescription("Number of recent messages to inspect").setMinValue(1).setMaxValue(50)))
 	.addSubcommand(command => command.setName("link-user").setDescription("Map a Discord user to an OpenProject user")
 		.addUserOption(option => option.setName("discord_user").setDescription("Discord user").setRequired(true))
 		.addStringOption(option => option.setName("openproject_user").setDescription("OpenProject user").setRequired(true).setAutocomplete(true)))
@@ -98,7 +108,7 @@ export const aiTaskMessageCommand = new ContextMenuCommandBuilder()
 	.setName("Draft OpenProject task with AI")
 	.setType(ApplicationCommandType.Message);
 
-type Services = { config: IntegrationConfig; db: Database; openProject: OpenProjectClient; extractor: TaskExtractor };
+type Services = { config: IntegrationConfig; db: Database; openProject: OpenProjectClient; extractor: TaskExtractor; rag?: OpenProjectRag };
 type TaskInteraction = ChatInputCommandInteraction | ModalSubmitInteraction | ButtonInteraction;
 type ContextDraft = {
 	userId: string; channelId: string; targetId: string; title: string; description: string;
@@ -113,6 +123,7 @@ type CreationDraft = {
 };
 type CollectedContext = {
 	messages: MinimizedMessage[];
+	sourceRecords: Map<string, { author: string; timestamp: string; text: string; attachments: Array<{ id: string; name: string; contentType?: string; url: string }> }>;
 	reverseAliases: Map<string, string>;
 	validIds: Set<string>;
 	primaryId: string;
@@ -120,6 +131,53 @@ type CollectedContext = {
 	explicitAssigneeId?: string;
 };
 const sensitiveOverrides = new Map<string, { userId: string; context: CollectedContext; expiresAt: number }>();
+
+function normalizedMetricValue(value?: string | null) {
+	return (value ?? "").trim().replace(/\s+/g, " ").toLocaleLowerCase();
+}
+
+export function proposalCorrections(input: {
+	original: {
+		title: string; description: string; projectName?: string; assigneeId?: string | null;
+		accountableId?: string | null; priorityId?: number | null; sizeHref?: string | null;
+		startDate?: string | null; dueDate?: string | null; estimatedHours?: number | null;
+	};
+	reviewed: {
+		title: string; description: string; projectName?: string; assigneeId?: string;
+		accountableId?: string; priorityId?: number; sizeHref?: string;
+		startDate?: string; dueDate?: string; estimatedHours?: number;
+	};
+}): CorrectionFlags {
+	const { original, reviewed } = input;
+	return {
+		title: normalizedMetricValue(original.title) !== normalizedMetricValue(reviewed.title),
+		description: normalizedMetricValue(original.description) !== normalizedMetricValue(reviewed.description),
+		project: normalizedMetricValue(original.projectName) !== normalizedMetricValue(reviewed.projectName),
+		assignee: (original.assigneeId ?? undefined) !== reviewed.assigneeId,
+		accountable: (original.accountableId ?? undefined) !== reviewed.accountableId,
+		priority: (original.priorityId ?? undefined) !== reviewed.priorityId,
+		size: (original.sizeHref ?? undefined) !== reviewed.sizeHref,
+		startDate: (databaseDate(original.startDate) ?? undefined) !== reviewed.startDate,
+		dueDate: (databaseDate(original.dueDate) ?? undefined) !== reviewed.dueDate,
+		estimate: (original.estimatedHours == null ? undefined : Number(original.estimatedHours)) !== reviewed.estimatedHours,
+	};
+}
+
+function percent(value: number) {
+	return `${Math.round(value * 100)}%`;
+}
+
+export function formatProposalMetrics(metrics: ProposalMetrics) {
+	const edits = correctionFields.map(field => `${field}: ${percent(metrics.correctionRates[field])}`).join(" · ");
+	return [
+		`**AI task quality · last ${metrics.days} days**`,
+		`Proposals: ${metrics.proposals} · approved: ${metrics.approved} · dismissed: ${metrics.dismissed} · duplicates: ${metrics.duplicates} · failures: ${metrics.failures}`,
+		`Approval rate: ${percent(metrics.approvalRate)} · duplicate rate: ${percent(metrics.duplicateRate)} · reconciliations: ${metrics.reconciliations}`,
+		`Assignee accepted: ${percent(metrics.assigneeAcceptanceRate)} · deadline accepted: ${percent(metrics.deadlineAcceptanceRate)}`,
+		`Average review: ${Math.round(metrics.averageReviewDurationMs / 1000)}s · extraction: ${Math.round(metrics.averageExtractionLatencyMs)}ms · tokens: ${metrics.totalTokens} · invalid outputs: ${metrics.invalidOutputs}`,
+		`Field edit rates — ${edits}`,
+	].join("\n");
+}
 
 async function contextDraft(id: string, userId: string, services: Services) {
 	return services.db.draft<ContextDraft>(id, userId, "context");
@@ -246,11 +304,25 @@ async function requireCreator(interaction: ChatInputCommandInteraction | Message
 		throw new Error("OpenProject tasks are available only in the Organizer Discord server.");
 	}
 	if (services.config.blockedChannels.has(interaction.channelId!)) throw new Error("Task creation is disabled in this channel.");
+	if (services.config.externalCategoryId && await isExternalChannel(interaction.channelId!, interaction.guild!, services.config.externalCategoryId)) {
+		throw new Error("Task extraction is disabled in the External category.");
+	}
 	const member = await interaction.guild!.members.fetch(interaction.user.id);
 	if (!member.roles.cache.has(services.config.ORGANIZER_GUILD_MEMBER_ROLE_ID)) {
 		throw new Error("You need the Members role to create or manage OpenProject tasks.");
 	}
 	return member;
+}
+
+async function isExternalChannel(channelId: string, guild: Guild, externalCategoryId?: string) {
+	if (!externalCategoryId) return false;
+	let channel = await guild.channels.fetch(channelId).catch(() => null);
+	for (let depth = 0; channel && depth < 5; depth++) {
+		if (channel.id === externalCategoryId || channel.type === ChannelType.GuildCategory && channel.id === externalCategoryId) return true;
+		if (!channel.parentId) break;
+		channel = await guild.channels.fetch(channel.parentId).catch(() => null);
+	}
+	return false;
 }
 
 async function categoryIdFor(channelId: string, guild: Guild) {
@@ -370,6 +442,11 @@ async function createAndAnnounce(args: {
 	const projectId = await resolveProject(args.projectText, interaction.channelId!, guild, assignee, services);
 	if (!projectId) throw new Error("Select a project; no channel or assignee-team default is configured.");
 	await requireProjectAccess(interaction, projectId, services);
+	const creatorOpenProjectId = await services.db.openProjectUserId(interaction.user.id);
+	if (!creatorOpenProjectId) throw new Error("Your Discord account is not linked to an OpenProject user.");
+	if (!await services.openProject.isProjectMember(projectId, creatorOpenProjectId)) {
+		throw new Error("You are not a member of the selected OpenProject project.");
+	}
 	if (assigneeOpenProjectId && !await services.openProject.isProjectMember(projectId, assigneeOpenProjectId)) {
 		throw new Error("The assignee is not a member of the selected OpenProject project.");
 	}
@@ -416,9 +493,10 @@ async function createAndAnnounce(args: {
 	await services.db.logTaskEvent(workPackage.id, "created", interaction.user.id, { projectId, sourceLinks: args.sourceLinks })
 		.catch(error => console.error("Task creation audit log failed", { workPackageId: workPackage.id, error: (error as Error).message }));
 	const url = services.openProject.workPackageUrl(workPackage.id);
-	const ping = assignee ? `<@${assignee.id}> ` : "";
+	const ownerIds = [assignee?.id, accountable?.discordId].filter((id): id is string => Boolean(id));
+	const ping = ownerIds.map(id => `<@${id}>`).join(" ");
 	const due = args.dueDate ? ` · due ${args.dueDate}` : "";
-	const content = `${ping}OpenProject task created: **${workPackage.subject}** in **${project.name}**${due}\n${url}`;
+	const content = `${ping ? `${ping} ` : ""}OpenProject task created: **${workPackage.subject}** in **${project.name}**${due}\n${url}`;
 	await interaction.editReply({ content: `Created ${url}` })
 		.catch(error => console.error("Task creation response failed", { workPackageId: workPackage.id, error: (error as Error).message }));
 	let confirmationMessageId: string | undefined;
@@ -426,10 +504,12 @@ async function createAndAnnounce(args: {
 		try {
 			const confirmation = await interaction.channel.send({
 				content,
-				allowedMentions: assignee ? { users: [assignee.id] } : { parse: [] },
+				allowedMentions: ownerIds.length ? { users: ownerIds } : { parse: [] },
 			});
 			confirmationMessageId = confirmation.id;
 		} catch (error) {
+			await services.db.queueConfirmation(workPackage.id, interaction.channelId!, assignee?.id, (error as Error).message)
+				.catch(queueError => console.error("Task confirmation queue failed", { workPackageId: workPackage.id, error: (queueError as Error).message }));
 			await services.db.logTaskEvent(workPackage.id, "confirmation_failed", interaction.user.id, { error: (error as Error).message })
 				.catch(auditError => console.error("Task confirmation audit log failed", { workPackageId: workPackage.id, error: (auditError as Error).message }));
 			await interaction.editReply({ content: `Created ${url}, but the channel confirmation could not be posted. The task was not created twice.` })
@@ -519,6 +599,13 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 		await interaction.editReply("Creation reconciled; no second OpenProject task was created.");
 		return;
 	}
+	if (subcommand === "metrics") {
+		requireOrganizer(interaction, services);
+		const period = interaction.options.getInteger("period", true);
+		if (period !== 7 && period !== 30 && period !== 90) throw new Error("Select a valid metrics period.");
+		await interaction.editReply(formatProposalMetrics(await services.db.proposalMetrics(period)));
+		return;
+	}
 	if (subcommand === "link-user") {
 		requireOrganizer(interaction, services);
 		const discordUser = interaction.options.getUser("discord_user", true);
@@ -545,15 +632,34 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 		return;
 	}
 	await requireCreator(interaction, services);
+	if (subcommand === "extract") {
+		if (!services.extractor.enabled) throw new Error("No task extraction provider is configured.");
+		const limit = interaction.options.getInteger("message_count") ?? 20;
+		const context = await collectRecentContext(interaction, limit);
+		try {
+			await completeAiContext(interaction, services, context);
+		} catch (error) {
+			if (error instanceof SensitiveContentError) {
+				await services.db.recordExtraction({ source: "manual", outcome: "sensitive_block" }).catch(() => undefined);
+				await interaction.editReply("This channel matched the sensitive-content heuristic. Nothing was sent to Azure.");
+				return;
+			}
+			throw error;
+		}
+		return;
+	}
 	if (subcommand !== "create") {
 		const id = interaction.options.getInteger("id", true);
 		const existingTask = await services.openProject.workPackage(id);
 		await requireProjectAccess(interaction, projectIdFromWorkPackage(existingTask), services);
 		if (subcommand === "announce") {
-			const assignee = interaction.options.getUser("assignee");
+			const pending = await services.db.pendingConfirmation(id);
+			const assignee = interaction.options.getUser("assignee")
+				?? (pending?.assignee_discord_id ? await interaction.guild!.members.fetch(pending.assignee_discord_id).then(member => member.user).catch(() => null) : null);
 			const content = `${assignee ? `<@${assignee.id}> ` : ""}OpenProject task: **${existingTask.subject}**\n${services.openProject.workPackageUrl(id)}`;
 			if (!interaction.channel?.isSendable()) throw new Error("This channel cannot receive announcements.");
 			await interaction.channel.send({ content, allowedMentions: assignee ? { users: [assignee.id] } : { parse: [] } });
+			await services.db.clearConfirmation(id);
 			await services.db.logTaskEvent(id, "announcement_retried", interaction.user.id, { assigneeDiscordId: assignee?.id });
 			await interaction.editReply(`Announcement posted for ${services.openProject.workPackageUrl(id)}.`);
 			return;
@@ -703,6 +809,46 @@ export function followingUntilGap<T extends { createdTimestamp: number }>(anchor
 	return selected;
 }
 
+const artifactTerms = ["doc", "document", "spreadsheet", "sheet", "form", "slides", "deck", "file", "list", "tracker"];
+
+export function historicalContinuityScore(
+	targetText: string,
+	candidateText: string,
+	options: { ageMs: number; sameAuthor?: boolean; mentionsTargetAuthor?: boolean },
+) {
+	if (options.ageMs <= AI_CONTEXT_GAP_MS || options.ageMs > 30 * 24 * 60 * 60_000) return 0;
+	const target = targetText.toLocaleLowerCase();
+	const candidate = candidateText.toLocaleLowerCase();
+	const hasReference = /\b(?:same|that|this|the|previous|existing|last year(?:'s)?)\s+(?:doc(?:ument)?|spreadsheet|sheet|form|slides?|deck|file|list|tracker)\b/i.test(target);
+	if (!hasReference) return 0;
+	const sharedArtifact = artifactTerms.some(term => target.includes(term) && candidate.includes(term));
+	if (!sharedArtifact) return 0;
+	let score = 3;
+	if (options.sameAuthor || options.mentionsTargetAuthor) score += 2;
+	score += 2;
+	if (/https?:\/\//i.test(candidate)) score += 2;
+	const words = new Set(target.match(/[\p{L}\p{N}]{4,}/gu) ?? []);
+	const overlap = [...new Set(candidate.match(/[\p{L}\p{N}]{4,}/gu) ?? [])].filter(word => words.has(word)).length;
+	score += Math.min(overlap, 2);
+	return score;
+}
+
+export function continuationScore(
+	anchorText: string,
+	candidateText: string,
+	options: { gapMs: number; sameAuthor?: boolean; hasAttachment?: boolean },
+) {
+	if (options.gapMs <= AI_CONTEXT_GAP_MS || options.gapMs > 6 * 60 * 60_000) return 0;
+	const anchor = anchorText.toLocaleLowerCase();
+	const candidate = candidateText.toLocaleLowerCase();
+	const bridge = /\b(?:these|below|above|following|previous|everything below|same thread|see below|screenshot|fields to replace|keep|remove this)\b/i.test(candidate);
+	if (!bridge) return 0;
+	const words = new Set(anchor.match(/[\p{L}\p{N}]{4,}/gu) ?? []);
+	const overlap = [...new Set(candidate.match(/[\p{L}\p{N}]{4,}/gu) ?? [])].filter(word => words.has(word)).length;
+	if (!overlap && !options.hasAttachment) return 0;
+	return 3 + Math.min(overlap, 3) + (options.sameAuthor ? 2 : 0) + (options.hasAttachment ? 2 : 0);
+}
+
 export function appendRelevantUrls(description: string, messages: MinimizedMessage[], sourceIds: string[]) {
 	const urls = new Set<string>();
 	for (const message of messages) {
@@ -721,29 +867,80 @@ export function appendRelevantUrls(description: string, messages: MinimizedMessa
 	return result;
 }
 
+export function appendVerbatimSources(
+	description: string,
+	records: CollectedContext["sourceRecords"],
+	sourceIds: string[],
+) {
+	const links = [...new Set(sourceIds.flatMap(id => records.get(id)?.attachments.map(attachment => attachment.url) ?? []))];
+	if (!links.length) return sanitizeGeneratedDescription(description);
+	const addition = `Related links:\n${links.map(link => `- ${link}`).join("\n")}`;
+	return `${sanitizeGeneratedDescription(description)}\n\n${addition}`.slice(0, 4000);
+}
+
 type ContextRole = NonNullable<MinimizedMessage["contextRole"]>;
 
 async function collectContext(target: Message, interaction: MessageContextMenuCommandInteraction) {
 	const byId = new Map<string, { message: Message; role: ContextRole }>();
-	const rolePriority: Record<ContextRole, number> = { primary: 0, thread_root: 1, reply_target: 2, preceding: 3, subsequent: 3 };
+	const rolePriority: Record<ContextRole, number> = { primary: 0, thread_root: 1, reply_target: 2, referenced_history: 2, preceding: 3, subsequent: 3 };
 	const add = (message: Message, role: ContextRole) => {
 		const existing = byId.get(message.id);
 		if (!existing || rolePriority[role] < rolePriority[existing.role]) byId.set(message.id, { message, role });
 	};
-	const addPrecedingWindow = async (anchor: Message) => {
+	const addPrecedingWindow = async (anchor: Message, includeReferencedHistory = false, includeContinuation = false) => {
 		if (byId.size >= 40) return;
-		const older = await anchor.channel.messages.fetch({ before: anchor.id, limit: 50 }).catch(() => null);
+		const older = await anchor.channel.messages.fetch({ before: anchor.id, limit: includeReferencedHistory ? 100 : 50 }).catch(() => null);
 		if (!older) return;
 		for (const message of precedingUntilGap(anchor.createdTimestamp, [...older.values()], Math.min(20, 40 - byId.size))) {
 			add(message, "preceding");
 		}
+		if (includeContinuation) {
+			for (const candidate of [...older.values()]
+				.filter(message => !byId.has(message.id) && !message.author.bot && !message.system)
+				.map(message => ({ message, score: continuationScore(anchor.content, message.content, {
+					gapMs: anchor.createdTimestamp - message.createdTimestamp,
+					sameAuthor: message.author.id === anchor.author.id,
+					hasAttachment: message.attachments.size > 0,
+				}) }))
+				.filter(candidate => candidate.score >= 5)
+				.sort((left, right) => right.score - left.score || right.message.createdTimestamp - left.message.createdTimestamp)
+				.slice(0, 5)) add(candidate.message, "referenced_history");
+		}
+		if (includeReferencedHistory) {
+			const candidates = [...older.values()]
+				.filter(message => !byId.has(message.id) && !message.author.bot && !message.system)
+				.map(message => ({
+					message,
+					score: historicalContinuityScore(anchor.content, message.content, {
+						ageMs: anchor.createdTimestamp - message.createdTimestamp,
+						sameAuthor: message.author.id === anchor.author.id,
+						mentionsTargetAuthor: message.mentions.users.has(anchor.author.id),
+					}),
+				}))
+				.filter(candidate => candidate.score >= 7)
+				.sort((left, right) => right.score - left.score || right.message.createdTimestamp - left.message.createdTimestamp)
+				.slice(0, 3);
+			for (const candidate of candidates) add(candidate.message, "referenced_history");
+		}
 	};
-	const addFollowingWindow = async (anchor: Message) => {
+	const addFollowingWindow = async (anchor: Message, includeContinuation = false) => {
 		if (byId.size >= 40) return;
-		const newer = await anchor.channel.messages.fetch({ after: anchor.id, limit: 50 }).catch(() => null);
+		const newer = await anchor.channel.messages.fetch({ after: anchor.id, limit: includeContinuation ? 100 : 50 }).catch(() => null);
 		if (!newer) return;
 		for (const message of followingUntilGap(anchor.createdTimestamp, [...newer.values()], Math.min(20, 40 - byId.size))) {
 			add(message, "subsequent");
+		}
+		if (includeContinuation) {
+			for (const candidate of [...newer.values()]
+				.filter(message => !byId.has(message.id) && !message.author.bot && !message.system)
+				.map(message => ({ message, score: continuationScore(anchor.content, message.content, {
+					gapMs: message.createdTimestamp - anchor.createdTimestamp,
+					sameAuthor: message.author.id === anchor.author.id,
+					hasAttachment: message.attachments.size > 0,
+				}) }))
+				.filter(candidate => candidate.score >= 5)
+				.sort((left, right) => right.score - left.score || left.message.createdTimestamp - right.message.createdTimestamp)
+				.slice(0, 5)) add(candidate.message, "referenced_history");
 		}
 	};
 	const fetchReplyTarget = async (message: Message) => {
@@ -756,8 +953,8 @@ async function collectContext(target: Message, interaction: MessageContextMenuCo
 	};
 
 	add(target, "primary");
-	await addPrecedingWindow(target);
-	await addFollowingWindow(target);
+	await addPrecedingWindow(target, true, true);
+	await addFollowingWindow(target, true);
 	if (target.channel.isThread()) {
 		const starter = await target.channel.fetchStarterMessage().catch(() => null);
 		if (starter) {
@@ -835,6 +1032,17 @@ async function collectContext(target: Message, interaction: MessageContextMenuCo
 		}
 		return replaced;
 	};
+	const sourceRecords = new Map([...byId.values()].map(({ message }) => [message.id, {
+		author: message.member?.displayName ?? message.author.username,
+		timestamp: message.createdAt.toISOString(),
+		text: message.content,
+		attachments: [...message.attachments.values()].map(attachment => ({
+			id: attachment.id,
+			name: attachment.name ?? "attachment",
+			contentType: attachment.contentType ?? undefined,
+			url: attachment.url,
+		})),
+	}] as const));
 	const messages: MinimizedMessage[] = [...byId.values()]
 		.filter(({ message }) => !message.author.bot && !message.system && !message.content.startsWith("/"))
 		.sort((left, right) => left.message.createdTimestamp - right.message.createdTimestamp)
@@ -845,8 +1053,14 @@ async function collectContext(target: Message, interaction: MessageContextMenuCo
 				channelId: message.channelId,
 				authorAlias: aliasFor(message.author.id),
 				text: minimizeText(raw),
-				timestamp: message.createdAt.toISOString(),
+					timestamp: message.createdAt.toISOString(),
 				replyTo: message.reference?.messageId,
+				attachments: [...message.attachments.values()].map(attachment => ({
+					id: attachment.id,
+					name: attachment.name ?? "attachment",
+					contentType: attachment.contentType ?? undefined,
+					url: attachment.url,
+				})),
 				contextRole: role,
 				priority: role === "primary",
 				containedSensitiveData: containsSensitiveContent([{ id: message.id, authorAlias: "", text: raw, timestamp: "" }]),
@@ -857,11 +1071,60 @@ async function collectContext(target: Message, interaction: MessageContextMenuCo
 	const explicitIds = [...new Set([...mentionedIds, ...namedIds])];
 	return {
 		messages,
+		sourceRecords,
 		reverseAliases,
 		validIds: new Set(byId.keys()),
 		primaryId: target.id,
 		primaryAuthorId: target.author.id,
 		explicitAssigneeId: explicitIds.length === 1 ? explicitIds[0] : undefined,
+	};
+}
+
+async function collectRecentContext(interaction: ChatInputCommandInteraction, limit: number): Promise<CollectedContext> {
+	if (!interaction.channel || !("messages" in interaction.channel)) throw new Error("This channel does not support message extraction.");
+	const fetched = await interaction.channel.messages.fetch({ limit });
+	const source = [...fetched.values()]
+		.filter(message => !message.author.bot && !message.system && !message.content.startsWith("/"))
+		.sort((left, right) => left.createdTimestamp - right.createdTimestamp);
+	if (!source.length) throw new Error("No recent messages were available for extraction.");
+	const aliases = new Map<string, string>();
+	const reverseAliases = new Map<string, string>();
+	const aliasFor = (id: string) => {
+		let alias = aliases.get(id);
+		if (!alias) {
+			alias = `USER_${aliases.size + 1}`;
+			aliases.set(id, alias);
+			reverseAliases.set(alias, id);
+		}
+		return alias;
+	};
+	const sourceRecords = new Map(source.map(message => [message.id, {
+		author: message.member?.displayName ?? message.author.username,
+		timestamp: message.createdAt.toISOString(),
+		text: message.content,
+		attachments: [...message.attachments.values()].map(attachment => ({
+			id: attachment.id, name: attachment.name ?? "attachment", contentType: attachment.contentType ?? undefined, url: attachment.url,
+		})),
+	}]));
+	const messages = source.map((message, index) => {
+		const raw = message.content.replace(/<@!?(\d+)>/g, (_, id: string) => aliasFor(id));
+		return {
+			id: message.id, channelId: message.channelId, authorAlias: aliasFor(message.author.id), text: minimizeText(raw),
+			timestamp: message.createdAt.toISOString(), replyTo: message.reference?.messageId,
+			attachments: [...message.attachments.values()].map(attachment => ({
+				id: attachment.id, name: attachment.name ?? "attachment", contentType: attachment.contentType ?? undefined, url: attachment.url,
+			})),
+			contextRole: index === source.length - 1 ? "primary" as const : "preceding" as const,
+			priority: index === source.length - 1,
+			containedSensitiveData: containsSensitiveContent([{ id: message.id, authorAlias: "", text: raw, timestamp: "" }]),
+		};
+	});
+	const primary = source.at(-1)!;
+	const mentionedIds = [...primary.mentions.users.keys()].filter(id => id !== primary.author.id);
+	return {
+		messages, sourceRecords, reverseAliases, validIds: new Set(source.map(message => message.id)),
+		primaryId: primary.id, primaryAuthorId: primary.author.id,
+		explicitAssigneeId: mentionedIds.length === 1 ? mentionedIds[0] : undefined,
 	};
 }
 
@@ -874,7 +1137,15 @@ async function handleAiContext(interaction: MessageContextMenuCommandInteraction
 	try {
 		await completeAiContext(interaction, services, context);
 	} catch (error) {
-		if (!(error instanceof SensitiveContentError)) throw error;
+		if (!(error instanceof SensitiveContentError)) {
+			await services.db.recordExtraction({
+				source: "manual",
+				outcome: error instanceof StructuredOutputError ? "invalid_output" : "error",
+			}).catch(auditError => console.error("AI extraction metrics failed", { error: (auditError as Error).message }));
+			throw error;
+		}
+		await services.db.recordExtraction({ source: "manual", outcome: "sensitive_block" })
+			.catch(auditError => console.error("AI extraction metrics failed", { error: (auditError as Error).message }));
 		const id = randomUUID();
 		sensitiveOverrides.set(id, { userId: interaction.user.id, context, expiresAt: Date.now() + 10 * 60_000 });
 		setTimeout(() => sensitiveOverrides.delete(id), 10 * 60_000).unref();
@@ -888,7 +1159,7 @@ async function handleAiContext(interaction: MessageContextMenuCommandInteraction
 }
 
 async function completeAiContext(
-	interaction: MessageContextMenuCommandInteraction | ButtonInteraction,
+	interaction: MessageContextMenuCommandInteraction | ChatInputCommandInteraction | ButtonInteraction,
 	services: Services,
 	context: CollectedContext,
 	allowSensitiveContent = false,
@@ -901,13 +1172,24 @@ async function completeAiContext(
 		metadata: { priorities: priorities.map(priority => priority.name), sizes: tentativeSizes.map(size => size.value) },
 	});
 	const { result, deployment } = extraction;
+	const inputSnapshot = context.messages.map(({ id, authorAlias, text, timestamp, contextRole }) => ({ id, authorAlias, text, timestamp, contextRole }));
+	const decisionTelemetry = { taskCount: result.tasks.length, action: "create", primaryMessageId: context.primaryId };
 	const candidate = result.tasks.find(task =>
-		(task.classification === "explicit_commitment" || task.classification === "direct_assignment") &&
+		task.proposed_action === "create" &&
+		(task.completion_state === "incomplete" || task.completion_state === "unknown") &&
+		task.significance_score >= services.config.OPENPROJECT_AI_SIGNIFICANCE_THRESHOLD * 0.7 &&
+		["new_assignment", "clarification", "additional_requirements", "question", "unclear"].includes(task.context_relation) &&
 		task.source_message_ids.includes(context.primaryId) &&
-		task.source_message_ids.every(id => context.validIds.has(id)),
+		task.source_message_ids.every(id => context.validIds.has(id)) &&
+		task.relevant_attachment_ids.every(id => [...context.sourceRecords.values()].some(record => record.attachments.some(attachment => attachment.id === id))),
 	);
 	if (!candidate) {
-		await interaction.editReply("No explicit commitment or direct assignment was found in the selected message.");
+		await services.db.recordExtraction({
+			source: "manual", outcome: "no_task", modelDeployment: deployment,
+			 taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+			inputSnapshot, messageAssessments: result.message_assessments, decision: { ...decisionTelemetry, outcome: "no_task" },
+		});
+		await interaction.editReply("No significant incomplete work was found in the selected context.");
 		return;
 	}
 	const assigneeId = context.explicitAssigneeId ?? (candidate.assignee_alias ? context.reverseAliases.get(candidate.assignee_alias) : undefined);
@@ -927,10 +1209,49 @@ async function completeAiContext(
 	};
 	const startDate = inferredDate(candidate.start_date);
 	const dueDate = inferredDate(candidate.due_date) ?? defaultAiDueDate(new Date(), priority?.name, size?.value, services.config.BOT_TIME_ZONE);
-	const description = appendRelevantUrls(candidate.description, context.messages, candidate.source_message_ids);
+	const description = appendVerbatimSources(
+		appendRelevantUrls(candidate.description, context.messages, candidate.source_message_ids),
+		context.sourceRecords,
+		candidate.source_message_ids,
+	);
+	let similar = services.rag && await services.rag.findSimilar(projectId ?? 0, candidate.title, description);
+	if (projectId && services.config.OPENPROJECT_RAG_MODE === "review" && similar?.[0] && similar[0].similarity >= services.config.OPENPROJECT_RAG_SIMILARITY_THRESHOLD) {
+		const match = similar[0];
+		const proposal = await services.db.createProposal({
+			requesterId: interaction.user.id, channelId: interaction.channelId, projectId,
+			title: candidate.title, description, assigneeDiscordId: assigneeId, accountableDiscordId: accountableId,
+			priorityId: priority?.id, sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate, dueDate,
+			estimatedHours: candidate.estimated_hours ?? undefined, sourceMessageIds: candidate.source_message_ids,
+			sourceLinks: candidate.source_message_ids.map(id => messageUrl(interaction.guildId!, context.messages.find(message => message.id === id)?.channelId ?? interaction.channelId!, id)),
+			classification: candidate.classification, modelDeployment: deployment, evidence: candidate.evidence,
+			ambiguities: [...result.ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: extraction.latencyMs,
+			tokenUsage: extraction.usage, escalationReason: extraction.escalationReason,
+			retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS, action: "update",
+			targetWorkPackageId: match.workPackageId, targetLockVersion: match.lockVersion,
+			initialSnapshot: { title: candidate.title, description, action: "update", targetWorkPackageId: match.workPackageId },
+		});
+		if (proposal.reused) {
+			await interaction.editReply(`This discussion already has a pending task update proposal.`);
+			return;
+		}
+		await interaction.editReply({
+			content: `**Possible update to #${match.workPackageId}**\n${candidate.title}\n${description}\n\nSimilarity: ${Math.round(match.similarity * 100)}%`,
+			components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
+				new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and apply").setStyle(ButtonStyle.Primary),
+				new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
+				new ButtonBuilder().setCustomId(`op-more-fields:${proposal.id}`).setLabel("More fields").setStyle(ButtonStyle.Secondary),
+			)],
+		});
+		return;
+	}
 	if (projectId) {
 		const duplicate = await services.openProject.possibleDuplicate(projectId, candidate.title);
 		if (duplicate) {
+			await services.db.recordExtraction({
+				source: "manual", outcome: "duplicate", modelDeployment: deployment,
+				taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+				inputSnapshot, messageAssessments: result.message_assessments, decision: { ...decisionTelemetry, outcome: "duplicate" },
+			});
 			await interaction.editReply(`A similar open task already exists: ${services.openProject.workPackageUrl(duplicate.id)}`);
 			return;
 		}
@@ -951,13 +1272,25 @@ async function completeAiContext(
 						return messageUrl(interaction.guildId!, source?.channelId ?? interaction.channelId!, id);
 					}),
 					retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS,
+					initialSnapshot: { title: candidate.title, description, action: "create" },
 	});
 	if (proposal.reused) {
+		await services.db.recordExtraction({
+			source: "manual", outcome: "duplicate", modelDeployment: deployment,
+			taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+			inputSnapshot, messageAssessments: result.message_assessments, decision: { ...decisionTelemetry, outcome: "proposal" },
+		});
 		await interaction.editReply("This discussion already has a pending or created task proposal.");
 		return;
 	}
+	await services.db.recordExtraction({
+		source: "manual", outcome: "proposal", modelDeployment: deployment,
+		taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+	});
 	const review = new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and edit").setStyle(ButtonStyle.Primary);
 	const dismiss = new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary);
+	const duplicate = new ButtonBuilder().setCustomId(`op-duplicate:${proposal.id}`).setLabel("Already tracked").setStyle(ButtonStyle.Secondary);
+	const moreFields = new ButtonBuilder().setCustomId(`op-more-fields:${proposal.id}`).setLabel("More fields").setStyle(ButtonStyle.Secondary);
 	const details = [
 		`Project: ${project?.name ?? "Not resolved"}`,
 		`Assignee: ${assigneeId ? `<@${assigneeId}>` : "Not inferred"}`,
@@ -969,7 +1302,7 @@ async function completeAiContext(
 	].join("\n");
 	await interaction.editReply({
 		content: `**${candidate.title}**\n${description}${details ? `\n\n${details}` : ""}\n\nClassification: ${candidate.classification}${result.ambiguities.length ? `\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`,
-		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(review, dismiss)],
+		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(review, dismiss, duplicate, moreFields)],
 	});
 }
 
@@ -989,7 +1322,7 @@ async function handleSensitiveOverrideButton(interaction: ButtonInteraction, ser
 }
 
 async function handleProposalButton(interaction: ButtonInteraction, services: Services) {
-	if (!interaction.customId.startsWith("op-review:") && !interaction.customId.startsWith("op-dismiss:")) return;
+	if (!interaction.customId.startsWith("op-review:") && !interaction.customId.startsWith("op-dismiss:") && !interaction.customId.startsWith("op-duplicate:") && !interaction.customId.startsWith("op-more-fields:")) return;
 	const id = interaction.customId.split(":")[1];
 	const proposal = await services.db.proposal(id);
 	if (proposal?.status !== "pending_review" || new Date(proposal.expires_at).getTime() <= Date.now() || (!proposal.permitted_reviewer_ids.includes(interaction.user.id) && proposal.requester_discord_id !== interaction.user.id)) throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
@@ -997,7 +1330,28 @@ async function handleProposalButton(interaction: ButtonInteraction, services: Se
 		if (!await services.db.setProposalStatus(id, "dismissed", interaction.user.id)) {
 			throw new Error("This proposal was already handled by another reviewer.");
 		}
-		await interaction.update({ content: "Proposal dismissed.", components: [] });
+		await interaction.message.delete().catch(() => undefined);
+		await interaction.reply({ content: "Proposal dismissed.", ephemeral: true });
+		return;
+	}
+	if (interaction.customId.startsWith("op-duplicate:")) {
+		if (!await services.db.setProposalStatus(id, "duplicate", interaction.user.id)) {
+			throw new Error("This proposal was already handled by another reviewer.");
+		}
+		await interaction.update({ content: "Proposal marked as already tracked.", components: [] });
+		return;
+	}
+	if (interaction.customId.startsWith("op-more-fields:")) {
+		const modal = new ModalBuilder().setCustomId(`op-ai-fields:${id}`).setTitle("Edit task metadata");
+		const fields = [
+			new TextInputBuilder().setCustomId("accountable").setLabel("Accountable name or mention").setStyle(TextInputStyle.Short).setRequired(false).setValue(proposal.accountable_discord_id ? `<@${proposal.accountable_discord_id}>` : ""),
+			new TextInputBuilder().setCustomId("priority").setLabel("Priority ID (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(proposal.priority_id ? String(proposal.priority_id) : ""),
+			new TextInputBuilder().setCustomId("size").setLabel("Size option href (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(proposal.size_href ?? ""),
+			new TextInputBuilder().setCustomId("start_date").setLabel("Start date YYYY-MM-DD").setStyle(TextInputStyle.Short).setRequired(false).setValue(databaseDate(proposal.start_date) ?? ""),
+			new TextInputBuilder().setCustomId("estimate").setLabel("Estimated hours").setStyle(TextInputStyle.Short).setRequired(false).setValue(proposal.estimated_hours == null ? "" : String(proposal.estimated_hours)),
+		];
+		modal.addComponents(...fields.map(field => new ActionRowBuilder<TextInputBuilder>().addComponents(field)));
+		await interaction.showModal(modal);
 		return;
 	}
 	const project = proposal.project_id ? (await services.openProject.projects()).find(item => item.id === proposal.project_id) : undefined;
@@ -1018,6 +1372,9 @@ async function handleProposalButton(interaction: ButtonInteraction, services: Se
 		new TextInputBuilder().setCustomId("due_date").setLabel("Due date YYYY-MM-DD").setStyle(TextInputStyle.Short).setRequired(true).setValue(dueDate),
 	];
 	modal.addComponents(...fields.map(field => new ActionRowBuilder<TextInputBuilder>().addComponents(field)));
+	if (!await services.db.startProposalReview(id, interaction.user.id)) {
+		throw new Error("This proposal was already handled by another reviewer.");
+	}
 	await interaction.showModal(modal);
 }
 
@@ -1074,9 +1431,27 @@ async function handleFinalCreationButton(interaction: ButtonInteraction, service
 }
 
 async function handleModal(interaction: ModalSubmitInteraction, services: Services) {
-	if (!interaction.customId.startsWith("op-task:") && !interaction.customId.startsWith("op-task2:") && !interaction.customId.startsWith("op-ai:") && !interaction.customId.startsWith("op-edit-create:")) return;
+	if (!interaction.customId.startsWith("op-task:") && !interaction.customId.startsWith("op-task2:") && !interaction.customId.startsWith("op-ai:") && !interaction.customId.startsWith("op-ai-fields:") && !interaction.customId.startsWith("op-edit-create:")) return;
 	await interaction.deferReply({ ephemeral: true });
 	const entityId = interaction.customId.split(":")[1];
+	if (interaction.customId.startsWith("op-ai-fields:")) {
+		const proposal = await services.db.proposal(entityId);
+		if (!proposal || proposal.status !== "pending_review" || new Date(proposal.expires_at).getTime() <= Date.now() || (!proposal.permitted_reviewer_ids.includes(interaction.user.id) && proposal.requester_discord_id !== interaction.user.id)) throw new Error("You are not permitted to edit this proposal.");
+		const accountableText = interaction.fields.getTextInputValue("accountable");
+		const accountableId = accountableText ? await resolveAssigneeInput(accountableText, interaction.guild!) : null;
+		const priorityText = interaction.fields.getTextInputValue("priority").trim();
+		const priorityId = priorityText ? Number(priorityText) : null;
+		if (priorityText && !Number.isInteger(priorityId)) throw new Error("Priority ID must be an integer.");
+		const sizeText = interaction.fields.getTextInputValue("size").trim();
+		if (sizeText && !/^\/api\/v3\/custom_options\/\d+$/.test(sizeText)) throw new Error("Size must use an OpenProject custom option href.");
+		const startDate = validIsoDate(interaction.fields.getTextInputValue("start_date") || undefined) ?? null;
+		const estimateText = interaction.fields.getTextInputValue("estimate").trim();
+		const estimatedHours = estimateText ? Number(estimateText) : null;
+		if (estimateText && (estimatedHours === null || !Number.isFinite(estimatedHours) || estimatedHours < 0)) throw new Error("Estimated hours must be a non-negative number.");
+		await services.db.updateProposalMetadata(entityId, interaction.user.id, { accountableId, priorityId, sizeHref: sizeText || null, startDate, estimatedHours });
+		await interaction.editReply("Additional proposal fields saved. Review and confirm the proposal when ready.");
+		return;
+	}
 	if (interaction.customId.startsWith("op-edit-create:")) {
 		const current = await creationDraft(entityId, interaction.user.id, services);
 		await services.db.failDraft(entityId, "edited");
@@ -1096,6 +1471,9 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 	const proposal = interaction.customId.startsWith("op-ai:") ? await services.db.proposal(entityId) : null;
 	if (proposal && (proposal.status !== "pending_review" || new Date(proposal.expires_at).getTime() <= Date.now() || (!proposal.permitted_reviewer_ids.includes(interaction.user.id) && proposal.requester_discord_id !== interaction.user.id))) throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
 	if (proposal) {
+		const project = proposal.project_id ? (await services.openProject.projects()).find(item => item.id === proposal.project_id) : undefined;
+		const reviewedAssigneeId = await resolveAssigneeInput(interaction.fields.getTextInputValue("assignee"), interaction.guild!);
+		const reviewedDueDate = validIsoDate(interaction.fields.getTextInputValue("due_date"));
 		const args = {
 			interaction,
 			services,
@@ -1103,20 +1481,68 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 			title: interaction.fields.getTextInputValue("title"),
 			description: interaction.fields.getTextInputValue("description"),
 			projectText: interaction.fields.getTextInputValue("project"),
-			assigneeId: await resolveAssigneeInput(interaction.fields.getTextInputValue("assignee"), interaction.guild!),
+			assigneeId: reviewedAssigneeId,
 			accountableId: proposal.accountable_discord_id ?? undefined,
 			priorityId: proposal.priority_id ?? undefined,
 			sizeHref: proposal.size_href ?? undefined,
 			startDate: databaseDate(proposal.start_date) ?? undefined,
-			dueDate: validIsoDate(interaction.fields.getTextInputValue("due_date")),
+			dueDate: reviewedDueDate,
 			estimatedHours: proposal.estimated_hours == null ? undefined : Number(proposal.estimated_hours),
 			sourceLinks: proposal.source_links,
 		};
 		if (!await services.db.claimProposal(proposal.id, interaction.user.id)) throw new Error("This proposal is already being handled.");
 		try {
+			if (proposal.action === "update" && proposal.target_work_package_id) {
+				const assigneeOpenProjectId = args.assigneeId ? await services.db.openProjectUserId(args.assigneeId) : undefined;
+				const accountableOpenProjectId = args.accountableId ? await services.db.openProjectUserId(args.accountableId) : undefined;
+				if (args.assigneeId && !assigneeOpenProjectId) throw new Error("The assignee is not mapped to OpenProject.");
+				if (args.accountableId && !accountableOpenProjectId) throw new Error("The accountable user is not mapped to OpenProject.");
+				const updated = await services.openProject.updateWorkPackage(proposal.target_work_package_id, {
+					subject: args.title,
+					description: { format: "markdown", raw: args.description },
+					_links: {
+						...(assigneeOpenProjectId ? { assignee: { href: `/api/v3/users/${assigneeOpenProjectId}` } } : {}),
+						...(accountableOpenProjectId ? { responsible: { href: `/api/v3/users/${accountableOpenProjectId}` } } : {}),
+						...(args.priorityId ? { priority: { href: `/api/v3/priorities/${args.priorityId}` } } : {}),
+					},
+					...(args.startDate !== undefined ? { startDate: args.startDate } : {}),
+					...(args.dueDate !== undefined ? { dueDate: args.dueDate } : {}),
+					...(args.estimatedHours !== undefined ? { estimatedTime: `PT${args.estimatedHours}H` } : {}),
+					...(args.sizeHref ? { [services.config.OPENPROJECT_SIZE_CUSTOM_FIELD]: { href: args.sizeHref } } : {}),
+				}, proposal.target_lock_version ?? undefined);
+				await services.db.markProposalUpdated(proposal.id, interaction.user.id, updated.id, proposalCorrections({
+					original: { title: proposal.title, description: proposal.description, assigneeId: proposal.assignee_discord_id, accountableId: proposal.accountable_discord_id, priorityId: proposal.priority_id, sizeHref: proposal.size_href, startDate: proposal.start_date, dueDate: proposal.due_date, estimatedHours: proposal.estimated_hours },
+					reviewed: { title: args.title, description: args.description, assigneeId: args.assigneeId, accountableId: args.accountableId, priorityId: args.priorityId, sizeHref: args.sizeHref, startDate: args.startDate, dueDate: args.dueDate, estimatedHours: args.estimatedHours },
+				}));
+				await services.db.recordFinalProposalRevision(proposal.id, { title: args.title, description: args.description, action: "update", targetWorkPackageId: updated.id });
+				await interaction.editReply(`Updated ${services.openProject.workPackageUrl(updated.id)}.`);
+				return;
+			}
 			const created = await createAndAnnounce(args);
 			try {
-				await services.db.markProposalCreated(proposal.id, interaction.user.id, created.workPackage.id, created.confirmationMessageId);
+				await services.db.markProposalCreated(
+					proposal.id,
+					interaction.user.id,
+					created.workPackage.id,
+					created.confirmationMessageId,
+					proposalCorrections({
+						original: {
+							title: proposal.title, description: proposal.description, projectName: project?.name,
+							assigneeId: proposal.assignee_discord_id, accountableId: proposal.accountable_discord_id,
+							priorityId: proposal.priority_id, sizeHref: proposal.size_href,
+							startDate: proposal.start_date, dueDate: proposal.due_date,
+							estimatedHours: proposal.estimated_hours,
+						},
+						reviewed: {
+							title: args.title, description: args.description,
+							projectName: args.projectText ?? undefined, assigneeId: args.assigneeId,
+							accountableId: args.accountableId, priorityId: args.priorityId,
+							sizeHref: args.sizeHref, startDate: args.startDate,
+							dueDate: args.dueDate, estimatedHours: args.estimatedHours,
+						},
+					}),
+				);
+				await services.db.recordFinalProposalRevision(proposal.id, { title: args.title, description: args.description, action: "create", workPackageId: created.workPackage.id });
 			} catch (error) {
 				throw new OpenProjectRequestError(`OpenProject task ${created.workPackage.id} was created, but its proposal could not be finalized: ${(error as Error).message}`, true);
 			}

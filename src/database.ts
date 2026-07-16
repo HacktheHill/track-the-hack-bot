@@ -4,6 +4,10 @@ import { randomUUID } from "node:crypto";
 
 const { Pool } = pg;
 
+function jsonParameter(value: unknown) {
+	return value == null ? null : JSON.stringify(value);
+}
+
 export const correctionFields = [
 	"title", "description", "project", "assignee", "accountable",
 	"priority", "size", "startDate", "dueDate", "estimate",
@@ -221,6 +225,7 @@ export class Database {
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS target_work_package_id INTEGER");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS target_lock_version INTEGER");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS revision INTEGER NOT NULL DEFAULT 1");
+		await this.pool.query("ALTER TABLE task_proposals DROP CONSTRAINT IF EXISTS task_proposals_openproject_work_package_id_key");
 		await this.pool.query("ALTER TABLE ai_extraction_events ADD COLUMN IF NOT EXISTS trigger_id TEXT");
 		await this.pool.query("ALTER TABLE ai_extraction_events ADD COLUMN IF NOT EXISTS input_snapshot JSONB");
 		await this.pool.query("ALTER TABLE ai_extraction_events ADD COLUMN IF NOT EXISTS message_assessments JSONB");
@@ -384,6 +389,13 @@ export class Database {
 		return result.rows[0]?.openproject_project_id;
 	}
 
+	async categoryProjectIds() {
+		const result = await this.pool.query<{ openproject_project_id: number }>(
+			"SELECT DISTINCT openproject_project_id FROM discord_category_projects",
+		);
+		return result.rows.map(row => row.openproject_project_id);
+	}
+
 	async setCategoryProject(categoryId: string, projectId: number, actorId: string) {
 		await this.pool.query(
 			`INSERT INTO discord_category_projects(category_id,openproject_project_id,updated_by_discord_id)
@@ -494,7 +506,7 @@ export class Database {
 		initialSnapshot?: Record<string, unknown>;
 	}) {
 		const id = randomUUID();
-		const fingerprint = [...input.sourceMessageIds].sort().join(":") + `:${input.title.toLowerCase()}`;
+		const fingerprint = [...input.sourceMessageIds].sort().join(":") + `:${input.action ?? "create"}:${input.targetWorkPackageId ?? "new"}:${input.title.toLowerCase()}`;
 		const result = await this.pool.query<{ id: string }>(
 			`INSERT INTO task_proposals
 			(id, requester_discord_id, channel_id, project_id, title, description,
@@ -568,6 +580,14 @@ export class Database {
 		return result.rowCount === 1;
 	}
 
+	async markProposalDeliveryFailed(id: string, error: string) {
+		await this.pool.query(
+			`UPDATE task_proposals SET status='failed', review_outcome='delivery_failed', error=$2,
+			 reviewed_at=now(), updated_at=now() WHERE id=$1 AND status='pending_review'`,
+			[id, error.slice(0, 1000)],
+		);
+	}
+
 	async startProposalReview(id: string, reviewerId: string) {
 		const result = await this.pool.query(
 			`UPDATE task_proposals SET review_started_at=COALESCE(review_started_at, now()),
@@ -582,14 +602,28 @@ export class Database {
 		accountableId?: string | null; priorityId?: number | null; sizeHref?: string | null;
 		startDate?: string | null; estimatedHours?: number | null;
 	}) {
-		const result = await this.pool.query<{ revision: number }>(
+		const result = await this.pool.query<{
+			revision: number; title: string; description: string; project_id: number | null;
+			assignee_discord_id: string | null; accountable_discord_id: string | null;
+			priority_id: number | null; size_href: string | null; start_date: string | null;
+			due_date: string | null; estimated_hours: number | null; action: string;
+			target_work_package_id: number | null; source_message_ids: string[]; source_links: string[];
+		}>(
 			`UPDATE task_proposals SET accountable_discord_id=$2, priority_id=$3, size_href=$4, start_date=$5,
 			 estimated_hours=$6, revision=revision + 1, reviewer_discord_id=$7, updated_at=now()
-			 WHERE id=$1 AND status='pending_review' AND expires_at > now() RETURNING revision`,
+			 WHERE id=$1 AND status='pending_review' AND expires_at > now() RETURNING *`,
 			[id, fields.accountableId ?? null, fields.priorityId ?? null, fields.sizeHref ?? null, fields.startDate ?? null, fields.estimatedHours ?? null, reviewerId],
 		);
 		if (result.rowCount !== 1) throw new Error("This proposal is no longer editable.");
-		await this.recordProposalRevision(id, result.rows[0].revision, "edit", fields);
+		const row = result.rows[0];
+		await this.recordProposalRevision(id, row.revision, "edit", {
+			title: row.title, description: row.description, projectId: row.project_id,
+			assigneeId: row.assignee_discord_id, accountableId: row.accountable_discord_id,
+			priorityId: row.priority_id, sizeHref: row.size_href, startDate: row.start_date,
+			dueDate: row.due_date, estimatedHours: row.estimated_hours, action: row.action,
+			targetWorkPackageId: row.target_work_package_id, sourceMessageIds: row.source_message_ids,
+			sourceLinks: row.source_links,
+		});
 	}
 
 	async claimProposal(id: string, reviewerId: string) {
@@ -625,17 +659,17 @@ export class Database {
 		);
 	}
 
-	async markProposalUpdated(id: string, reviewerId: string, workPackageId: number, corrections?: CorrectionFlags) {
+	async markProposalUpdated(id: string, reviewerId: string, workPackageId: number, corrections?: CorrectionFlags, action = "update") {
 		await this.pool.query(
 			`UPDATE task_proposals SET status='created', reviewer_discord_id=$2, openproject_work_package_id=$3,
-			 review_outcome='updated', reviewed_at=now(), correction_flags=$4,
+			 review_outcome=$5, reviewed_at=now(), correction_flags=$4,
 			 review_duration_ms=GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(review_started_at, created_at))) * 1000)::integer,
 			 updated_at=now() WHERE id=$1 AND status='creating'`,
-			[id, reviewerId, workPackageId, corrections ?? {}],
+			[id, reviewerId, workPackageId, corrections ?? {}, action],
 		);
 		await this.pool.query(
-			"INSERT INTO task_audit_log(proposal_id,event,actor_discord_id,metadata) VALUES($1,'updated',$2,$3)",
-			[id, reviewerId, { workPackageId }],
+			"INSERT INTO task_audit_log(proposal_id,event,actor_discord_id,metadata) VALUES($1,$2,$3,$4)",
+			[id, action, reviewerId, { workPackageId }],
 		);
 	}
 
@@ -706,8 +740,8 @@ export class Database {
 			`INSERT INTO ai_extraction_events(source,outcome,model_deployment,task_count,latency_ms,token_usage,trigger_id,input_snapshot,message_assessments,decision)
 			 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 			[input.source, input.outcome, input.modelDeployment ?? null, input.taskCount ?? 0,
-				input.latencyMs ?? null, input.tokenUsage ?? null, input.triggerId ?? null, input.inputSnapshot ?? null,
-				input.messageAssessments ?? null, input.decision ?? null],
+				input.latencyMs ?? null, jsonParameter(input.tokenUsage), input.triggerId ?? null, jsonParameter(input.inputSnapshot),
+				jsonParameter(input.messageAssessments), jsonParameter(input.decision)],
 		);
 	}
 
@@ -715,7 +749,7 @@ export class Database {
 		await this.pool.query(
 			`INSERT INTO task_proposal_revisions(proposal_id,revision,phase,payload) VALUES($1,$2,$3,$4)
 			 ON CONFLICT(proposal_id,revision) DO UPDATE SET phase=excluded.phase,payload=excluded.payload,created_at=now()`,
-			[proposalId, revision, phase, payload],
+			[proposalId, revision, phase, jsonParameter(payload)],
 		);
 	}
 
@@ -774,6 +808,23 @@ export class Database {
 		return result.rows;
 	}
 
+	async embeddingTitles(projectId: number): Promise<Omit<SimilarWorkPackage, "similarity">[]> {
+		const result = await this.pool.query<Omit<SimilarWorkPackage, "similarity">>(
+			`SELECT work_package_id AS "workPackageId", project_id AS "projectId", lock_version AS "lockVersion", subject, description
+			 FROM openproject_embeddings WHERE project_id=$1`,
+			[projectId],
+		);
+		return result.rows;
+	}
+
+	async recordEmbeddingSync(error?: string) {
+		await this.pool.query(
+			`INSERT INTO openproject_embedding_sync(id,last_run_at,last_error,updated_at) VALUES(TRUE,now(),$1,now())
+			 ON CONFLICT(id) DO UPDATE SET last_run_at=excluded.last_run_at,last_error=excluded.last_error,updated_at=now()`,
+			[error?.slice(0, 1000) ?? null],
+		);
+	}
+
 	async proposalMetrics(days: 7 | 30 | 90): Promise<ProposalMetrics> {
 		const proposal = await this.pool.query<{
 			proposals: string; approved: string; dismissed: string; duplicates: string;
@@ -782,7 +833,7 @@ export class Database {
 			correction_flags: Record<string, number> | null;
 		}>(
 			`SELECT COUNT(*)::text AS proposals,
-			 COUNT(*) FILTER (WHERE review_outcome='approved')::text AS approved,
+			 COUNT(*) FILTER (WHERE review_outcome IN ('approved','update','complete','reopen'))::text AS approved,
 			 COUNT(*) FILTER (WHERE review_outcome='dismissed')::text AS dismissed,
 			 COUNT(*) FILTER (WHERE review_outcome='duplicate')::text AS duplicates,
 			 COUNT(*) FILTER (WHERE review_outcome IN ('failed','needs_reconciliation'))::text AS failures,
@@ -831,11 +882,11 @@ export class Database {
 		await this.pool.query(
 			`DELETE FROM task_proposals WHERE openproject_work_package_id IS NULL
 			 AND status <> 'needs_reconciliation'
-			 AND (expires_at < now() OR (
+			 AND ((status='pending_review' AND expires_at < now()) OR (
 				 status IN ('dismissed','duplicate','failed')
 				 AND updated_at < now() - ($1::text || ' days')::interval
 			 ))`,
-			[config.OPENPROJECT_PROPOSAL_RETENTION_DAYS],
+			[config.OPENPROJECT_AI_EVALUATION_RETENTION_DAYS],
 		);
 		await this.pool.query(
 			`DELETE FROM task_drafts WHERE status IN ('created','failed')

@@ -9,6 +9,9 @@ import { OpenProjectClient } from "./openproject.js";
 import { registerTaskInteractions } from "./tasks.js";
 import { AzureTaskExtractor } from "./azure-openai.js";
 import { registerAutomaticTaskDetection } from "./automatic-tasks.js";
+import { reconcileOpenProjectUsers } from "./identity.js";
+import { AzureEmbeddingClient } from "./embeddings.js";
+import { OpenProjectRag } from "./rag.js";
 import { registerMessageScheduler } from "./scheduler.js";
 
 config();
@@ -63,16 +66,31 @@ client.once("clientReady", async () => {
 	if (integrationConfig) {
 		const db = new Database(integrationConfig.DATABASE_URL);
 		integrationDb = db;
-		await db.migrate(integrationConfig);
+		if (integrationConfig.OPENPROJECT_RUN_MIGRATIONS) await db.migrate(integrationConfig);
 		await db.cleanup(integrationConfig);
+		const openProject = new OpenProjectClient(integrationConfig);
+		const rag = integrationConfig.OPENPROJECT_RAG_MODE !== "off" && integrationConfig.AZURE_OPENAI_EMBEDDING_DEPLOYMENT
+			? new OpenProjectRag(integrationConfig, db, openProject, new AzureEmbeddingClient(integrationConfig))
+			: undefined;
 		const services = {
 			config: integrationConfig,
 			db,
-			openProject: new OpenProjectClient(integrationConfig),
+			openProject,
 			extractor: new AzureTaskExtractor(integrationConfig),
+			rag,
 		};
 		registerTaskInteractions(client, services);
 		registerAutomaticTaskDetection(client, services);
+		const organizerGuild = await client.guilds.fetch(integrationConfig.ORGANIZER_GUILD_ID);
+		const reconcileIdentities = () => void reconcileOpenProjectUsers(organizerGuild, integrationConfig, db, services.openProject)
+			.then(result => console.log("OpenProject identity reconciliation complete", result))
+			.catch(error => console.error("OpenProject identity reconciliation failed", { error: (error as Error).message }));
+		reconcileIdentities();
+		setInterval(reconcileIdentities, 24 * 60 * 60 * 1000).unref();
+		if (rag?.enabled) {
+			void rag.sync().catch(error => console.error("Initial OpenProject embedding sync failed", { error: (error as Error).message }));
+			setInterval(() => void rag.sync().catch(error => console.error("OpenProject embedding sync failed", { error: (error as Error).message })), integrationConfig.OPENPROJECT_RAG_SYNC_INTERVAL_SECONDS * 1000).unref();
+		}
 		integrationReady = true;
 		setInterval(() => void db.cleanup(integrationConfig).catch(error => console.error("Proposal cleanup failed", error)), 24 * 60 * 60 * 1000).unref();
 		console.log("OpenProject task integration enabled");
