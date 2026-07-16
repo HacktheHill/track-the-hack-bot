@@ -1,0 +1,117 @@
+name: Build and deploy bot image
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bot-container-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  validate-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24.x
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: false
+          tags: track-the-hack-bot:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: validate-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: Production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: azure/login@1384c340ab2dda50fed2bee3041d1d87018aa5e8 # v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Log in to Azure Container Registry
+        env:
+          ACR_LOGIN_SERVER: ${{ vars.AZURE_ACR_LOGIN_SERVER }}
+        run: az acr login --name "${ACR_LOGIN_SERVER%%.*}"
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: true
+          tags: ${{ vars.AZURE_ACR_LOGIN_SERVER }}/track-the-hack-bot:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: azure/cli@d4515bc8e518874d3c814bf5c307a1cb08ec9b35 # v2
+        if: github.ref == 'refs/heads/main'
+        with:
+          inlineScript: |
+            set -euo pipefail
+            az containerapp update \
+              --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+              --name track-the-hack-bot \
+              --image "${{ vars.AZURE_ACR_LOGIN_SERVER }}/track-the-hack-bot:${{ github.sha }}"
+            for job in track-the-hack-bot-migrate track-the-hack-bot-embeddings; do
+              if az containerapp job show --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" --name "$job" >/dev/null 2>&1; then
+                az containerapp job update \
+                  --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+                  --name "$job" \
+                  --image "${{ vars.AZURE_ACR_LOGIN_SERVER }}/track-the-hack-bot:${{ github.sha }}"
+              fi
+            done
+            for attempt in $(seq 1 20); do
+              revision="$(az containerapp show \
+                --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+                --name track-the-hack-bot \
+                --query properties.latestRevisionName --output tsv)"
+              health="$(az containerapp revision show \
+                --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+                --name track-the-hack-bot --revision "$revision" \
+                --query properties.healthState --output tsv)"
+              image="$(az containerapp revision show \
+                --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+                --name track-the-hack-bot --revision "$revision" \
+                --query properties.template.containers[0].image --output tsv)"
+              if [ "$health" = Healthy ] && [ "$image" = "${{ vars.AZURE_ACR_LOGIN_SERVER }}/track-the-hack-bot:${{ github.sha }}" ]; then break; fi
+              echo "Revision $revision is $health; waiting for health (attempt $attempt/20)."
+              if [ "$attempt" -eq 20 ]; then
+                echo "Expected image ${{ github.sha }}, got $image." >&2
+                exit 1
+              fi
+              sleep 15
+            done
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24.x
+          cache: npm
+      - name: Register Discord application commands
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          COMMUNITY_GUILD_ID: ${{ vars.COMMUNITY_GUILD_ID }}
+          ORGANIZER_GUILD_ID: ${{ vars.ORGANIZER_GUILD_ID }}
+        run: |
+          npm ci --ignore-scripts
+          npm run register
