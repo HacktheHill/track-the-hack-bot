@@ -3,7 +3,7 @@ import { containsSensitiveContent, minimizeText, StructuredOutputError, type Min
 import { isOrganizerGuild, type IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient } from "./openproject.js";
-import { appendVerbatimSources, defaultAiDueDate } from "./tasks.js";
+import { appendSourceLinks, defaultAiDueDate } from "./tasks.js";
 import type { OpenProjectRag } from "./rag.js";
 
 type AutomaticServices = { config: IntegrationConfig; db: Database; extractor: TaskExtractor; openProject: OpenProjectClient; rag?: OpenProjectRag };
@@ -96,7 +96,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				const assigneeId = task.assignee_alias ? reverse.get(task.assignee_alias) : undefined;
 				const accountableId = source.find(message => task.source_message_ids.includes(message.id))?.author.id;
 				const projectId = source[0] ? await categoryProject(source[0], services) : undefined;
-				const description = appendVerbatimSources(task.description, sourceRecords, task.source_message_ids);
+				const description = appendSourceLinks(task.description, sourceRecords, task.source_message_ids);
 				const similar = projectId && services.rag ? await services.rag.findSimilar(projectId, task.title, description) : [];
 				const match = similar[0];
 				if (match && match.similarity >= services.config.OPENPROJECT_RAG_SIMILARITY_THRESHOLD) {

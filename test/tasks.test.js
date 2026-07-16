@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendVerbatimSources, calendarDate, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, isExcludedChannel, precedingUntilGap, proposalCorrections, taskCommand, validIsoDate } from "../dist/tasks.js";
+import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, calendarDate, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, isExcludedChannel, precedingUntilGap, proposalCorrections, taskCommand, validIsoDate } from "../dist/tasks.js";
 import { normalizeTaskTitle, OpenProjectClient, titlesLikelyDuplicate } from "../dist/openproject.js";
 
 test("task defaults start today and use the configured due offset", () => {
@@ -117,7 +117,7 @@ test("AI task descriptions retain URLs from cited messages", () => {
 });
 
 test("AI task descriptions retain attachment links without verbatim source text", () => {
-	const description = appendVerbatimSources("Summary", new Map([
+	const description = appendSourceLinks("Summary", new Map([
 		["m1", {
 			author: "Daniel", timestamp: "2026-07-06T22:00:00Z", text: "These are the fields to replace.",
 			attachments: [{ id: "a1", name: "schema.png", contentType: "image/png", url: "https://cdn.discordapp.com/attachments/1/2/schema.png" }],

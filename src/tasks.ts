@@ -865,7 +865,7 @@ export function appendRelevantUrls(description: string, messages: MinimizedMessa
 	return result;
 }
 
-export function appendVerbatimSources(
+export function appendSourceLinks(
 	description: string,
 	records: CollectedContext["sourceRecords"],
 	sourceIds: string[],
@@ -1207,7 +1207,7 @@ async function completeAiContext(
 	};
 	const startDate = inferredDate(candidate.start_date);
 	const dueDate = inferredDate(candidate.due_date) ?? defaultAiDueDate(new Date(), priority?.name, size?.value, services.config.BOT_TIME_ZONE);
-	const description = appendVerbatimSources(
+	const description = appendSourceLinks(
 		appendRelevantUrls(candidate.description, context.messages, candidate.source_message_ids),
 		context.sourceRecords,
 		candidate.source_message_ids,
