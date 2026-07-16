@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AzureTaskExtractor, containsSensitiveContent, minimizeText, SensitiveContentError } from "../dist/azure-openai.js";
+import { AzureTaskExtractor, containsSensitiveContent, minimizeText, normalizeExtractedDate, SensitiveContentError } from "../dist/azure-openai.js";
 
 test("minimizeText removes common credentials and personal contact data", () => {
 	const value = minimizeText(
@@ -20,6 +20,12 @@ test("minimizeText preserves ordinary task discussion", () => {
 	);
 });
 
+test("extracted dates are normalized or discarded before review", () => {
+	assert.equal(normalizeExtractedDate("2026-07-28T12:30:00Z"), "2026-07-28");
+	assert.equal(normalizeExtractedDate("2026-02-30"), null);
+	assert.equal(normalizeExtractedDate("07/28/2026"), null);
+});
+
 const config = {
 	AZURE_OPENAI_MAX_COMPLETION_TOKENS: 1024,
 	OPENPROJECT_AI_MAX_CONTEXT_CHARS: 16000,
@@ -37,13 +43,24 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 	};
 	try {
 		const extractor = new AzureTaskExtractor(config, async () => "managed-identity-token");
-		await extractor.extract([{ id: "m1", authorAlias: "USER_1", text: "Ship it", timestamp: "2026-07-13T00:00:00Z" }]);
+		await extractor.extract(
+			[{ id: "m1", authorAlias: "USER_1", text: "Ship it", timestamp: "2026-07-13T00:00:00Z", contextRole: "primary" }],
+			{ metadata: { priorities: ["High"], sizes: ["Small"] } },
+		);
 		assert.equal(request.url, "https://azure.example/openai/v1/chat/completions");
 		assert.equal(request.body.model, "task-extractor");
 		assert.equal(request.body.max_completion_tokens, 1024);
 		assert.equal("max_tokens" in request.body, false);
 		assert.equal("temperature" in request.body, false);
 		assert.equal(request.headers.Authorization, "Bearer managed-identity-token");
+		assert.match(request.body.messages[0].content, /sole extraction focus/);
+		assert.match(request.body.messages[0].content, /timestamps/);
+		assert.match(request.body.messages[0].content, /priority_name must exactly match one of: High/);
+		assert.match(request.body.messages[0].content, /size_name must exactly match one of: Small/);
+		assert.deepEqual(JSON.parse(request.body.messages[1].content)[0], {
+			id: "m1", authorAlias: "USER_1", text: "Ship it",
+			timestamp: "2026-07-13T00:00:00Z", contextRole: "primary",
+		});
 	} finally {
 		globalThis.fetch = originalFetch;
 	}

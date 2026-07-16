@@ -2,7 +2,7 @@ import { REST } from "@discordjs/rest";
 import { Routes } from "discord-api-types/v9";
 import { SlashCommandBuilder } from "@discordjs/builders";
 import { config } from "dotenv";
-import { taskCommand, taskMessageCommand } from "./tasks.js";
+import { aiTaskMessageCommand, taskCommand, taskMessageCommand } from "./tasks.js";
 
 config();
 
@@ -37,6 +37,7 @@ const organizerCommands = [
 		.toJSON(),
 	taskCommand.toJSON(),
 	taskMessageCommand.toJSON(),
+	aiTaskMessageCommand.toJSON(),
 ];
 
 const sharedCommands = [

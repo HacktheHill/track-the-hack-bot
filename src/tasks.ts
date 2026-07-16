@@ -25,10 +25,10 @@ import {
 	UserSelectMenuInteraction,
 } from "discord.js";
 import { randomUUID } from "node:crypto";
-import type { IntegrationConfig, TeamMapping } from "./config.js";
+import { isOrganizerGuild, type IntegrationConfig, type TeamMapping } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient, OpenProjectRequestError } from "./openproject.js";
-import { containsSensitiveContent, minimizeText, SensitiveContentError, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
+import { containsSensitiveContent, minimizeText, normalizeExtractedDate, SensitiveContentError, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 
 export const taskCommand = new SlashCommandBuilder()
 	.setName("task")
@@ -94,6 +94,10 @@ export const taskMessageCommand = new ContextMenuCommandBuilder()
 	.setName("Create OpenProject task")
 	.setType(ApplicationCommandType.Message);
 
+export const aiTaskMessageCommand = new ContextMenuCommandBuilder()
+	.setName("Draft OpenProject task with AI")
+	.setType(ApplicationCommandType.Message);
+
 type Services = { config: IntegrationConfig; db: Database; openProject: OpenProjectClient; extractor: TaskExtractor };
 type TaskInteraction = ChatInputCommandInteraction | ModalSubmitInteraction | ButtonInteraction;
 type ContextDraft = {
@@ -111,9 +115,12 @@ type CollectedContext = {
 	messages: MinimizedMessage[];
 	reverseAliases: Map<string, string>;
 	validIds: Set<string>;
+	primaryId: string;
+	primaryAuthorId: string;
+	explicitAssigneeId?: string;
 };
+const sensitiveOverrides = new Map<string, { userId: string; context: CollectedContext; expiresAt: number }>();
 
-const organizerGuildId = "1022942414090027008";
 async function contextDraft(id: string, userId: string, services: Services) {
 	return services.db.draft<ContextDraft>(id, userId, "context");
 }
@@ -146,29 +153,62 @@ export function validIsoDate(value?: string | null) {
 	return value;
 }
 
-export function defaultTaskDates(now: Date, startToday: boolean, dueDays: number) {
-	const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-	const due = new Date(start);
-	due.setUTCDate(due.getUTCDate() + dueDays);
+export function calendarDate(now: Date, timeZone = "America/Toronto") {
+	const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", {
+		timeZone, year: "numeric", month: "2-digit", day: "2-digit",
+	}).formatToParts(now).filter(part => part.type !== "literal").map(part => [part.type, part.value]));
+	return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function addCalendarDays(value: string, days: number) {
+	const date = new Date(`${value}T00:00:00Z`);
+	date.setUTCDate(date.getUTCDate() + days);
+	return date.toISOString().slice(0, 10);
+}
+
+export function defaultTaskDates(now: Date, startToday: boolean, dueDays: number, timeZone = "America/Toronto") {
+	const start = calendarDate(now, timeZone);
 	return {
-		startDate: startToday ? start.toISOString().slice(0, 10) : undefined,
-		dueDate: due.toISOString().slice(0, 10),
+		startDate: startToday ? start : undefined,
+		dueDate: addCalendarDays(start, dueDays),
 	};
+}
+
+export function defaultAiDueDate(now: Date, priorityName?: string, sizeName?: string, timeZone = "America/Toronto") {
+	const priorityDays = priorityName?.toLocaleLowerCase() === "immediate" ? 3
+		: priorityName?.toLocaleLowerCase() === "high" ? 7
+			: priorityName?.toLocaleLowerCase() === "low" ? 21 : 14;
+	const normalizedSize = (sizeName ?? "").normalize("NFKD").replace(/\p{M}/gu, "").toLocaleLowerCase()
+		.replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+	const sizeDays = normalizedSize.includes("x large") ? 28
+		: normalizedSize.includes("large") ? 14
+			: normalizedSize.includes("medium") ? 7 : 0;
+	return addCalendarDays(calendarDate(now, timeZone), priorityDays + sizeDays);
+}
+
+export function explicitAssignmentNames(text: string) {
+	const names = new Set<string>();
+	for (const match of text.matchAll(/\bTask\s*\d+\s*\(([^)\n]{2,64})\)/gi)) names.add(match[1].trim());
+	for (const match of text.matchAll(/\b(?:assignee|assigned to|owner)\s*[:=-]?\s*([^\n,;]{2,64})/gi)) names.add(match[1].trim());
+	return [...names];
 }
 
 function validateDateOrder(startDate?: string | null, dueDate?: string | null) {
 	if (startDate && dueDate && startDate > dueDate) throw new Error("The start date cannot be after the due date.");
 }
 
-function dateChoices(query: string) {
-	const today = new Date();
-	const choices: Array<{ name: string; value: string }> = [];
-	for (let offset = 0; offset < 31; offset++) {
-		const date = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + offset));
-		const value = date.toISOString().slice(0, 10);
-		const label = offset === 0 ? `Today — ${value}` : offset === 1 ? `Tomorrow — ${value}` : value;
-		choices.push({ name: label, value });
-	}
+export function dateChoices(query: string, includePast = false, now = new Date(), timeZone = "America/Toronto") {
+	const today = calendarDate(now, timeZone);
+	const offsets = includePast
+		? [0, ...Array.from({ length: 30 }, (_, index) => index + 1).flatMap(offset => [-offset, offset])]
+		: Array.from({ length: 31 }, (_, offset) => offset);
+	const choices = offsets.map(offset => {
+		const value = addCalendarDays(today, offset);
+		const label = offset === 0 ? `Today — ${value}`
+			: offset === 1 ? `Tomorrow — ${value}`
+				: offset === -1 ? `Yesterday — ${value}` : value;
+		return { name: label, value };
+	});
 	return choices.filter(choice => choice.value.includes(query) || choice.name.toLowerCase().includes(query.toLowerCase()));
 }
 
@@ -191,7 +231,6 @@ async function accountableFor(
 		const configuredId = await services.db.openProjectUserId(team[1].accountableDiscordId);
 		if (configuredId) return { discordId: team[1].accountableDiscordId, openProjectId: configuredId };
 	}
-	await assignee.guild.members.fetch();
 	const candidates = assignee.guild.members.cache
 		.filter(member => member.roles.cache.has(team[0]) && member.roles.cache.has(executiveRole))
 		.sort((left, right) => left.id.localeCompare(right.id));
@@ -203,7 +242,7 @@ async function accountableFor(
 }
 
 async function requireCreator(interaction: ChatInputCommandInteraction | MessageContextMenuCommandInteraction | ModalSubmitInteraction | ButtonInteraction, services: Services) {
-	if (!interaction.inGuild() || interaction.guildId !== organizerGuildId || services.config.ORGANIZER_GUILD_ID !== organizerGuildId) {
+	if (!interaction.inGuild() || !isOrganizerGuild(services.config, interaction.guildId)) {
 		throw new Error("OpenProject tasks are available only in the Organizer Discord server.");
 	}
 	if (services.config.blockedChannels.has(interaction.channelId!)) throw new Error("Task creation is disabled in this channel.");
@@ -253,11 +292,11 @@ function projectIdFromWorkPackage(task: { _links: Record<string, { href: string 
 }
 
 function requireOrganizer(interaction: ChatInputCommandInteraction, services: Services) {
-	if (!interaction.inGuild() || interaction.guildId !== organizerGuildId || services.config.ORGANIZER_GUILD_ID !== organizerGuildId || !interaction.member || !("roles" in interaction.member)) {
+	if (!interaction.inGuild() || !isOrganizerGuild(services.config, interaction.guildId) || !interaction.member || !("roles" in interaction.member)) {
 		throw new Error("OpenProject configuration is available only in the Organizer Discord server.");
 	}
 	const member = interaction.member as GuildMember;
-	if (!member.roles.cache.has(process.env.ORGANIZER_GUILD_ORGANIZER_ROLE_ID ?? "") && !member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+	if (!member.roles.cache.has(services.config.ORGANIZER_GUILD_ORGANIZER_ROLE_ID) && !member.permissions.has(PermissionFlagsBits.ManageGuild)) {
 		throw new Error("Only organizers can change OpenProject mappings.");
 	}
 }
@@ -269,16 +308,44 @@ async function resolveProject(
 	assignee: GuildMember | null,
 	services: Services,
 ) {
-	if (explicit && /^\d+$/.test(explicit)) return Number(explicit);
+	if (explicit) {
+		if (/^\d+$/.test(explicit)) return Number(explicit);
+		const normalized = explicit.trim().toLocaleLowerCase();
+		const matches = (await services.openProject.projects()).filter(project => project.name.toLocaleLowerCase() === normalized);
+		if (matches.length === 1) return matches[0].id;
+		throw new Error("Select a valid OpenProject project name.");
+	}
 	const categoryDefault = await categoryProject(channelId, guild, services);
 	if (categoryDefault) return categoryDefault;
 	return matchedTeam(assignee, services.config.teamRoles)?.[1].projectId;
+}
+
+export function databaseDate(value: unknown) {
+	if (value instanceof Date) return value.toISOString().slice(0, 10);
+	return normalizeExtractedDate(value == null ? null : String(value));
+}
+
+async function resolveAssigneeInput(value: string, guild: Guild) {
+	const input = value.trim();
+	if (!input) return undefined;
+	const mention = /^<@!?(\d+)>$/.exec(input);
+	if (mention || /^\d+$/.test(input)) return (mention?.[1] ?? input);
+	const normalized = input.replace(/^@/, "").toLocaleLowerCase();
+	const matches = [...guild.members.cache.values()].filter(member => [
+		member.displayName,
+		member.displayName.replace(/(?:\s*\[[^\]]+\])+\s*$/g, ""),
+		member.user.globalName,
+		member.user.username,
+	].some(name => name?.toLocaleLowerCase() === normalized));
+	if (matches.length !== 1) throw new Error(matches.length ? "That assignee name is ambiguous." : "No Organizer member matches that assignee name.");
+	return matches[0].id;
 }
 
 async function createAndAnnounce(args: {
 	interaction: TaskInteraction;
 	services: Services;
 	draftId?: string;
+	correlationId?: string;
 	title: string;
 	description: string;
 	projectText: string | null;
@@ -334,18 +401,26 @@ async function createAndAnnounce(args: {
 		estimatedHours: args.estimatedHours,
 		sourceLinks: args.sourceLinks,
 		typeId: type?.id,
-		correlationId: args.draftId,
+		correlationId: args.correlationId ?? args.draftId,
 	});
 	// Persist completion immediately after the non-idempotent OpenProject POST.
 	// Discord response/announcement failures must never make a successful POST
 	// look retryable and create a second work package.
-	if (args.draftId) await services.db.completeDraft(args.draftId, workPackage.id);
-	await services.db.logTaskEvent(workPackage.id, "created", interaction.user.id, { projectId, sourceLinks: args.sourceLinks });
+	if (args.draftId) {
+		try {
+			await services.db.completeDraft(args.draftId, workPackage.id);
+		} catch (error) {
+			throw new OpenProjectRequestError(`OpenProject task ${workPackage.id} was created, but its local draft could not be finalized: ${(error as Error).message}`, true);
+		}
+	}
+	await services.db.logTaskEvent(workPackage.id, "created", interaction.user.id, { projectId, sourceLinks: args.sourceLinks })
+		.catch(error => console.error("Task creation audit log failed", { workPackageId: workPackage.id, error: (error as Error).message }));
 	const url = services.openProject.workPackageUrl(workPackage.id);
 	const ping = assignee ? `<@${assignee.id}> ` : "";
 	const due = args.dueDate ? ` · due ${args.dueDate}` : "";
 	const content = `${ping}OpenProject task created: **${workPackage.subject}** in **${project.name}**${due}\n${url}`;
-	await interaction.editReply({ content: `Created ${url}` });
+	await interaction.editReply({ content: `Created ${url}` })
+		.catch(error => console.error("Task creation response failed", { workPackageId: workPackage.id, error: (error as Error).message }));
 	let confirmationMessageId: string | undefined;
 	if (interaction.channel?.type === ChannelType.GuildText || interaction.channel?.type === ChannelType.PublicThread || interaction.channel?.type === ChannelType.PrivateThread) {
 		try {
@@ -355,8 +430,10 @@ async function createAndAnnounce(args: {
 			});
 			confirmationMessageId = confirmation.id;
 		} catch (error) {
-			await services.db.logTaskEvent(workPackage.id, "confirmation_failed", interaction.user.id, { error: (error as Error).message });
-			await interaction.editReply({ content: `Created ${url}, but the channel confirmation could not be posted. The task was not created twice.` });
+			await services.db.logTaskEvent(workPackage.id, "confirmation_failed", interaction.user.id, { error: (error as Error).message })
+				.catch(auditError => console.error("Task confirmation audit log failed", { workPackageId: workPackage.id, error: (auditError as Error).message }));
+			await interaction.editReply({ content: `Created ${url}, but the channel confirmation could not be posted. The task was not created twice.` })
+				.catch(responseError => console.error("Task confirmation response failed", { workPackageId: workPackage.id, error: (responseError as Error).message }));
 		}
 	}
 	return { workPackage, confirmationMessageId };
@@ -367,13 +444,30 @@ async function showCreationPreview(
 	services: Services,
 	draft: Omit<CreationDraft, "userId" | "channelId" | "expiresAt">,
 ) {
-	const id = await services.db.createDraft("creation", interaction.user.id, interaction.channelId!, draft);
+	const id = await services.db.createDraft(
+		"creation",
+		interaction.user.id,
+		interaction.channelId!,
+		draft,
+		services.config.OPENPROJECT_DRAFT_TTL_MINUTES,
+	);
 	const projectId = draft.projectText && /^\d+$/.test(draft.projectText) ? Number(draft.projectText) : undefined;
 	const project = projectId ? (await services.openProject.projects()).find(item => item.id === projectId) : undefined;
+	const priority = draft.priorityId ? (await services.openProject.priorities()).find(item => item.id === draft.priorityId) : undefined;
+	const sizeId = draft.sizeHref ? Number(draft.sizeHref.split("/").at(-1)) : undefined;
+	const size = projectId && sizeId ? (await services.openProject.sizeOptions(projectId)).find(item => item.id === sizeId) : undefined;
 	const dates = draft.startDate || draft.dueDate ? `\nDates: ${draft.startDate ?? "—"} → ${draft.dueDate ?? "—"}` : "";
+	const metadata = [
+		draft.assigneeId ? `Assignee: <@${draft.assigneeId}>` : null,
+		draft.accountableId ? `Accountable: <@${draft.accountableId}>` : null,
+		priority ? `Priority: ${priority.name}` : null,
+		size ? `Size: ${size.value}` : null,
+		draft.estimatedHours !== undefined ? `Estimate: ${draft.estimatedHours}h` : null,
+	]
+		.filter(Boolean).join(" · ");
 	const description = draft.description.trim() ? `\n\n${draft.description.slice(0, 1200)}` : "";
 	await interaction.editReply({
-		content: `Review before creating:\n**${draft.title}**\nProject: ${project?.name ?? "resolved from category/team"}${dates}${description}`,
+		content: `Review before creating:\n**${draft.title}**\nProject: ${project?.name ?? "resolved from category/team"}${metadata ? `\n${metadata}` : ""}${dates}${description}`,
 		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
 			new ButtonBuilder().setCustomId(`op-create-final:${id}`).setLabel("Create").setStyle(ButtonStyle.Success),
 			new ButtonBuilder().setCustomId(`op-edit-final:${id}`).setLabel("Edit").setStyle(ButtonStyle.Primary),
@@ -395,7 +489,7 @@ async function handleAutocomplete(interaction: AutocompleteInteraction, services
 	} else if (focused.name === "priority") {
 		choices = (await services.openProject.priorities()).map(priority => ({ name: priority.name, value: String(priority.id) }));
 	} else if (focused.name === "start_date" || focused.name === "due_date") {
-		choices = dateChoices(query);
+		choices = dateChoices(query, focused.name === "start_date", new Date(), services.config.BOT_TIME_ZONE);
 	} else if (focused.name === "size") {
 		const explicitProject = interaction.options.getString("project");
 		const projectId = explicitProject && /^\d+$/.test(explicitProject)
@@ -431,7 +525,10 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 		const openProjectId = Number(interaction.options.getString("openproject_user", true));
 		if (!Number.isInteger(openProjectId)) throw new Error("Select a valid OpenProject user.");
 		const user = (await services.openProject.users()).find(item => item.id === openProjectId);
-		if (!user) throw new Error("The selected OpenProject user is inactive or inaccessible.");
+		if (!user) throw new Error("The selected OpenProject user is not assignable in a configured project.");
+		const mappings = await services.db.openProjectUserMappings();
+		const collision = [...mappings].find(([discordId, mappedId]) => mappedId === openProjectId && discordId !== discordUser.id);
+		if (collision) throw new Error(`That OpenProject user is already mapped to <@${collision[0]}>.`);
 		await services.db.setOpenProjectUser(discordUser.id, openProjectId);
 		await interaction.editReply(`Mapped <@${discordUser.id}> to OpenProject user **${user.name}**.`);
 		return;
@@ -501,7 +598,7 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 		await interaction.editReply(`${subcommand === "close" ? "Closed" : "Reopened"} ${services.openProject.workPackageUrl(id)}.`);
 		return;
 	}
-	const defaults = defaultTaskDates(new Date(), services.config.OPENPROJECT_DEFAULT_START_TODAY, services.config.OPENPROJECT_DEFAULT_DUE_DAYS);
+	const defaults = defaultTaskDates(new Date(), services.config.OPENPROJECT_DEFAULT_START_TODAY, services.config.OPENPROJECT_DEFAULT_DUE_DAYS, services.config.BOT_TIME_ZONE);
 	const priority = interaction.options.getString("priority")
 		? Number(interaction.options.getString("priority"))
 		: (await services.openProject.priorities()).find(item => item.isDefault)?.id;
@@ -565,7 +662,7 @@ async function handleContextContinue(interaction: ButtonInteraction, services: S
 	const id = interaction.customId.split(":")[1];
 	const draft = await contextDraft(id, interaction.user.id, services);
 	if (!draft.projectId) throw new Error("Choose a project before continuing.");
-	const defaults = defaultTaskDates(new Date(), services.config.OPENPROJECT_DEFAULT_START_TODAY, services.config.OPENPROJECT_DEFAULT_DUE_DAYS);
+	const defaults = defaultTaskDates(new Date(), services.config.OPENPROJECT_DEFAULT_START_TODAY, services.config.OPENPROJECT_DEFAULT_DUE_DAYS, services.config.BOT_TIME_ZONE);
 	const modal = new ModalBuilder().setCustomId(`op-task2:${id}`).setTitle("Create OpenProject task");
 	const fields = [
 		new TextInputBuilder().setCustomId("title").setLabel("Title").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(255).setValue(draft.title),
@@ -576,6 +673,352 @@ async function handleContextContinue(interaction: ButtonInteraction, services: S
 	modal.addComponents(...fields.map(field => new ActionRowBuilder<TextInputBuilder>().addComponents(field)));
 	await interaction.showModal(modal);
 	return true;
+}
+
+export const AI_CONTEXT_GAP_MS = 30 * 60 * 1000;
+
+export function precedingUntilGap<T extends { createdTimestamp: number }>(anchorTimestamp: number, messages: T[], limit = 20) {
+	const selected: T[] = [];
+	let nextTimestamp = anchorTimestamp;
+	for (const message of [...messages].sort((left, right) => right.createdTimestamp - left.createdTimestamp)) {
+		if (message.createdTimestamp >= nextTimestamp) continue;
+		if (nextTimestamp - message.createdTimestamp > AI_CONTEXT_GAP_MS) break;
+		selected.push(message);
+		nextTimestamp = message.createdTimestamp;
+		if (selected.length >= limit) break;
+	}
+	return selected;
+}
+
+export function followingUntilGap<T extends { createdTimestamp: number }>(anchorTimestamp: number, messages: T[], limit = 20) {
+	const selected: T[] = [];
+	let previousTimestamp = anchorTimestamp;
+	for (const message of [...messages].sort((left, right) => left.createdTimestamp - right.createdTimestamp)) {
+		if (message.createdTimestamp <= previousTimestamp) continue;
+		if (message.createdTimestamp - previousTimestamp > AI_CONTEXT_GAP_MS) break;
+		selected.push(message);
+		previousTimestamp = message.createdTimestamp;
+		if (selected.length >= limit) break;
+	}
+	return selected;
+}
+
+export function appendRelevantUrls(description: string, messages: MinimizedMessage[], sourceIds: string[]) {
+	const urls = new Set<string>();
+	for (const message of messages) {
+		if (!sourceIds.includes(message.id)) continue;
+		for (const match of message.text.matchAll(/https?:\/\/[^\s<>()]+/gi)) {
+			const url = match[0].replace(/[.,;:!?]+$/, "");
+			if (!/^https?:\/\/(?:www\.)?discord(?:app)?\.com\//i.test(url) && !description.includes(url)) urls.add(url);
+		}
+	}
+	let result = description.trim();
+	for (const url of urls) {
+		const addition = `${result ? "\n\n" : ""}${result.includes("Related links:") ? "" : "Related links:\n"}- ${url}`;
+		if (result.length + addition.length > 4000) break;
+		result += addition;
+	}
+	return result;
+}
+
+type ContextRole = NonNullable<MinimizedMessage["contextRole"]>;
+
+async function collectContext(target: Message, interaction: MessageContextMenuCommandInteraction) {
+	const byId = new Map<string, { message: Message; role: ContextRole }>();
+	const rolePriority: Record<ContextRole, number> = { primary: 0, thread_root: 1, reply_target: 2, preceding: 3, subsequent: 3 };
+	const add = (message: Message, role: ContextRole) => {
+		const existing = byId.get(message.id);
+		if (!existing || rolePriority[role] < rolePriority[existing.role]) byId.set(message.id, { message, role });
+	};
+	const addPrecedingWindow = async (anchor: Message) => {
+		if (byId.size >= 40) return;
+		const older = await anchor.channel.messages.fetch({ before: anchor.id, limit: 50 }).catch(() => null);
+		if (!older) return;
+		for (const message of precedingUntilGap(anchor.createdTimestamp, [...older.values()], Math.min(20, 40 - byId.size))) {
+			add(message, "preceding");
+		}
+	};
+	const addFollowingWindow = async (anchor: Message) => {
+		if (byId.size >= 40) return;
+		const newer = await anchor.channel.messages.fetch({ after: anchor.id, limit: 50 }).catch(() => null);
+		if (!newer) return;
+		for (const message of followingUntilGap(anchor.createdTimestamp, [...newer.values()], Math.min(20, 40 - byId.size))) {
+			add(message, "subsequent");
+		}
+	};
+	const fetchReplyTarget = async (message: Message) => {
+		if (!message.reference?.messageId || !message.reference.channelId) return null;
+		const channel = message.reference.channelId === message.channelId
+			? message.channel
+			: await interaction.guild!.channels.fetch(message.reference.channelId).catch(() => null);
+		if (!channel || !("messages" in channel)) return null;
+		return await channel.messages.fetch(message.reference.messageId).catch(() => null);
+	};
+
+	add(target, "primary");
+	await addPrecedingWindow(target);
+	await addFollowingWindow(target);
+	if (target.channel.isThread()) {
+		const starter = await target.channel.fetchStarterMessage().catch(() => null);
+		if (starter) {
+			add(starter, "thread_root");
+			await addPrecedingWindow(starter);
+		}
+	}
+	let replyWindows = 0;
+	for (const { message } of byId.values()) {
+		if (replyWindows >= 8 || byId.size >= 40) break;
+		const referenced = await fetchReplyTarget(message);
+		if (!referenced) continue;
+		add(referenced, "reply_target");
+		await addPrecedingWindow(referenced);
+		replyWindows++;
+	}
+	const aliases = new Map<string, string>();
+	const reverseAliases = new Map<string, string>();
+	const aliasFor = (id: string) => {
+		let alias = aliases.get(id);
+		if (!alias) {
+			alias = `USER_${aliases.size + 1}`;
+			aliases.set(id, alias);
+			reverseAliases.set(alias, id);
+		}
+		return alias;
+	};
+	const normalizedName = (value: string) => value.trim().toLocaleLowerCase();
+	const memberNames = (member: GuildMember) => [
+		member.displayName,
+		member.displayName.replace(/(?:\s*\[[^\]]+\])+\s*$/g, ""),
+		member.user.globalName,
+		member.user.username,
+	]
+		.filter((value): value is string => Boolean(value));
+	const namedAliases = new Map<string, string>();
+	const namedDiscordIds = new Map<string, string>();
+	const primaryNames = new Set(explicitAssignmentNames(target.content));
+	const explicitNames = new Set(primaryNames);
+	for (const { message } of byId.values()) {
+		for (const name of explicitAssignmentNames(message.content)) explicitNames.add(name);
+	}
+	for (const member of interaction.guild!.members.cache.values()) {
+		if (member.user.bot || member.id === target.author.id) continue;
+		const baseName = member.displayName.replace(/(?:\s*\[[^\]]+\])+\s*$/g, "").trim();
+		if (baseName.length < 2) continue;
+		const escaped = baseName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		if (new RegExp(`(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, "iu").test(target.content)) {
+			explicitNames.add(baseName);
+			primaryNames.add(baseName);
+		}
+	}
+	for (const name of explicitNames) {
+		const contextualMatches = new Map<string, GuildMember>();
+		for (const { message } of byId.values()) {
+			if (message.member && memberNames(message.member).some(value => normalizedName(value) === normalizedName(name))) {
+				contextualMatches.set(message.member.id, message.member);
+			}
+		}
+		let matches = [...contextualMatches.values()];
+		if (!matches.length) {
+			matches = [...interaction.guild!.members.cache.values()]
+				.filter(member => memberNames(member).some(value => normalizedName(value) === normalizedName(name)));
+		}
+		if (matches.length === 1) {
+			namedAliases.set(name, aliasFor(matches[0].id));
+			namedDiscordIds.set(normalizedName(name), matches[0].id);
+		}
+	}
+	const replaceNamedAliases = (text: string) => {
+		let replaced = text;
+		for (const [name, alias] of namedAliases) {
+			const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+			replaced = replaced.replace(new RegExp(`(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, "giu"), alias);
+		}
+		return replaced;
+	};
+	const messages: MinimizedMessage[] = [...byId.values()]
+		.filter(({ message }) => !message.author.bot && !message.system && !message.content.startsWith("/"))
+		.sort((left, right) => left.message.createdTimestamp - right.message.createdTimestamp)
+		.map(({ message, role }) => {
+			const raw = replaceNamedAliases(message.content.replace(/<@!?(\d+)>/g, (_, id: string) => aliasFor(id)));
+			return {
+				id: message.id,
+				channelId: message.channelId,
+				authorAlias: aliasFor(message.author.id),
+				text: minimizeText(raw),
+				timestamp: message.createdAt.toISOString(),
+				replyTo: message.reference?.messageId,
+				contextRole: role,
+				priority: role === "primary",
+				containedSensitiveData: containsSensitiveContent([{ id: message.id, authorAlias: "", text: raw, timestamp: "" }]),
+			};
+		});
+	const mentionedIds = [...target.mentions.users.keys()].filter(id => id !== target.author.id);
+	const namedIds = [...primaryNames].flatMap(name => namedDiscordIds.get(normalizedName(name)) ?? []);
+	const explicitIds = [...new Set([...mentionedIds, ...namedIds])];
+	return {
+		messages,
+		reverseAliases,
+		validIds: new Set(byId.keys()),
+		primaryId: target.id,
+		primaryAuthorId: target.author.id,
+		explicitAssigneeId: explicitIds.length === 1 ? explicitIds[0] : undefined,
+	};
+}
+
+async function handleAiContext(interaction: MessageContextMenuCommandInteraction, services: Services) {
+	if (interaction.commandName !== aiTaskMessageCommand.name) return;
+	await requireCreator(interaction, services);
+	if (!services.extractor.enabled) throw new Error("No task extraction provider is configured.");
+	await interaction.deferReply({ ephemeral: true });
+	const context = await collectContext(interaction.targetMessage, interaction);
+	try {
+		await completeAiContext(interaction, services, context);
+	} catch (error) {
+		if (!(error instanceof SensitiveContentError)) throw error;
+		const id = randomUUID();
+		sensitiveOverrides.set(id, { userId: interaction.user.id, context, expiresAt: Date.now() + 10 * 60_000 });
+		setTimeout(() => sensitiveOverrides.delete(id), 10 * 60_000).unref();
+		await interaction.editReply({
+			content: "This context matched the sensitive-data heuristic. Nothing was sent to Azure. If this is a false positive, you can explicitly send the minimized context for this request only.",
+			components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
+				new ButtonBuilder().setCustomId(`op-sensitive-override:${id}`).setLabel("Send minimized context").setStyle(ButtonStyle.Danger),
+			)],
+		});
+	}
+}
+
+async function completeAiContext(
+	interaction: MessageContextMenuCommandInteraction | ButtonInteraction,
+	services: Services,
+	context: CollectedContext,
+	allowSensitiveContent = false,
+) {
+	const tentativeProjectId = await categoryProject(interaction.channelId!, interaction.guild!, services);
+	const priorities = await services.openProject.priorities();
+	const tentativeSizes = tentativeProjectId ? await services.openProject.sizeOptions(tentativeProjectId) : [];
+	const extraction = await services.extractor.extract(context.messages, {
+		allowSensitiveContent,
+		metadata: { priorities: priorities.map(priority => priority.name), sizes: tentativeSizes.map(size => size.value) },
+	});
+	const { result, deployment } = extraction;
+	const candidate = result.tasks.find(task =>
+		(task.classification === "explicit_commitment" || task.classification === "direct_assignment") &&
+		task.source_message_ids.includes(context.primaryId) &&
+		task.source_message_ids.every(id => context.validIds.has(id)),
+	);
+	if (!candidate) {
+		await interaction.editReply("No explicit commitment or direct assignment was found in the selected message.");
+		return;
+	}
+	const assigneeId = context.explicitAssigneeId ?? (candidate.assignee_alias ? context.reverseAliases.get(candidate.assignee_alias) : undefined);
+	const accountableId = context.primaryAuthorId;
+	const assigneeMember = assigneeId ? await interaction.guild!.members.fetch(assigneeId).catch(() => null) : null;
+	const projectId = await resolveProject(null, interaction.channelId, interaction.guild!, assigneeMember, services);
+	const project = projectId ? (await services.openProject.projects()).find(item => item.id === projectId) : undefined;
+	const priority = candidate.priority_name
+		? priorities.find(item => item.name.toLocaleLowerCase() === candidate.priority_name!.toLocaleLowerCase())
+		: undefined;
+	const sizes = projectId ? await services.openProject.sizeOptions(projectId) : [];
+	const size = candidate.size_name
+		? sizes.find(item => item.value.toLocaleLowerCase() === candidate.size_name!.toLocaleLowerCase())
+		: undefined;
+	const inferredDate = (value: string | null) => {
+		try { return validIsoDate(value); } catch { return undefined; }
+	};
+	const startDate = inferredDate(candidate.start_date);
+	const dueDate = inferredDate(candidate.due_date) ?? defaultAiDueDate(new Date(), priority?.name, size?.value, services.config.BOT_TIME_ZONE);
+	const description = appendRelevantUrls(candidate.description, context.messages, candidate.source_message_ids);
+	if (projectId) {
+		const duplicate = await services.openProject.possibleDuplicate(projectId, candidate.title);
+		if (duplicate) {
+			await interaction.editReply(`A similar open task already exists: ${services.openProject.workPackageUrl(duplicate.id)}`);
+			return;
+		}
+	}
+	const proposal = await services.db.createProposal({
+		requesterId: interaction.user.id, channelId: interaction.channelId, projectId,
+		title: candidate.title, description,
+		assigneeDiscordId: assigneeId, accountableDiscordId: accountableId, priorityId: priority?.id,
+		sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined,
+		startDate, dueDate, estimatedHours: candidate.estimated_hours ?? undefined,
+		sourceMessageIds: candidate.source_message_ids,
+		classification: candidate.classification, modelDeployment: deployment,
+		evidence: candidate.evidence, ambiguities: result.ambiguities,
+		latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+					escalationReason: extraction.escalationReason,
+					sourceLinks: candidate.source_message_ids.map(id => {
+						const source = context.messages.find(message => message.id === id);
+						return messageUrl(interaction.guildId!, source?.channelId ?? interaction.channelId!, id);
+					}),
+					retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS,
+	});
+	if (proposal.reused) {
+		await interaction.editReply("This discussion already has a pending or created task proposal.");
+		return;
+	}
+	const review = new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and edit").setStyle(ButtonStyle.Primary);
+	const dismiss = new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary);
+	const details = [
+		`Project: ${project?.name ?? "Not resolved"}`,
+		`Assignee: ${assigneeId ? `<@${assigneeId}>` : "Not inferred"}`,
+		`Accountable: <@${accountableId}>`,
+		`Priority: ${priority?.name ?? "Not inferred"}`,
+		`Size: ${size?.value ?? "Not inferred"}`,
+		`Dates: ${startDate ?? "Not set"} → ${dueDate}`,
+		`Estimate: ${candidate.estimated_hours !== null ? `${candidate.estimated_hours}h` : "Not inferred"}`,
+	].join("\n");
+	await interaction.editReply({
+		content: `**${candidate.title}**\n${description}${details ? `\n\n${details}` : ""}\n\nClassification: ${candidate.classification}${result.ambiguities.length ? `\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`,
+		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(review, dismiss)],
+	});
+}
+
+async function handleSensitiveOverrideButton(interaction: ButtonInteraction, services: Services) {
+	if (!interaction.customId.startsWith("op-sensitive-override:")) return false;
+	const id = interaction.customId.split(":")[1];
+	const override = sensitiveOverrides.get(id);
+	if (override?.userId !== interaction.user.id || override.expiresAt <= Date.now()) {
+		sensitiveOverrides.delete(id);
+		throw new Error("This sensitive-content override expired. Run the message shortcut again.");
+	}
+	await requireCreator(interaction, services);
+	sensitiveOverrides.delete(id);
+	await interaction.deferUpdate();
+	await completeAiContext(interaction, services, override.context, true);
+	return true;
+}
+
+async function handleProposalButton(interaction: ButtonInteraction, services: Services) {
+	if (!interaction.customId.startsWith("op-review:") && !interaction.customId.startsWith("op-dismiss:")) return;
+	const id = interaction.customId.split(":")[1];
+	const proposal = await services.db.proposal(id);
+	if (proposal?.status !== "pending_review" || new Date(proposal.expires_at).getTime() <= Date.now() || (!proposal.permitted_reviewer_ids.includes(interaction.user.id) && proposal.requester_discord_id !== interaction.user.id)) throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
+	if (interaction.customId.startsWith("op-dismiss:")) {
+		if (!await services.db.setProposalStatus(id, "dismissed", interaction.user.id)) {
+			throw new Error("This proposal was already handled by another reviewer.");
+		}
+		await interaction.update({ content: "Proposal dismissed.", components: [] });
+		return;
+	}
+	const project = proposal.project_id ? (await services.openProject.projects()).find(item => item.id === proposal.project_id) : undefined;
+	const assignee = proposal.assignee_discord_id ? await interaction.guild!.members.fetch(proposal.assignee_discord_id).catch(() => null) : null;
+	let dueDate = databaseDate(proposal.due_date);
+	if (!dueDate) {
+		const priority = proposal.priority_id ? (await services.openProject.priorities()).find(item => item.id === proposal.priority_id) : undefined;
+		const sizeId = proposal.size_href ? Number(proposal.size_href.split("/").at(-1)) : undefined;
+		const size = proposal.project_id && sizeId ? (await services.openProject.sizeOptions(proposal.project_id)).find(item => item.id === sizeId) : undefined;
+		dueDate = defaultAiDueDate(new Date(), priority?.name, size?.value, services.config.BOT_TIME_ZONE);
+	}
+	const modal = new ModalBuilder().setCustomId(`op-ai:${id}`).setTitle("Review proposed task");
+	const fields = [
+		new TextInputBuilder().setCustomId("title").setLabel("Title").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(255).setValue(proposal.title),
+		new TextInputBuilder().setCustomId("description").setLabel("Description (optional)").setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(4000).setValue(proposal.description.slice(0, 4000)),
+		new TextInputBuilder().setCustomId("project").setLabel("Project name").setStyle(TextInputStyle.Short).setRequired(true).setValue(project?.name ?? ""),
+		new TextInputBuilder().setCustomId("assignee").setLabel("Assignee name (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(assignee?.displayName ?? ""),
+		new TextInputBuilder().setCustomId("due_date").setLabel("Due date YYYY-MM-DD").setStyle(TextInputStyle.Short).setRequired(true).setValue(dueDate),
+	];
+	modal.addComponents(...fields.map(field => new ActionRowBuilder<TextInputBuilder>().addComponents(field)));
+	await interaction.showModal(modal);
 }
 
 async function handleFinalCreationButton(interaction: ButtonInteraction, services: Services) {
@@ -610,18 +1053,21 @@ async function handleFinalCreationButton(interaction: ButtonInteraction, service
 	try {
 		const created = await createAndAnnounce({ interaction, services, draftId: id, ...draft });
 		if (draft.proposalId) {
-			await services.db.markProposalCreated(draft.proposalId, interaction.user.id, created.workPackage.id, created.confirmationMessageId);
+			try {
+				await services.db.markProposalCreated(draft.proposalId, interaction.user.id, created.workPackage.id, created.confirmationMessageId);
+			} catch (error) {
+				throw new OpenProjectRequestError(`OpenProject task ${created.workPackage.id} was created, but its proposal could not be finalized: ${(error as Error).message}`, true);
+			}
 		}
-		await services.db.completeDraft(id, created.workPackage.id);
 	} catch (error) {
-		if (draft.proposalId) {
-			const ambiguous = error instanceof OpenProjectRequestError && error.ambiguous;
-			await services.db.markProposalFailed(draft.proposalId, ambiguous ? "needs_reconciliation" : "failed", interaction.user.id, (error as Error).message);
-		}
-		await services.db.failDraft(id, (error as Error).message, error instanceof OpenProjectRequestError && error.ambiguous ? "needs_reconciliation" : "failed");
-		if (error instanceof OpenProjectRequestError && error.ambiguous) {
+		const ambiguous = error instanceof OpenProjectRequestError && error.ambiguous;
+		if (ambiguous) {
+			if (draft.proposalId) await services.db.markProposalFailed(draft.proposalId, "needs_reconciliation", interaction.user.id, error.message);
+			await services.db.failDraft(id, error.message, "needs_reconciliation");
 			throw new Error(`${error.message} Reconciliation ID: ${draft.proposalId ?? id}. Use /task reconcile after checking OpenProject.`);
 		}
+		if (draft.proposalId) await services.db.releaseProposal(draft.proposalId, (error as Error).message);
+		await services.db.releaseDraft(id, (error as Error).message, services.config.OPENPROJECT_DRAFT_TTL_MINUTES);
 		throw error;
 	}
 	return true;
@@ -649,31 +1095,78 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 	const draft = interaction.customId.startsWith("op-task2:") ? await contextDraft(entityId, interaction.user.id, services) : null;
 	const proposal = interaction.customId.startsWith("op-ai:") ? await services.db.proposal(entityId) : null;
 	if (proposal && (proposal.status !== "pending_review" || new Date(proposal.expires_at).getTime() <= Date.now() || (!proposal.permitted_reviewer_ids.includes(interaction.user.id) && proposal.requester_discord_id !== interaction.user.id))) throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
-	const sourceIds = proposal?.source_message_ids ?? [draft?.targetId ?? entityId];
+	if (proposal) {
+		const args = {
+			interaction,
+			services,
+			correlationId: proposal.id,
+			title: interaction.fields.getTextInputValue("title"),
+			description: interaction.fields.getTextInputValue("description"),
+			projectText: interaction.fields.getTextInputValue("project"),
+			assigneeId: await resolveAssigneeInput(interaction.fields.getTextInputValue("assignee"), interaction.guild!),
+			accountableId: proposal.accountable_discord_id ?? undefined,
+			priorityId: proposal.priority_id ?? undefined,
+			sizeHref: proposal.size_href ?? undefined,
+			startDate: databaseDate(proposal.start_date) ?? undefined,
+			dueDate: validIsoDate(interaction.fields.getTextInputValue("due_date")),
+			estimatedHours: proposal.estimated_hours == null ? undefined : Number(proposal.estimated_hours),
+			sourceLinks: proposal.source_links,
+		};
+		if (!await services.db.claimProposal(proposal.id, interaction.user.id)) throw new Error("This proposal is already being handled.");
+		try {
+			const created = await createAndAnnounce(args);
+			try {
+				await services.db.markProposalCreated(proposal.id, interaction.user.id, created.workPackage.id, created.confirmationMessageId);
+			} catch (error) {
+				throw new OpenProjectRequestError(`OpenProject task ${created.workPackage.id} was created, but its proposal could not be finalized: ${(error as Error).message}`, true);
+			}
+		} catch (error) {
+			if (error instanceof OpenProjectRequestError && error.ambiguous) {
+				await services.db.markProposalFailed(proposal.id, "needs_reconciliation", interaction.user.id, error.message);
+				throw new Error(`${error.message} Reconciliation ID: ${proposal.id}. Use /task reconcile after checking OpenProject.`);
+			}
+			await services.db.releaseProposal(proposal.id, (error as Error).message);
+			throw error;
+		}
+		return;
+	}
+	if (!draft) return;
+	const startDate = validIsoDate(interaction.fields.getTextInputValue("start_date") || undefined);
+	const dueDate = validIsoDate(interaction.fields.getTextInputValue("due_date") || undefined);
 	await showCreationPreview(interaction, services, {
 		title: interaction.fields.getTextInputValue("title"),
 		description: interaction.fields.getTextInputValue("description"),
-		projectText: draft ? String(draft.projectId) : interaction.fields.getTextInputValue("project") || null,
-		assigneeId: draft ? draft.assigneeId : interaction.fields.getTextInputValue("assignee") || undefined,
-		startDate: draft ? interaction.fields.getTextInputValue("start_date") || undefined : undefined,
-		dueDate: interaction.fields.getTextInputValue("due_date") || undefined,
-		sourceLinks: proposal?.source_links ?? sourceIds.map(id => messageUrl(interaction.guildId!, interaction.channelId!, id)),
-		proposalId: proposal?.id,
+		projectText: String(draft.projectId),
+		assigneeId: draft.assigneeId,
+		startDate,
+		dueDate,
+		sourceLinks: [messageUrl(interaction.guildId!, interaction.channelId!, draft.targetId)],
 	});
-	if (draft) await services.db.failDraft(entityId, "context-complete");
+	await services.db.failDraft(entityId, "context-complete");
 }
 
 export function registerTaskInteractions(client: Client, services: Services) {
 	client.on("interactionCreate", async interaction => {
 		try {
+			const isTaskInteraction =
+				((interaction.isAutocomplete() || interaction.isChatInputCommand()) && interaction.commandName === taskCommand.name) ||
+				(interaction.isMessageContextMenuCommand() && (interaction.commandName === taskMessageCommand.name || interaction.commandName === aiTaskMessageCommand.name)) ||
+				((interaction.isStringSelectMenu() || interaction.isUserSelectMenu() || interaction.isButton() || interaction.isModalSubmit()) && interaction.customId.startsWith("op-"));
+			if (!isTaskInteraction) return;
+			if (!interaction.inGuild() || !isOrganizerGuild(services.config, interaction.guildId)) {
+				if (interaction.isAutocomplete()) await interaction.respond([]);
+				else throw new Error("OpenProject tasks are available only in the Organizer Discord server.");
+				return;
+			}
 			if (interaction.isAutocomplete()) await handleAutocomplete(interaction, services);
 			else if (interaction.isChatInputCommand()) await handleSlash(interaction, services);
 			else if (interaction.isMessageContextMenuCommand()) {
 				await handleContext(interaction, services);
+				await handleAiContext(interaction, services);
 			}
 			else if (interaction.isStringSelectMenu() || interaction.isUserSelectMenu()) await handleContextSelect(interaction, services);
 			else if (interaction.isButton()) {
-				if (!await handleContextContinue(interaction, services) && !await handleFinalCreationButton(interaction, services)) return;
+				if (!await handleSensitiveOverrideButton(interaction, services) && !await handleContextContinue(interaction, services) && !await handleFinalCreationButton(interaction, services)) await handleProposalButton(interaction, services);
 			}
 			else if (interaction.isModalSubmit()) await handleModal(interaction, services);
 		} catch (error) {
