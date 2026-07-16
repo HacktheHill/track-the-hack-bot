@@ -10,12 +10,15 @@ import {
 import express, { Request, Response } from "express";
 import bodyParser from "body-parser";
 import { config } from "dotenv";
-import { getClient } from "./bot.js";
+import { getClient, isIntegrationReady } from "./bot.js";
+import { createHmac, timingSafeEqual } from "node:crypto";
 
 config();
 
 const app = express();
 app.use(bodyParser.json());
+
+const startedAt = new Date().toISOString();
 
 const {
 	PORT = 4000,
@@ -23,8 +26,8 @@ const {
 	COMMUNITY_GUILD_HACKER_ROLE_ID,
 	COMMUNITY_GUILD_ORGANIZER_ROLE_ID,
 	LOG_CHANNEL_ID,
-	SECRET_KEY,
 	TRACK_THE_HACK_URL,
+	INTERNAL_API_SECRET,
 } = process.env;
 
 if (
@@ -32,7 +35,7 @@ if (
 	!COMMUNITY_GUILD_HACKER_ROLE_ID ||
 	!COMMUNITY_GUILD_ORGANIZER_ROLE_ID ||
 	!LOG_CHANNEL_ID ||
-	!SECRET_KEY ||
+	!INTERNAL_API_SECRET ||
 	!TRACK_THE_HACK_URL
 ) {
 	console.error("Missing environment variables for verification");
@@ -73,10 +76,31 @@ const log = async (client: Client, member: GuildMember) => {
 };
 
 app.post("/verify", async (req: Request, res: Response) => {
-	const { discordId, secretKey } = req.body;
+	const { discordId } = req.body;
+	const requestTimestamp = req.header("x-track-the-hack-timestamp");
+	const requestSignature = req.header("x-track-the-hack-signature");
+	const sharedSecret = INTERNAL_API_SECRET;
+	const timestamp = Number(requestTimestamp);
+	const rawBody = JSON.stringify(req.body);
+	const signedPayload = `${requestTimestamp ?? ""}.${rawBody}`;
+	const expectedSignature = createHmac("sha256", sharedSecret)
+		.update(signedPayload)
+		.digest("hex");
+	const signatureValid = Boolean(
+		requestSignature &&
+		/^[a-f0-9]{64}$/i.test(requestSignature) &&
+		timingSafeEqual(
+			Buffer.from(requestSignature, "utf8"),
+			Buffer.from(expectedSignature, "utf8"),
+		),
+	);
+	const timestampValid = Number.isFinite(timestamp) && Math.abs(Date.now() - timestamp * 1000) <= 300_000;
 
-	if (secretKey !== SECRET_KEY) {
-		return res.status(403).json({ error: "Invalid secret key" });
+	if (!signatureValid) {
+		return res.status(403).json({ error: "Invalid request signature" });
+	}
+	if (requestSignature && !timestampValid) {
+		return res.status(401).json({ error: "Expired request" });
 	}
 
 	try {
@@ -98,6 +122,17 @@ app.post("/verify", async (req: Request, res: Response) => {
 		console.error(error);
 		return res.status(500).json({ error: "Internal server error" });
 	}
+});
+
+app.get("/healthz", (_req, res) => {
+	res.json({ status: "ok", startedAt });
+});
+
+app.get("/readyz", (_req, res) => {
+	if (!getClient().isReady() || !isIntegrationReady()) {
+		return res.status(503).json({ status: "not_ready" });
+	}
+	return res.json({ status: "ready" });
 });
 
 app.listen(PORT, () => {
