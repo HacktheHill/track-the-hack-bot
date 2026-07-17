@@ -45,6 +45,8 @@ const envSchema = z.object({
 	OPENPROJECT_AI_MAX_CONTEXT_CHARS: z.coerce.number().int().min(2000).max(100000).default(16000),
 	OPENPROJECT_AI_MAX_IMAGE_ATTACHMENTS: z.coerce.number().int().min(0).max(20).default(0),
 	OPENPROJECT_AI_SIGNIFICANCE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.5),
+	AI_EVAL_MIN_INTERVAL_MS: z.coerce.number().int().min(0).max(60000).default(0),
+	AI_EVAL_PROVIDER_RETRIES: z.coerce.number().int().min(0).max(10).default(3),
 });
 
 type ExtractedTask = Awaited<ReturnType<AzureTaskExtractor["extract"]>>["result"]["tasks"][number];
@@ -66,6 +68,10 @@ function sameSet(left: string[], right: string[]) {
 
 function percent(value: number) {
 	return `${(value * 100).toFixed(1)}%`;
+}
+
+function sleep(milliseconds: number) {
+	return new Promise(resolve => setTimeout(resolve, milliseconds));
 }
 
 async function main() {
@@ -106,11 +112,27 @@ async function main() {
 	let totalLatencyMs = 0;
 	let latencySamples = 0;
 	let totalTokens = 0;
+	let providerRetries = 0;
+	let lastRequestAt = 0;
 	const cases: Array<Record<string, unknown>> = [];
 
 	for (const window of windows) {
 		try {
-			const extraction = await extractor.extract(window.messages as MinimizedMessage[], { metadata: window.metadata });
+			let extraction: Awaited<ReturnType<AzureTaskExtractor["extract"]>> | undefined;
+			for (let attempt = 0; attempt <= env.AI_EVAL_PROVIDER_RETRIES; attempt++) {
+				const waitFor = Math.max(0, env.AI_EVAL_MIN_INTERVAL_MS - (Date.now() - lastRequestAt));
+				if (waitFor) await sleep(waitFor);
+				lastRequestAt = Date.now();
+				try {
+					extraction = await extractor.extract(window.messages as MinimizedMessage[], { metadata: window.metadata });
+					break;
+				} catch (error) {
+					if (error instanceof StructuredOutputError || attempt === env.AI_EVAL_PROVIDER_RETRIES) throw error;
+					providerRetries++;
+					await sleep(Math.max(env.AI_EVAL_MIN_INTERVAL_MS, 1000) * (attempt + 1));
+				}
+			}
+			if (!extraction) throw new Error("AI evaluation exhausted retries without a result.");
 			validOutputs++;
 			totalLatencyMs += extraction.latencyMs;
 			latencySamples++;
@@ -179,6 +201,7 @@ async function main() {
 			totalTokens,
 			invalidOutputs,
 			providerErrors,
+			providerRetries,
 		},
 		counts: { truePositives, falsePositives, falseNegatives, trueNegatives },
 		targets: { taskPrecision: 0.95, ownerAccuracy: 0.90, deadlineAccuracy: 0.90, validOutputRate: 0.99 },
@@ -206,6 +229,7 @@ async function main() {
 		`| Valid structured output | ${percent(report.metrics.validOutputRate)} | 99% |`,
 		`| Average latency | ${Math.round(report.metrics.averageLatencyMs)} ms | — |`,
 		`| Total tokens | ${report.metrics.totalTokens} | — |`,
+		`| Provider retries | ${report.metrics.providerRetries} | — |`,
 		"",
 		`Invalid outputs: ${invalidOutputs}; provider errors: ${providerErrors}.`,
 		windows.length < 100 ? "\n> Warning: this corpus has fewer than the planned 100 representative windows." : "",

@@ -200,6 +200,8 @@ Each line contains `id`, `messages`, and `expected`, where `expected` includes
 to the corpus. Use 100 representative windows and track 95% task precision,
 90% owner/deadline accuracy, and 99% valid structured output as improvement
 targets rather than automatic activation gates.
+Aggregate baselines and their limitations are recorded in
+[docs/ai-evaluation.md](docs/ai-evaluation.md).
 
 ### Local containers
 
