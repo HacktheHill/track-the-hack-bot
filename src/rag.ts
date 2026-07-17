@@ -19,7 +19,16 @@ function descriptionOf(workPackage: WorkPackage) {
 
 export function lexicalTitleSimilarity(left: string, right: string) {
 	const stopWords = new Set(["and", "for", "the", "with"]);
-	const words = (value: string) => new Set(value.toLowerCase().match(/[a-z0-9]+/g)?.filter(word => word.length > 2 && !stopWords.has(word)) ?? []);
+	const editWords = new Set(["change", "changed", "edit", "modify", "modified", "revise", "revised", "revision", "update", "updated"]);
+	const canonical = (word: string) => {
+		if (editWords.has(word)) return "edit";
+		if (word.length > 4 && word.endsWith("ies")) return `${word.slice(0, -3)}y`;
+		if (word.length > 4 && word.endsWith("s") && !word.endsWith("ss")) return word.slice(0, -1);
+		return word;
+	};
+	const words = (value: string) => new Set(value.toLowerCase().match(/[a-z0-9]+/g)
+		?.filter(word => word.length > 2 && !stopWords.has(word))
+		.map(canonical) ?? []);
 	const leftWords = words(left);
 	const rightWords = words(right);
 	if (!leftWords.size || !rightWords.size) return 0;
@@ -92,7 +101,7 @@ export class OpenProjectRag {
 			const lexical = lexicalTitleSimilarity(title, item.subject);
 			const current = candidates.get(item.workPackageId);
 			const similarity = current
-				? current.similarity + (1 - current.similarity) * lexical * 0.25
+				? current.similarity + (1 - current.similarity) * lexical * 0.5
 				: lexical;
 			if (current || lexical > 0) candidates.set(item.workPackageId, { ...item, similarity });
 		}

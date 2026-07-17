@@ -91,6 +91,10 @@ test("RAG combines semantic candidates with lexical title matches", async () => 
 	assert.equal(matches[0].workPackageId, 2);
 	assert.ok(matches[0].similarity > 0.7);
 	assert.equal(lexicalTitleSimilarity("Publish sponsor prospectus", "Publish the sponsor prospectus"), 1);
+	assert.ok(lexicalTitleSimilarity(
+		"Update sponsorship package tier table",
+		"Revise sponsorship tiers graphic layout and colors",
+	) >= 0.3);
 });
 
 test("AI evaluator uses automatic-runtime create candidate semantics", () => {
