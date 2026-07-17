@@ -48,7 +48,7 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-      - uses: azure/login@1384c340ab2dda50fed2bee3041d1d87018aa5e8 # v2
+      - uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -64,7 +64,7 @@ jobs:
           tags: ${{ vars.AZURE_ACR_LOGIN_SERVER }}/track-the-hack-bot:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - uses: azure/cli@d4515bc8e518874d3c814bf5c307a1cb08ec9b35 # v2
+      - uses: azure/cli@9eb25b8360668fb0ecbafa808d40e2197b2f5f52 # v3
         if: github.ref == 'refs/heads/main'
         with:
           inlineScript: |
