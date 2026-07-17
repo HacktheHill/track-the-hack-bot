@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, isExcludedChannel, precedingUntilGap, proposalCorrections, taskCommand, validIsoDate } from "../dist/tasks.js";
+import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, isExcludedChannel, precedingUntilGap, proposalCorrections, proposalReviewAllowed, taskCommand, validIsoDate } from "../dist/tasks.js";
 import { normalizeTaskTitle, OpenProjectClient, titlesLikelyDuplicate } from "../dist/openproject.js";
 
 test("task defaults start today and use the configured due offset", () => {
@@ -80,6 +80,14 @@ test("forced extraction accepts evidence from every requested message", () => {
 	assert.equal(citesExtractionFocus(["older"], focusIds), true);
 	assert.equal(citesExtractionFocus(["newest"], focusIds), true);
 	assert.equal(citesExtractionFocus(["supporting"], focusIds), false);
+});
+
+test("proposal review permits participants, organizers, and server managers", () => {
+	assert.equal(proposalReviewAllowed("participant", ["participant"], null), true);
+	assert.equal(proposalReviewAllowed("requester", [], "requester"), true);
+	assert.equal(proposalReviewAllowed("organizer", [], null, true), true);
+	assert.equal(proposalReviewAllowed("manager", [], null, false, true), true);
+	assert.equal(proposalReviewAllowed("member", [], null), false);
 });
 
 test("older messages can resolve a high-confidence artifact reference", () => {

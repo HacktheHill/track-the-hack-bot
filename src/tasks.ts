@@ -343,6 +343,32 @@ async function requireCreator(interaction: ChatInputCommandInteraction | Message
 	return member;
 }
 
+async function canReviewProposal(
+	interaction: ButtonInteraction | ModalSubmitInteraction,
+	proposal: { permitted_reviewer_ids: string[]; requester_discord_id: string | null },
+	services: Services,
+) {
+	if (proposalReviewAllowed(interaction.user.id, proposal.permitted_reviewer_ids, proposal.requester_discord_id)) return true;
+	const member = await interaction.guild!.members.fetch(interaction.user.id);
+	return proposalReviewAllowed(
+		interaction.user.id,
+		proposal.permitted_reviewer_ids,
+		proposal.requester_discord_id,
+		member.roles.cache.has(services.config.ORGANIZER_GUILD_ORGANIZER_ROLE_ID),
+		member.permissions.has(PermissionFlagsBits.ManageGuild),
+	);
+}
+
+export function proposalReviewAllowed(
+	userId: string,
+	permittedReviewerIds: readonly string[],
+	requesterId: string | null,
+	isOrganizer = false,
+	canManageGuild = false,
+) {
+	return permittedReviewerIds.includes(userId) || requesterId === userId || isOrganizer || canManageGuild;
+}
+
 export async function isExcludedChannel(channelId: string, guild: Guild, excludedIds: ReadonlySet<string>) {
 	let channel = await guild.channels.fetch(channelId).catch(() => null);
 	for (let depth = 0; channel && depth < 5; depth++) {
@@ -1412,17 +1438,14 @@ async function handleProposalButton(interaction: ButtonInteraction, services: Se
 	if (!interaction.customId.startsWith("op-review:") && !interaction.customId.startsWith("op-dismiss:") && !interaction.customId.startsWith("op-duplicate:")) return;
 	const id = interaction.customId.split(":")[1];
 	const proposal = await services.db.proposal(id);
-	if (proposal?.status !== "pending_review" || new Date(proposal.expires_at).getTime() <= Date.now() || (!proposal.permitted_reviewer_ids.includes(interaction.user.id) && proposal.requester_discord_id !== interaction.user.id)) throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
+	if (proposal?.status !== "pending_review" || new Date(proposal.expires_at).getTime() <= Date.now() || !await canReviewProposal(interaction, proposal, services)) throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
 	if (interaction.customId.startsWith("op-dismiss:")) {
 		if (!await services.db.setProposalStatus(id, "dismissed", interaction.user.id)) {
 			throw new Error("This proposal was already handled by another reviewer.");
 		}
-		if (interaction.message.flags.has(MessageFlags.Ephemeral)) {
-			await interaction.update({ content: "Proposal dismissed.", components: [] });
-		} else {
-			await interaction.message.delete().catch(() => interaction.update({ content: "This proposal is no longer pending.", components: [] }));
-			if (!interaction.replied && !interaction.deferred) await interaction.reply({ content: "Proposal dismissed.", ephemeral: true });
-		}
+		await interaction.deferUpdate();
+		if (interaction.message.flags.has(MessageFlags.Ephemeral)) await interaction.deleteReply();
+		else await interaction.message.delete().catch(() => interaction.deleteReply());
 		return;
 	}
 	if (interaction.customId.startsWith("op-duplicate:")) {
@@ -1529,7 +1552,7 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 	}
 	const draft = interaction.customId.startsWith("op-task2:") ? await contextDraft(entityId, interaction.user.id, services) : null;
 	const proposal = interaction.customId.startsWith("op-ai:") ? await services.db.proposal(entityId) : null;
-	if (proposal && (proposal.status !== "pending_review" || new Date(proposal.expires_at).getTime() <= Date.now() || (!proposal.permitted_reviewer_ids.includes(interaction.user.id) && proposal.requester_discord_id !== interaction.user.id))) throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
+	if (proposal && (proposal.status !== "pending_review" || new Date(proposal.expires_at).getTime() <= Date.now() || !await canReviewProposal(interaction, proposal, services))) throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
 	if (proposal) {
 		const project = proposal.project_id ? (await services.openProject.projects()).find(item => item.id === proposal.project_id) : undefined;
 		const reviewedAssigneeId = await resolveAssigneeInput(interaction.fields.getTextInputValue("assignee"), interaction.guild!);
