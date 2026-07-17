@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, isExcludedChannel, precedingUntilGap, proposalCorrections, taskCommand, validIsoDate } from "../dist/tasks.js";
+import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, isExcludedChannel, precedingUntilGap, proposalCorrections, taskCommand, validIsoDate } from "../dist/tasks.js";
 import { normalizeTaskTitle, OpenProjectClient, titlesLikelyDuplicate } from "../dist/openproject.js";
 
 test("task defaults start today and use the configured due offset", () => {
@@ -73,6 +73,13 @@ test("category exclusions apply to descendant channels but channel exclusions st
 	assert.equal(await isExcludedChannel("child", guild, new Set(["category"])), true);
 	assert.equal(await isExcludedChannel("sibling", guild, new Set(["category"])), false);
 	assert.equal(await isExcludedChannel("child", guild, new Set(["child"])), true);
+});
+
+test("forced extraction accepts evidence from every requested message", () => {
+	const focusIds = new Set(["older", "newest"]);
+	assert.equal(citesExtractionFocus(["older"], focusIds), true);
+	assert.equal(citesExtractionFocus(["newest"], focusIds), true);
+	assert.equal(citesExtractionFocus(["supporting"], focusIds), false);
 });
 
 test("older messages can resolve a high-confidence artifact reference", () => {

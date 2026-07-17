@@ -53,7 +53,8 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 		assert.equal("max_tokens" in request.body, false);
 		assert.equal("temperature" in request.body, false);
 		assert.equal(request.headers.Authorization, "Bearer managed-identity-token");
-		assert.match(request.body.messages[0].content, /sole extraction focus/);
+		assert.match(request.body.messages[0].content, /one or more messages have contextRole=primary/);
+		assert.match(request.body.messages[0].content, /Evaluate each primary message independently/);
 		assert.match(request.body.messages[0].content, /timestamps/);
 		assert.match(request.body.messages[0].content, /priority_name must exactly match one of: High/);
 		assert.match(request.body.messages[0].content, /size_name must exactly match one of: Small/);

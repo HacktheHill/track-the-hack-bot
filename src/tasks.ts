@@ -127,6 +127,7 @@ type CollectedContext = {
 	sourceRecords: Map<string, { author: string; timestamp: string; text: string; attachments: Array<{ id: string; name: string; contentType?: string; url: string }> }>;
 	reverseAliases: Map<string, string>;
 	validIds: Set<string>;
+	focusIds: Set<string>;
 	primaryId: string;
 	primaryAuthorId: string;
 	explicitAssigneeId?: string;
@@ -350,6 +351,10 @@ export async function isExcludedChannel(channelId: string, guild: Guild, exclude
 		channel = await guild.channels.fetch(channel.parentId).catch(() => null);
 	}
 	return false;
+}
+
+export function citesExtractionFocus(sourceMessageIds: readonly string[], focusIds: ReadonlySet<string>) {
+	return sourceMessageIds.some(id => focusIds.has(id));
 }
 
 async function categoryIdFor(channelId: string, guild: Guild) {
@@ -1106,6 +1111,7 @@ async function collectContext(target: Message, interaction: MessageContextMenuCo
 		sourceRecords,
 		reverseAliases,
 		validIds: new Set(byId.keys()),
+		focusIds: new Set([target.id]),
 		primaryId: target.id,
 		primaryAuthorId: target.author.id,
 		explicitAssigneeId: explicitIds.length === 1 ? explicitIds[0] : undefined,
@@ -1138,7 +1144,7 @@ async function collectRecentContext(interaction: ChatInputCommandInteraction, li
 			id: attachment.id, name: attachment.name ?? "attachment", contentType: attachment.contentType ?? undefined, url: attachment.url,
 		})),
 	}]));
-	const messages = source.map((message, index) => {
+	const messages = source.map(message => {
 		const raw = message.content.replace(/<@!?(\d+)>/g, (_, id: string) => aliasFor(id));
 		return {
 			id: message.id, channelId: message.channelId, authorAlias: aliasFor(message.author.id), text: minimizeText(raw),
@@ -1146,15 +1152,15 @@ async function collectRecentContext(interaction: ChatInputCommandInteraction, li
 			attachments: [...message.attachments.values()].map(attachment => ({
 				id: attachment.id, name: attachment.name ?? "attachment", contentType: attachment.contentType ?? undefined, url: attachment.url,
 			})),
-			contextRole: index === source.length - 1 ? "primary" as const : "preceding" as const,
-			priority: index === source.length - 1,
+			contextRole: "primary" as const,
+			priority: true,
 			containedSensitiveData: containsSensitiveContent([{ id: message.id, authorAlias: "", text: raw, timestamp: "" }]),
 		};
 	});
 	const primary = source.at(-1)!;
 	const mentionedIds = [...primary.mentions.users.keys()].filter(id => id !== primary.author.id);
 	return {
-		messages, sourceRecords, reverseAliases, validIds: new Set(source.map(message => message.id)),
+		messages, sourceRecords, reverseAliases, validIds: new Set(source.map(message => message.id)), focusIds: new Set(source.map(message => message.id)),
 		primaryId: primary.id, primaryAuthorId: primary.author.id,
 		explicitAssigneeId: mentionedIds.length === 1 ? mentionedIds[0] : undefined,
 	};
@@ -1207,14 +1213,14 @@ async function completeAiContext(
 	});
 	const { result, deployment } = extraction;
 	const inputSnapshot = context.messages.map(({ id, authorAlias, text, timestamp, contextRole }) => ({ id, authorAlias, text, timestamp, contextRole }));
-	const decisionTelemetry = { taskCount: result.tasks.length, primaryMessageId: context.primaryId };
+	const decisionTelemetry = { taskCount: result.tasks.length, primaryMessageIds: [...context.focusIds] };
 	const candidate = result.tasks.find(task =>
 		task.proposed_action !== "no_action" &&
 		(task.proposed_action !== "create" || task.completion_state === "incomplete" || task.completion_state === "unknown") &&
 		(task.proposed_action !== "complete" || task.completion_state === "completed") &&
 		task.significance_score >= services.config.OPENPROJECT_AI_SIGNIFICANCE_THRESHOLD * (task.proposed_action === "create" ? 0.7 : 0.5) &&
 		["new_assignment", "clarification", "additional_requirements", "status_update", "completion_evidence", "question", "unclear"].includes(task.context_relation) &&
-		task.source_message_ids.includes(context.primaryId) &&
+		citesExtractionFocus(task.source_message_ids, context.focusIds) &&
 		task.source_message_ids.every(id => context.validIds.has(id)) &&
 		task.relevant_attachment_ids.every(id => [...context.sourceRecords.values()].some(record => record.attachments.some(attachment => attachment.id === id))),
 	);
