@@ -37,12 +37,25 @@ repository. Store at least the following as secret values:
 
 - `DISCORD_TOKEN`
 - `INTERNAL_API_SECRET`
+- `OUTREACH_DISCORD_SIGNING_SECRET`
 - `OPENPROJECT_API_KEY`
 - `DATABASE_URL`
 
 The other Discord IDs, OpenProject mappings, and feature settings can be normal
 Container App environment variables unless organizational policy requires them
 to be secrets.
+
+The optional outreach integration registers an organizer-guild message context
+command that sends only the selected message to the outreach service. Configure
+`OUTREACH_SERVICE_URL`, `OUTREACH_DISCORD_KEY_ID`,
+`OUTREACH_DISCORD_SIGNING_SECRET`, and the JSON
+`OUTREACH_DISCORD_ALLOWED_CHANNEL_IDS` together. The signing secret must be a
+dedicated secret value and must match an active key ID in the outreach service.
+Requests use the private service route and bind the method, path, timestamp,
+nonce, and exact body digest with HMAC-SHA256. Rotate keys with an overlap period
+before removing the old key. The bot sends no surrounding messages,
+attachments, reactions, or member lists, and the outreach service independently
+enforces the same guild and channel allowlists.
 
 The OpenProject integration is enabled only when all required values accepted by
 `src/config.ts` are present. For production, run `npm run migrate:db` as a

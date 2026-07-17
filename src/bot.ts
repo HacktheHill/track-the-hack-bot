@@ -3,7 +3,7 @@ import { config } from "dotenv";
 import registerHelpCommand from "./help.js";
 import registerSyncCommand, { registerGuildMemberAddHandler } from "./sync.js";
 import registerVerificationCommand from "./verification.js";
-import { loadIntegrationConfig } from "./config.js";
+import { loadIntegrationConfig, loadOutreachConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient } from "./openproject.js";
 import { registerTaskInteractions } from "./tasks.js";
@@ -13,6 +13,7 @@ import { reconcileOpenProjectUsers } from "./identity.js";
 import { AzureEmbeddingClient } from "./embeddings.js";
 import { OpenProjectRag } from "./rag.js";
 import { registerMessageScheduler } from "./scheduler.js";
+import { registerOutreachInteractions } from "./outreach.js";
 
 config();
 
@@ -61,6 +62,13 @@ client.once("clientReady", async () => {
 	registerVerificationCommand(client);
 
 	registerGuildMemberAddHandler(client);
+	const outreachConfig = loadOutreachConfig();
+	registerOutreachInteractions(client, outreachConfig);
+	if (outreachConfig) {
+		console.log("Outreach evidence integration enabled");
+	} else {
+		console.warn("Outreach evidence integration disabled: configuration is missing");
+	}
 
 	const integrationConfig = loadIntegrationConfig();
 	if (integrationConfig) {

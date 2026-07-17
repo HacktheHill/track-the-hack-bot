@@ -78,6 +78,36 @@ export function loadIntegrationConfig() {
 
 export type IntegrationConfig = NonNullable<ReturnType<typeof loadIntegrationConfig>>;
 
+const outreachSchema = z.object({
+	OUTREACH_SERVICE_URL: z.url().refine(value => new URL(value).protocol === "https:", "must use HTTPS"),
+	OUTREACH_DISCORD_KEY_ID: z.string().min(1).max(100),
+	OUTREACH_DISCORD_SIGNING_SECRET: z.string().min(32),
+	ORGANIZER_GUILD_ID: z.string().regex(/^\d{5,30}$/),
+	ORGANIZER_GUILD_ORGANIZER_ROLE_ID: z.string().regex(/^\d{5,30}$/),
+});
+const outreachChannelIdsSchema = z.array(z.string().regex(/^\d{5,30}$/)).min(1);
+
+export function loadOutreachConfig() {
+	const names = [
+		"OUTREACH_SERVICE_URL",
+		"OUTREACH_DISCORD_KEY_ID",
+		"OUTREACH_DISCORD_SIGNING_SECRET",
+		"OUTREACH_DISCORD_ALLOWED_CHANNEL_IDS",
+	] as const;
+	if (names.every(name => !process.env[name])) return null;
+	if (names.some(name => !process.env[name])) {
+		throw new Error("Outreach integration configuration is incomplete");
+	}
+	const parsed = outreachSchema.parse(process.env);
+	const channelIds = outreachChannelIdsSchema.safeParse(jsonRecord<unknown>("OUTREACH_DISCORD_ALLOWED_CHANNEL_IDS", []));
+	if (!channelIds.success) {
+		throw new Error("OUTREACH_DISCORD_ALLOWED_CHANNEL_IDS must contain Discord channel IDs");
+	}
+	return { ...parsed, allowedChannelIds: new Set(channelIds.data) };
+}
+
+export type OutreachConfig = NonNullable<ReturnType<typeof loadOutreachConfig>>;
+
 export function isOrganizerGuild(config: Pick<IntegrationConfig, "ORGANIZER_GUILD_ID">, guildId?: string | null) {
 	return guildId === config.ORGANIZER_GUILD_ID;
 }
