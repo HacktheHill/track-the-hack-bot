@@ -1322,7 +1322,6 @@ async function completeAiContext(
 			components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
 				new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and apply").setStyle(ButtonStyle.Primary),
 				new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
-				new ButtonBuilder().setCustomId(`op-more-fields:${proposal.id}`).setLabel("More fields").setStyle(ButtonStyle.Secondary),
 			)],
 		});
 		return;
@@ -1379,7 +1378,6 @@ async function completeAiContext(
 	const review = new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and edit").setStyle(ButtonStyle.Primary);
 	const dismiss = new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary);
 	const duplicate = new ButtonBuilder().setCustomId(`op-duplicate:${proposal.id}`).setLabel("Already tracked").setStyle(ButtonStyle.Secondary);
-	const moreFields = new ButtonBuilder().setCustomId(`op-more-fields:${proposal.id}`).setLabel("More fields").setStyle(ButtonStyle.Secondary);
 	const details = [
 		`Project: ${project?.name ?? "Not resolved"}`,
 		`Assignee: ${assigneeId ? `<@${assigneeId}>` : "Not inferred"}`,
@@ -1391,7 +1389,7 @@ async function completeAiContext(
 	].join("\n");
 	await deliverProposalReply(interaction, services, proposal.id, {
 		content: boundedDiscordContent(`**${candidate.title}**\n${description}${details ? `\n\n${details}` : ""}\n\nClassification: ${candidate.classification}${result.ambiguities.length ? `\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`),
-		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(review, dismiss, duplicate, moreFields)],
+		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(review, dismiss, duplicate)],
 	});
 }
 
@@ -1411,7 +1409,7 @@ async function handleSensitiveOverrideButton(interaction: ButtonInteraction, ser
 }
 
 async function handleProposalButton(interaction: ButtonInteraction, services: Services) {
-	if (!interaction.customId.startsWith("op-review:") && !interaction.customId.startsWith("op-dismiss:") && !interaction.customId.startsWith("op-duplicate:") && !interaction.customId.startsWith("op-more-fields:")) return;
+	if (!interaction.customId.startsWith("op-review:") && !interaction.customId.startsWith("op-dismiss:") && !interaction.customId.startsWith("op-duplicate:")) return;
 	const id = interaction.customId.split(":")[1];
 	const proposal = await services.db.proposal(id);
 	if (proposal?.status !== "pending_review" || new Date(proposal.expires_at).getTime() <= Date.now() || (!proposal.permitted_reviewer_ids.includes(interaction.user.id) && proposal.requester_discord_id !== interaction.user.id)) throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
@@ -1432,19 +1430,6 @@ async function handleProposalButton(interaction: ButtonInteraction, services: Se
 			throw new Error("This proposal was already handled by another reviewer.");
 		}
 		await interaction.update({ content: "Proposal marked as already tracked.", components: [] });
-		return;
-	}
-	if (interaction.customId.startsWith("op-more-fields:")) {
-		const modal = new ModalBuilder().setCustomId(`op-ai-fields:${id}`).setTitle("Edit task metadata");
-		const fields = [
-			new TextInputBuilder().setCustomId("accountable").setLabel("Accountable name or mention").setStyle(TextInputStyle.Short).setRequired(false).setValue(proposal.accountable_discord_id ? `<@${proposal.accountable_discord_id}>` : ""),
-			new TextInputBuilder().setCustomId("priority").setLabel("Priority ID (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(proposal.priority_id ? String(proposal.priority_id) : ""),
-			new TextInputBuilder().setCustomId("size").setLabel("Size option href (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(proposal.size_href ?? ""),
-			new TextInputBuilder().setCustomId("start_date").setLabel("Start date YYYY-MM-DD").setStyle(TextInputStyle.Short).setRequired(false).setValue(databaseDate(proposal.start_date) ?? ""),
-			new TextInputBuilder().setCustomId("estimate").setLabel("Estimated hours").setStyle(TextInputStyle.Short).setRequired(false).setValue(proposal.estimated_hours == null ? "" : String(proposal.estimated_hours)),
-		];
-		modal.addComponents(...fields.map(field => new ActionRowBuilder<TextInputBuilder>().addComponents(field)));
-		await interaction.showModal(modal);
 		return;
 	}
 	const project = proposal.project_id ? (await services.openProject.projects()).find(item => item.id === proposal.project_id) : undefined;
@@ -1524,32 +1509,9 @@ async function handleFinalCreationButton(interaction: ButtonInteraction, service
 }
 
 async function handleModal(interaction: ModalSubmitInteraction, services: Services) {
-	if (!interaction.customId.startsWith("op-task:") && !interaction.customId.startsWith("op-task2:") && !interaction.customId.startsWith("op-ai:") && !interaction.customId.startsWith("op-ai-fields:") && !interaction.customId.startsWith("op-edit-create:")) return;
+	if (!interaction.customId.startsWith("op-task:") && !interaction.customId.startsWith("op-task2:") && !interaction.customId.startsWith("op-ai:") && !interaction.customId.startsWith("op-edit-create:")) return;
 	await interaction.deferReply({ ephemeral: true });
 	const entityId = interaction.customId.split(":")[1];
-	if (interaction.customId.startsWith("op-ai-fields:")) {
-		const proposal = await services.db.proposal(entityId);
-		if (!proposal || proposal.status !== "pending_review" || new Date(proposal.expires_at).getTime() <= Date.now() || (!proposal.permitted_reviewer_ids.includes(interaction.user.id) && proposal.requester_discord_id !== interaction.user.id)) throw new Error("You are not permitted to edit this proposal.");
-		const accountableText = interaction.fields.getTextInputValue("accountable");
-		const accountableId = accountableText ? await resolveAssigneeInput(accountableText, interaction.guild!) : null;
-		const priorityText = interaction.fields.getTextInputValue("priority").trim();
-		const priorityId = priorityText ? Number(priorityText) : null;
-		if (priorityText && !Number.isInteger(priorityId)) throw new Error("Priority ID must be an integer.");
-		if (priorityId && !(await services.openProject.priorities()).some(priority => priority.id === priorityId)) throw new Error("Select a valid OpenProject priority.");
-		const sizeText = interaction.fields.getTextInputValue("size").trim();
-		if (sizeText && !/^\/api\/v3\/custom_options\/\d+$/.test(sizeText)) throw new Error("Size must use an OpenProject custom option href.");
-		if (sizeText && proposal.project_id) {
-			const sizeId = Number(sizeText.split("/").at(-1));
-			if (!(await services.openProject.sizeOptions(proposal.project_id)).some(size => size.id === sizeId)) throw new Error("Select a valid OpenProject size.");
-		}
-		const startDate = validIsoDate(interaction.fields.getTextInputValue("start_date") || undefined) ?? null;
-		const estimateText = interaction.fields.getTextInputValue("estimate").trim();
-		const estimatedHours = estimateText ? Number(estimateText) : null;
-		if (estimateText && (estimatedHours === null || !Number.isFinite(estimatedHours) || estimatedHours < 0)) throw new Error("Estimated hours must be a non-negative number.");
-		await services.db.updateProposalMetadata(entityId, interaction.user.id, { accountableId, priorityId, sizeHref: sizeText || null, startDate, estimatedHours });
-		await interaction.editReply("Additional proposal fields saved. Review and confirm the proposal when ready.");
-		return;
-	}
 	if (interaction.customId.startsWith("op-edit-create:")) {
 		const current = await creationDraft(entityId, interaction.user.id, services);
 		await services.db.failDraft(entityId, "edited");

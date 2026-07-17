@@ -143,7 +143,6 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 							components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
 								new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and apply").setStyle(ButtonStyle.Primary),
 								new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
-								new ButtonBuilder().setCustomId(`op-more-fields:${proposal.id}`).setLabel("More fields").setStyle(ButtonStyle.Secondary),
 							)], allowedMentions: { users: [assigneeId, accountableId].filter((id): id is string => Boolean(id)) },
 							});
 						} catch (error) {
@@ -199,7 +198,6 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 								new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and edit").setStyle(ButtonStyle.Primary),
 								new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
 								new ButtonBuilder().setCustomId(`op-duplicate:${proposal.id}`).setLabel("Already tracked").setStyle(ButtonStyle.Secondary),
-								new ButtonBuilder().setCustomId(`op-more-fields:${proposal.id}`).setLabel("More fields").setStyle(ButtonStyle.Secondary),
 							)],
 							allowedMentions: { users: [assigneeId, accountableId].filter((id): id is string => Boolean(id)) },
 						});
