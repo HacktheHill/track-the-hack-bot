@@ -369,6 +369,10 @@ export function proposalReviewAllowed(
 	return permittedReviewerIds.includes(userId) || requesterId === userId || isOrganizer || canManageGuild;
 }
 
+export function citesExtractionFocus(sourceMessageIds: readonly string[], focusIds: ReadonlySet<string>) {
+	return sourceMessageIds.some(id => focusIds.has(id));
+}
+
 export async function isExcludedChannel(channelId: string, guild: Guild, excludedIds: ReadonlySet<string>) {
 	let channel = await guild.channels.fetch(channelId).catch(() => null);
 	for (let depth = 0; channel && depth < 5; depth++) {
@@ -377,10 +381,6 @@ export async function isExcludedChannel(channelId: string, guild: Guild, exclude
 		channel = await guild.channels.fetch(channel.parentId).catch(() => null);
 	}
 	return false;
-}
-
-export function citesExtractionFocus(sourceMessageIds: readonly string[], focusIds: ReadonlySet<string>) {
-	return sourceMessageIds.some(id => focusIds.has(id));
 }
 
 async function categoryIdFor(channelId: string, guild: Guild) {
