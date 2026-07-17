@@ -104,6 +104,28 @@ test("Azure extractor retries malformed structured output only once", async () =
 	}
 });
 
+test("Azure extractor retries truncated structured output with the full token budget", async () => {
+	const originalFetch = globalThis.fetch;
+	const budgets = [];
+	globalThis.fetch = async (_url, init) => {
+		const request = JSON.parse(init.body);
+		budgets.push(request.max_completion_tokens);
+		const truncated = budgets.length === 1;
+		return new Response(JSON.stringify({
+			choices: [{ finish_reason: truncated ? "length" : "stop", message: { content: truncated ? '{"summary":"' : JSON.stringify({ summary: "", tasks: [], ambiguities: [] }) } }],
+			usage: { completion_tokens: truncated ? 1024 : 20 },
+		}), { status: 200 });
+	};
+	try {
+		await new AzureTaskExtractor(config, async () => "managed-identity-token").extract([
+			{ id: "m1", authorAlias: "USER_1", text: "Ship it", timestamp: "2026-07-13T00:00:00Z" },
+		]);
+		assert.deepEqual(budgets, [1024, 4096]);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
 test("Azure extraction returns one assessment for every supplied message", async () => {
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ summary: "", message_assessments: [{ message_id: "m1", relevance: "relevant", significance_score: 0.8, rationale: "assignment" }], tasks: [], ambiguities: [] }) } }] }), { status: 200 });

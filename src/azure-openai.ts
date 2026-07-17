@@ -13,12 +13,12 @@ export function normalizeExtractedDate(value?: string | null) {
 }
 
 const taskSchema = z.object({
-	summary: z.string(),
+	summary: z.string().max(500),
 	message_assessments: z.array(z.object({
 		message_id: z.string().min(1),
 		relevance: z.enum(["relevant", "supporting", "unrelated", "completion", "superseding", "unclear"]),
 		significance_score: z.number().min(0).max(1),
-		rationale: z.string().max(500),
+		rationale: z.string().max(200),
 	})).default([]),
 	tasks: z.array(z.object({
 		title: z.string().min(1).max(255),
@@ -31,7 +31,7 @@ const taskSchema = z.object({
 		estimated_hours: z.number().min(0).nullable(),
 		source_message_ids: z.array(z.string()).min(1),
 		relevant_attachment_ids: z.array(z.string()),
-		evidence: z.string(),
+		evidence: z.string().max(500),
 		context_relation: z.enum(["new_assignment", "clarification", "additional_requirements", "status_update", "completion_evidence", "question", "unrelated", "unclear"]),
 		proposed_action: z.enum(["create", "update", "complete", "reopen", "no_action"]).default("create"),
 		completion_state: z.enum(["incomplete", "completed", "cancelled", "superseded", "unknown"]).default("unknown"),
@@ -41,30 +41,30 @@ const taskSchema = z.object({
 			"question_or_request", "superseded", "insufficient_context",
 		]),
 	})).max(5),
-	ambiguities: z.array(z.string()),
+	ambiguities: z.array(z.string().max(300)),
 });
 
 const taskJsonSchema = {
 	type: "object", additionalProperties: false,
 	required: ["summary", "message_assessments", "tasks", "ambiguities"],
 	properties: {
-			summary: { type: "string" },
+			summary: { type: "string", maxLength: 500 },
 			message_assessments: { type: "array", items: { type: "object", additionalProperties: false, required: ["message_id", "relevance", "significance_score", "rationale"], properties: {
 				message_id: { type: "string" }, relevance: { type: "string", enum: ["relevant", "supporting", "unrelated", "completion", "superseding", "unclear"] },
-				significance_score: { type: "number", minimum: 0, maximum: 1 }, rationale: { type: "string" },
+				significance_score: { type: "number", minimum: 0, maximum: 1 }, rationale: { type: "string", maxLength: 200 },
 			} } },
-			ambiguities: { type: "array", items: { type: "string" } },
+			ambiguities: { type: "array", items: { type: "string", maxLength: 300 } },
 		tasks: { type: "array", maxItems: 5, items: { type: "object", additionalProperties: false,
 			required: ["title", "description", "assignee_alias", "start_date", "due_date", "priority_name", "size_name", "estimated_hours", "source_message_ids", "relevant_attachment_ids", "evidence", "context_relation", "proposed_action", "completion_state", "significance_score", "classification"],
 			properties: {
-				title: { type: "string" }, description: { type: "string" },
+				title: { type: "string", maxLength: 255 }, description: { type: "string", maxLength: 4000 },
 				assignee_alias: { type: ["string", "null"] },
 				start_date: { type: ["string", "null"] }, due_date: { type: ["string", "null"] },
 				priority_name: { type: ["string", "null"] }, size_name: { type: ["string", "null"] },
 				estimated_hours: { type: ["number", "null"], minimum: 0 },
 				source_message_ids: { type: "array", items: { type: "string" }, minItems: 1 },
 				relevant_attachment_ids: { type: "array", items: { type: "string" } },
-				evidence: { type: "string" },
+				evidence: { type: "string", maxLength: 500 },
 				context_relation: { type: "string", enum: ["new_assignment", "clarification", "additional_requirements", "status_update", "completion_evidence", "question", "unrelated", "unclear"] },
 				proposed_action: { type: "string", enum: ["create", "update", "complete", "reopen", "no_action"] },
 				completion_state: { type: "string", enum: ["incomplete", "completed", "cancelled", "superseded", "unknown"] },
@@ -134,12 +134,20 @@ export function containsSensitiveContent(messages: MinimizedMessage[]) {
 	return messages.some(message => message.containedSensitiveData || sensitivePatterns.some(pattern => pattern.test(message.text)));
 }
 
-export class StructuredOutputError extends Error {}
+export class StructuredOutputError extends Error {
+	constructor(message: string, readonly truncated = false) {
+		super(message);
+	}
+}
 export class SensitiveContentError extends Error {}
 
-function parseResponse(json: unknown, provider: string, latencyMs: number): ExtractionResult {
-	const content = (json as { choices?: Array<{ message?: { content?: string } }> }).choices?.[0]?.message?.content;
+function parseResponse(json: unknown, provider: string, latencyMs: number, maxCompletionTokens: number): ExtractionResult {
+	const choice = (json as { choices?: Array<{ finish_reason?: string; message?: { content?: string } }> }).choices?.[0];
+	const content = choice?.message?.content;
 	if (!content) throw new StructuredOutputError(`${provider} returned no structured content.`);
+	if (choice?.finish_reason === "length") {
+		throw new StructuredOutputError(`${provider} reached the completion token limit before returning complete structured content.`, true);
+	}
 	try {
 		const usage = (json as { usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } }).usage;
 		return {
@@ -154,6 +162,10 @@ function parseResponse(json: unknown, provider: string, latencyMs: number): Extr
 		};
 	} catch (error) {
 		if (error instanceof StructuredOutputError) throw error;
+		const completionTokens = (json as { usage?: { completion_tokens?: number } }).usage?.completion_tokens;
+		if (completionTokens !== undefined && completionTokens >= maxCompletionTokens) {
+			throw new StructuredOutputError(`${provider} reached the completion token limit before returning complete structured content.`, true);
+		}
 		throw new StructuredOutputError(`${provider} returned invalid structured content: ${(error as Error).message}`);
 	}
 }
@@ -296,7 +308,7 @@ async function invokeCompatible(options: {
 			}),
 		});
 		if (!response.ok) throw new Error(`${options.provider} ${response.status}: ${(await response.text()).slice(0, 300)}`);
-		return parseResponse(await response.json(), options.provider, Date.now() - started);
+		return parseResponse(await response.json(), options.provider, Date.now() - started, options.maxCompletionTokens);
 	} finally {
 		clearTimeout(timeout);
 	}
@@ -328,16 +340,18 @@ export class AzureTaskExtractor implements TaskExtractor {
 		if (containsSensitiveContent(messages) && !options.allowSensitiveContent) {
 			throw new SensitiveContentError("AI extraction was skipped because the conversation may contain sensitive information.");
 		}
+		let maxCompletionTokens = this.config.AZURE_OPENAI_MAX_COMPLETION_TOKENS;
 		for (let attempt = 0; ; attempt++) {
 			try {
-				return addDeterministicAmbiguities(await this.invoke(messages, deployment, options), messages);
+				return addDeterministicAmbiguities(await this.invoke(messages, deployment, options, maxCompletionTokens), messages);
 			} catch (error) {
 				if (!(error instanceof StructuredOutputError) || attempt >= 1) throw error;
+				if (error.truncated) maxCompletionTokens = 4096;
 			}
 		}
 	}
 
-	private async invoke(messages: MinimizedMessage[], deployment: string, options: ExtractionOptions) {
+	private async invoke(messages: MinimizedMessage[], deployment: string, options: ExtractionOptions, maxCompletionTokens: number) {
 		const token = await this.tokenProvider();
 		const endpoint = this.config.AZURE_OPENAI_ENDPOINT!.replace(/\/$/, "");
 		const useV1 = this.config.AZURE_OPENAI_API_VERSION === "v1";
@@ -346,7 +360,7 @@ export class AzureTaskExtractor implements TaskExtractor {
 			: `${endpoint}/openai/deployments/${encodeURIComponent(deployment)}/chat/completions?api-version=${encodeURIComponent(this.config.AZURE_OPENAI_API_VERSION)}`;
 		return invokeCompatible({
 			url, model: deployment, messages, provider: `azure:${deployment}`, token,
-			maxCompletionTokens: this.config.AZURE_OPENAI_MAX_COMPLETION_TOKENS,
+			maxCompletionTokens,
 			maxContextChars: this.config.OPENPROJECT_AI_MAX_CONTEXT_CHARS,
 			maxImages: this.config.OPENPROJECT_AI_MAX_IMAGE_ATTACHMENTS,
 			metadata: options.metadata,

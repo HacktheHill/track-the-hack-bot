@@ -41,7 +41,7 @@ const envSchema = z.object({
 	AZURE_OPENAI_ENDPOINT: z.url(),
 	AZURE_OPENAI_DEPLOYMENT: z.string().min(1),
 	AZURE_OPENAI_API_VERSION: z.string().default("v1"),
-	AZURE_OPENAI_MAX_COMPLETION_TOKENS: z.coerce.number().int().min(64).max(4096).default(1024),
+	AZURE_OPENAI_MAX_COMPLETION_TOKENS: z.coerce.number().int().min(64).max(4096).default(4096),
 	OPENPROJECT_AI_MAX_CONTEXT_CHARS: z.coerce.number().int().min(2000).max(100000).default(16000),
 	OPENPROJECT_AI_MAX_IMAGE_ATTACHMENTS: z.coerce.number().int().min(0).max(20).default(0),
 	OPENPROJECT_AI_SIGNIFICANCE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.5),
