@@ -143,6 +143,7 @@ test("AI task descriptions retain URLs from cited messages", () => {
 test("ephemeral proposal controls omit Dismiss and remain actionable", () => {
 	assert.deepEqual(manualProposalButtons("proposal", "update").map(button => button.toJSON().custom_id), ["op-review:proposal"]);
 	assert.deepEqual(manualProposalButtons("proposal", "create").map(button => button.toJSON().custom_id), ["op-review:proposal", "op-duplicate:proposal"]);
+	assert.deepEqual(manualProposalButtons("proposal", "create", 42).map(button => button.toJSON().custom_id), ["op-review:proposal", "op-use-existing:proposal:42", "op-duplicate:proposal"]);
 });
 
 test("AI task descriptions retain attachment links without verbatim source text", () => {

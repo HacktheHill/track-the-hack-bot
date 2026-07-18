@@ -244,7 +244,8 @@ export class Database {
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS claim_expires_at TIMESTAMPTZ");
 		await this.pool.query(`UPDATE task_proposals SET status='superseded', review_outcome='superseded',
 			error='This proposal predates safe update operations. Extract the discussion again.', reviewed_at=now(), updated_at=now()
-			WHERE status='pending_review' AND action <> 'create' AND operation_schema_version IS NULL`);
+			WHERE status='pending_review' AND action <> 'create'
+			AND (operation_schema_version IS NULL OR target_work_package_id IS NULL OR target_lock_version IS NULL OR content_operation IS NULL)`);
 		await this.pool.query("ALTER TABLE task_proposals DROP CONSTRAINT IF EXISTS task_proposals_openproject_work_package_id_key");
 		await this.pool.query("ALTER TABLE ai_extraction_events ADD COLUMN IF NOT EXISTS trigger_id TEXT");
 		await this.pool.query("ALTER TABLE ai_extraction_events ADD COLUMN IF NOT EXISTS input_snapshot JSONB");
@@ -511,7 +512,7 @@ export class Database {
 		estimatedHours?: number;
 		sourceMessageIds: string[];
 		sourceLinks?: string[];
-		classification: string;
+		classification?: string;
 		modelDeployment: string;
 		permittedReviewerIds?: string[];
 		evidence?: string;
@@ -528,8 +529,13 @@ export class Database {
 		contentOperation?: ContentOperation;
 		contentMarkdown?: string | null;
 	}) {
+		if (input.action && input.action !== "create" && (!input.targetWorkPackageId || input.targetLockVersion === undefined)) {
+			throw new Error("Existing-task proposals require a target task and lock version.");
+		}
 		const id = randomUUID();
-		const fingerprint = [...input.sourceMessageIds].sort().join(":") + `:${input.action ?? "create"}:${input.targetWorkPackageId ?? "new"}:${input.title.toLowerCase()}`;
+		const normalizedTitle = input.title.toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+		const sourceAnchor = [...input.sourceMessageIds].sort()[0] ?? "no-source";
+		const fingerprint = `${input.channelId}:${sourceAnchor}:${input.action ?? "create"}:${input.targetWorkPackageId ?? "new"}:${normalizedTitle}`;
 		const result = await this.pool.query<{ id: string }>(
 			`INSERT INTO task_proposals
 			(id, requester_discord_id, channel_id, project_id, title, description,
@@ -564,7 +570,7 @@ export class Database {
 			 input.description, input.assigneeDiscordId ?? null, input.accountableDiscordId ?? null,
 			 input.priorityId ?? null, input.sizeHref ?? null,
 			 input.startDate ?? null, input.dueDate ?? null, input.estimatedHours ?? null,
-			 input.sourceMessageIds, fingerprint, input.sourceLinks ?? [], input.classification, input.modelDeployment,
+			 input.sourceMessageIds, fingerprint, input.sourceLinks ?? [], input.classification ?? null, input.modelDeployment,
 			 input.permittedReviewerIds ?? (input.requesterId ? [input.requesterId] : []), input.action ?? "create", input.targetWorkPackageId ?? null, input.targetLockVersion ?? null,
 			 input.evidence ?? null, input.ambiguities ?? [], input.latencyMs ?? null,
 			 input.tokenUsage ?? null, input.escalationReason ?? null,
@@ -581,6 +587,25 @@ export class Database {
 		);
 		if (!existing.rows[0]) throw new Error("Proposal idempotency conflict could not be reconciled.");
 		return { id: existing.rows[0].id, reused: true };
+	}
+
+	async convertProposalToUpdate(input: {
+		id: string;
+		projectId: number;
+		targetWorkPackageId: number;
+		targetLockVersion: number;
+		metadataPatch: ProposalMetadataPatch;
+		contentOperation: ContentOperation;
+		contentMarkdown: string | null;
+	}) {
+		const result = await this.pool.query(
+			`UPDATE task_proposals SET action='update', target_work_package_id=$2, target_lock_version=$3,
+			 operation_schema_version=1, metadata_patch=$4, content_operation=$5, content_markdown=$6,
+			 project_id=$7, updated_at=now()
+			 WHERE id=$1 AND status='pending_review' AND action='create'`,
+			[input.id, input.targetWorkPackageId, input.targetLockVersion, jsonParameter(input.metadataPatch), input.contentOperation, input.contentMarkdown, input.projectId],
+		);
+		if (result.rowCount !== 1) throw new Error("This proposal is no longer available for target selection.");
 	}
 
 	async proposal(id: string) {

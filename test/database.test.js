@@ -125,6 +125,31 @@ test("existing-task proposals persist explicit operations and independent checkp
 	assert.match(queries[2].sql, /comment_activity_id/);
 });
 
+test("existing-task proposals require a target and lock version", async () => {
+	const db = databaseWithPool({ async query() { throw new Error("should not query"); } });
+	await assert.rejects(db.createProposal({
+		channelId: "channel", projectId: 3, title: "Update wording", description: "Add revisions",
+		sourceMessageIds: ["message"], modelDeployment: "model", action: "update",
+		contentOperation: "postComment", contentMarkdown: "- Change wording",
+	}), /require a target task and lock version/);
+});
+
+test("reviewers can safely retarget a create proposal as an update", async () => {
+	let updated;
+	const db = databaseWithPool({
+		async query(sql, values) {
+			updated = { sql, values };
+			return { rowCount: 1, rows: [] };
+		},
+	});
+	await db.convertProposalToUpdate({
+		id: "proposal", projectId: 7, targetWorkPackageId: 42, targetLockVersion: 3,
+		metadataPatch: {}, contentOperation: "postComment", contentMarkdown: "## Update\n\n- Revise it.",
+	});
+	assert.match(updated.sql, /action='update'/);
+	assert.deepEqual(updated.values, ["proposal", 42, 3, "{}", "postComment", "## Update\n\n- Revise it.", 7]);
+});
+
 test("proposal submission and completion persist timing and correction metadata", async () => {
 	const queries = [];
 	const db = databaseWithPool({

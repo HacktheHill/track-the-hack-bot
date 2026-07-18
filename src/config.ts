@@ -32,7 +32,6 @@ const envSchema = z.object({
 	OPENPROJECT_RAG_SYNC_INTERVAL_SECONDS: z.coerce.number().int().min(60).default(600),
 	OPENPROJECT_RAG_SIMILARITY_THRESHOLD: z.coerce.number().min(0).max(1).default(0.55),
 	OPENPROJECT_RUN_MIGRATIONS: z.string().default("false").transform(value => value.toLowerCase() === "true"),
-	OPENPROJECT_AI_SIGNIFICANCE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.5),
 	OPENPROJECT_BATCH_IDLE_SECONDS: z.coerce.number().int().min(30).default(300),
 	OPENPROJECT_DEFAULT_DUE_DAYS: z.coerce.number().int().min(0).max(365).default(7),
 	OPENPROJECT_DEFAULT_START_TODAY: z.string().default("true").transform(value => value.toLowerCase() === "true"),

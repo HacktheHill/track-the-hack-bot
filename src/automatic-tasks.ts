@@ -4,11 +4,15 @@ import { isOrganizerGuild, type IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient } from "./openproject.js";
 import { boundedDiscordContent, defaultAiDueDate, formatAiTaskDescription } from "./tasks.js";
-import { explicitlyReferencesExistingWork, resolveProposedAction, type OpenProjectRag } from "./rag.js";
-import { describeProposalOperations, planExistingTaskOperations, taskSourcesAreRelevant } from "./task-proposals.js";
+import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
+import { describeProposalOperations, planExistingTaskOperations, taskReferencesAreValid } from "./task-proposals.js";
 
 type AutomaticServices = { config: IntegrationConfig; db: Database; extractor: TaskExtractor; openProject: OpenProjectClient; rag?: OpenProjectRag };
 type Batch = { messages: Message[]; timer: NodeJS.Timeout };
+
+export function automaticFocalWindows<T>(messages: readonly T[], limit = 30) {
+	return messages.map((_, index) => messages.slice(Math.max(0, index - limit + 1), index + 1));
+}
 
 async function categoryProject(message: Message, services: AutomaticServices) {
 	if (!message.inGuild()) return undefined;
@@ -36,13 +40,15 @@ async function isExcludedChannel(message: Message, services: AutomaticServices) 
 export function registerAutomaticTaskDetection(client: Client, services: AutomaticServices) {
 	if (services.config.OPENPROJECT_AUTOMATION_MODE === "off" || !services.extractor.enabled) return;
 	const batches = new Map<string, Batch>();
+	const activeFlushes = new Map<string, Promise<void>>();
 
 	const flush = async (channelId: string) => {
 		const batch = batches.get(channelId);
 		if (!batch) return;
 		batches.delete(channelId);
-		const source = batch.messages.slice(-30);
-		if (source[0] && await isExcludedChannel(source[0], services)) return;
+		const batchSource = batch.messages.slice(-30);
+		if (batchSource[0] && await isExcludedChannel(batchSource[0], services)) return;
+		for (const source of automaticFocalWindows(batchSource, 8)) {
 		const aliases = new Map<string, string>();
 		const reverse = new Map<string, string>();
 		const aliasFor = (id: string) => {
@@ -75,10 +81,11 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			};
 		});
 		try {
-			const projectId = source[0] ? await categoryProject(source[0], services) : undefined;
+			const channelProjectId = source[0] ? await categoryProject(source[0], services) : undefined;
 			const priorities = await services.openProject.priorities();
-			const sizes = projectId ? await services.openProject.sizeOptions(projectId) : [];
+			const sizes = channelProjectId ? await services.openProject.sizeOptions(channelProjectId) : [];
 			const extraction = await services.extractor.extract(minimized, {
+				mode: "automatic",
 				metadata: { priorities: priorities.map(priority => priority.name), sizes: sizes.map(size => size.value) },
 			});
 			const { result, deployment } = extraction;
@@ -96,20 +103,15 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					url: attachment.url,
 				})),
 			}]));
-			for (const task of result.tasks.filter(item =>
-				item.proposed_action !== "no_action" &&
-				(item.proposed_action !== "create" || item.completion_state === "incomplete") &&
-				(item.proposed_action !== "complete" || item.completion_state === "completed") &&
-				item.significance_score >= services.config.OPENPROJECT_AI_SIGNIFICANCE_THRESHOLD &&
-				["new_assignment", "clarification", "additional_requirements", "status_update", "completion_evidence", "unclear"].includes(item.context_relation))) {
-				if (!task.source_message_ids.every(id => source.some(message => message.id === id))) continue;
-				if (!task.source_message_ids.includes(primary?.id ?? "")) continue;
-				if (!taskSourcesAreRelevant(task.source_message_ids, result.message_assessments)) continue;
+			const validMessageIds = new Set(source.map(message => message.id));
+			const focalMessageIds = new Set(primary ? [primary.id] : []);
+			const validAttachmentIds = new Set(source.flatMap(message => [...message.attachments.keys()]));
+			for (const task of result.tasks) {
+				if (!taskReferencesAreValid(task, validMessageIds, focalMessageIds, validAttachmentIds)) continue;
+				let projectId = channelProjectId;
 				const assigneeId = task.assignee_alias ? reverse.get(task.assignee_alias) : undefined;
 				const accountableId = source.find(message => task.source_message_ids.includes(message.id))?.author.id;
 				const priority = task.priority_name ? priorities.find(item => item.name.toLocaleLowerCase() === task.priority_name!.toLocaleLowerCase()) : undefined;
-				const size = task.size_name ? sizes.find(item => item.value.toLocaleLowerCase() === task.size_name!.toLocaleLowerCase()) : undefined;
-				const dueDate = task.due_date ?? defaultAiDueDate(new Date(), priority?.name, size?.value, services.config.BOT_TIME_ZONE);
 				const sourceLinks = task.source_message_ids.map(id => `https://discord.com/channels/${source[0]?.guildId ?? ""}/${source.find(item => item.id === id)?.channelId ?? channelId}/${id}`);
 				const description = formatAiTaskDescription(task.description, minimized, sourceRecords, task.source_message_ids, task.relevant_attachment_ids);
 				const similar = projectId && services.rag ? await services.rag.findSimilar(projectId, task.title, description) : [];
@@ -117,16 +119,27 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					title: task.title, proposedAction: task.proposed_action,
 					workPackageId: similar[0]?.workPackageId, similarity: similar[0]?.similarity,
 				});
-				const match = services.config.OPENPROJECT_RAG_MODE === "review" && similar[0]?.similarity >= services.config.OPENPROJECT_RAG_SIMILARITY_THRESHOLD ? similar[0] : undefined;
-				const explicitExistingWork = explicitlyReferencesExistingWork(task.source_message_ids.map(id => sourceRecords.get(id)?.text ?? ""));
-				const action = resolveProposedAction(task.proposed_action, services.config.OPENPROJECT_RAG_MODE, Boolean(match), explicitExistingWork);
+				const suggestedMatch = services.config.OPENPROJECT_RAG_MODE === "review" && similar[0]?.similarity >= services.config.OPENPROJECT_RAG_SIMILARITY_THRESHOLD ? similar[0] : undefined;
+				const targetResolution = await resolveProposalTarget({
+					action: task.proposed_action,
+					sourceTexts: task.source_message_ids.map(id => sourceRecords.get(id)?.text ?? ""),
+					openProjectBaseUrl: services.config.OPENPROJECT_BASE_URL,
+					projectId,
+					ragMode: services.config.OPENPROJECT_RAG_MODE,
+					suggestedMatch,
+					workPackage: id => services.openProject.workPackage(id),
+				});
+				projectId = targetResolution.projectId;
+				const { action, match, target } = targetResolution;
 				if (action === "no_action") continue;
 				if (action !== "create" && !match) continue;
+				const candidateSizes = projectId === channelProjectId ? sizes : projectId ? await services.openProject.sizeOptions(projectId) : [];
+				const size = task.size_name ? candidateSizes.find(item => item.value.toLocaleLowerCase() === task.size_name!.toLocaleLowerCase()) : undefined;
+				const dueDate = task.due_date ?? defaultAiDueDate(new Date(), priority?.name, size?.value, services.config.BOT_TIME_ZONE);
 				if (match && action !== "create") {
-					const target = await services.openProject.workPackage(match.workPackageId);
 					const operations = planExistingTaskOperations({
-						workPackage: target,
-						requestedAction: task.proposed_action === "no_action" ? "update" : task.proposed_action,
+						workPackage: target!,
+						requestedAction: task.proposed_action,
 						contentIntent: task.content_intent,
 						description,
 						metadataFields: task.metadata_change_fields,
@@ -147,9 +160,9 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						priorityId: priority?.id, sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined,
 						startDate: task.start_date ?? undefined, dueDate, estimatedHours: task.estimated_hours ?? undefined,
 						sourceMessageIds: task.source_message_ids, sourceLinks,
-						classification: task.classification, modelDeployment: deployment, permittedReviewerIds: [...reviewers], evidence: task.evidence,
+						modelDeployment: deployment, permittedReviewerIds: [...reviewers], evidence: task.evidence,
 						ambiguities: [...result.ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
-						action, targetWorkPackageId: match.workPackageId, targetLockVersion: target.lockVersion,
+						action, targetWorkPackageId: match.workPackageId, targetLockVersion: target!.lockVersion,
 						metadataPatch: operations.metadataPatch, contentOperation: operations.contentOperation,
 						contentMarkdown: operations.contentMarkdown,
 						initialSnapshot: {
@@ -178,10 +191,9 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					createdProposals++;
 					continue;
 				}
-				if (projectId && await services.openProject.possibleDuplicate(projectId, task.title)) {
-					duplicates++;
-					continue;
-				}
+				const advisory = suggestedMatch
+					? `Possible existing task: #${suggestedMatch.workPackageId} (${Math.round(suggestedMatch.similarity * 100)}% similarity). This proposal will still create a new task.`
+					: undefined;
 				const citedIds = new Set(task.source_message_ids);
 				const reviewers = new Set<string>(source.filter(message => citedIds.has(message.id)).map(message => message.author.id));
 				if (assigneeId) reviewers.add(assigneeId);
@@ -195,9 +207,9 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						priorityId: priority?.id, sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined,
 						startDate: task.start_date ?? undefined, dueDate, estimatedHours: task.estimated_hours ?? undefined,
 						sourceMessageIds: task.source_message_ids, sourceLinks,
-					classification: task.classification, modelDeployment: deployment,
+					modelDeployment: deployment,
 					permittedReviewerIds: [...reviewers],
-					evidence: task.evidence, ambiguities: result.ambiguities,
+					evidence: task.evidence, ambiguities: [...result.ambiguities, ...(advisory ? [advisory] : [])],
 					latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
 						escalationReason: extraction.escalationReason,
 						initialSnapshot: {
@@ -218,9 +230,10 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					if (channel?.isSendable()) {
 						try {
 						await channel.send({
-					content: boundedDiscordContent(`${assigneeId ? `<@${assigneeId}> ` : ""}${accountableId && accountableId !== assigneeId ? `<@${accountableId}> ` : ""}Proposed OpenProject task: **${task.title}**\n${description}`),
+							content: boundedDiscordContent(`${assigneeId ? `<@${assigneeId}> ` : ""}${accountableId && accountableId !== assigneeId ? `<@${accountableId}> ` : ""}Proposed OpenProject task: **${task.title}**\n${description}${advisory ? `\n\n${advisory}` : ""}`),
 							components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
 								new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and edit").setStyle(ButtonStyle.Primary),
+								...(suggestedMatch ? [new ButtonBuilder().setCustomId(`op-use-existing:${proposal.id}:${suggestedMatch.workPackageId}`).setLabel(`Use existing #${suggestedMatch.workPackageId}`).setStyle(ButtonStyle.Secondary)] : []),
 								new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
 								new ButtonBuilder().setCustomId(`op-duplicate:${proposal.id}`).setLabel("Already tracked").setStyle(ButtonStyle.Secondary),
 							)],
@@ -242,7 +255,6 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				tokenUsage: extraction.usage,
 				triggerId: source.at(-1)?.id,
 				inputSnapshot: minimized.map(({ id, authorAlias, text, timestamp, contextRole }) => ({ id, authorAlias, text, timestamp, contextRole })),
-				messageAssessments: result.message_assessments,
 				decision: { taskCount: result.tasks.length, proposalCount: createdProposals, duplicateCount: duplicates, ragEvaluations },
 			});
 		} catch (error) {
@@ -254,6 +266,16 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			}).catch(auditError => console.error("Automatic task extraction metrics failed", { channelId, error: (auditError as Error).message }));
 			console.error("Automatic task extraction failed", { channelId, error: (error as Error).message });
 		}
+		}
+	};
+	const enqueueFlush = (channelId: string) => {
+		const previous = activeFlushes.get(channelId) ?? Promise.resolve();
+		const next = previous.catch(() => undefined).then(() => flush(channelId)).catch(error => {
+			console.error("Automatic task extraction flush failed", { channelId, error: (error as Error).message });
+		}).finally(() => {
+			if (activeFlushes.get(channelId) === next) activeFlushes.delete(channelId);
+		});
+		activeFlushes.set(channelId, next);
 	};
 
 	client.on("messageCreate", async message => {
@@ -262,7 +284,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 		const existing = batches.get(message.channelId);
 		if (existing) clearTimeout(existing.timer);
 		const messages = [...(existing?.messages ?? []), message].slice(-30);
-		const timer = setTimeout(() => void flush(message.channelId), services.config.OPENPROJECT_BATCH_IDLE_SECONDS * 1000);
+		const timer = setTimeout(() => enqueueFlush(message.channelId), services.config.OPENPROJECT_BATCH_IDLE_SECONDS * 1000);
 		batches.set(message.channelId, { messages, timer });
 	});
 	console.log(`Automatic task extraction enabled in ${services.config.OPENPROJECT_AUTOMATION_MODE} mode`);

@@ -8,10 +8,18 @@ export const metadataFieldNames = [
 export type MetadataFieldName = typeof metadataFieldNames[number];
 export type ContentIntent = "none" | "update_note" | "replace_description";
 export type ContentOperation = "none" | "descriptionReplacement" | "postComment";
-export type MessageAssessment = {
-	message_id: string;
-	relevance: "relevant" | "supporting" | "unrelated" | "completion" | "superseding" | "unclear";
-};
+
+export function taskReferencesAreValid(
+	task: { source_message_ids: readonly string[]; relevant_attachment_ids: readonly string[] },
+	validMessageIds: ReadonlySet<string>,
+	focalMessageIds: ReadonlySet<string>,
+	validAttachmentIds: ReadonlySet<string>,
+) {
+	return task.source_message_ids.length > 0 &&
+		task.source_message_ids.every(id => validMessageIds.has(id)) &&
+		task.source_message_ids.some(id => focalMessageIds.has(id)) &&
+		task.relevant_attachment_ids.every(id => validAttachmentIds.has(id));
+}
 
 export type ProposalMetadataPatch = {
 	subject?: string;
@@ -68,14 +76,6 @@ export function isEffectivelyEmptyDescription(value: string) {
 		.filter(Boolean)
 		.filter(line => !/^https:\/\/discord\.com\/channels\/\d+\/\d+\/\d+\/?$/i.test(line));
 	return remaining.length === 0;
-}
-
-export function taskSourcesAreRelevant(sourceMessageIds: readonly string[], assessments: readonly MessageAssessment[]) {
-	const byId = new Map(assessments.map(assessment => [assessment.message_id, assessment.relevance]));
-	const relevance = sourceMessageIds.map(id => byId.get(id));
-	return relevance.length > 0 &&
-		relevance.every(value => value === "relevant" || value === "supporting" || value === "completion") &&
-		relevance.some(value => value === "relevant" || value === "completion");
 }
 
 function stripGeneratedReferenceSections(value: string) {

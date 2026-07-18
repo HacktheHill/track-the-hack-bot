@@ -1,24 +1,42 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { corpusWindowSchema, isRuntimeCreateCandidate } from "../dist/evaluate-ai.js";
+import { corpusWindowSchema, runtimeProposalCandidates } from "../dist/evaluate-ai.js";
 import { OpenProjectClient, workPackageChangesApplied } from "../dist/openproject.js";
-import { explicitlyReferencesExistingWork, lexicalTitleSimilarity, OpenProjectRag, resolveProposedAction } from "../dist/rag.js";
+import { explicitWorkPackageId, lexicalTitleSimilarity, OpenProjectRag, resolveProposalTarget, resolveProposedAction } from "../dist/rag.js";
 
 test("RAG shadow mode never changes proposal actions", () => {
-	assert.equal(resolveProposedAction("create", "shadow", true), "create");
-	assert.equal(resolveProposedAction("update", "shadow", true), "no_action");
-	assert.equal(resolveProposedAction("complete", "off", true), "no_action");
-	assert.equal(resolveProposedAction("create", "review", true), "update");
-	assert.equal(resolveProposedAction("complete", "review", true), "complete");
+	assert.equal(resolveProposedAction("create", false), "create");
+	assert.equal(resolveProposedAction("create", true), "create");
+	assert.equal(resolveProposedAction("update", false), "no_action");
+	assert.equal(resolveProposedAction("complete", true), "complete");
 });
 
-test("unmatched provisional updates fall back to creation only for new ideas", () => {
-	assert.equal(resolveProposedAction("update", "review", false, false), "create");
-	assert.equal(resolveProposedAction("update", "review", false, true), "no_action");
-	assert.equal(resolveProposedAction("complete", "review", false, false), "no_action");
-	assert.equal(explicitlyReferencesExistingWork(["What if we reach out to the student union for bulk fruit prices?"]), false);
-	assert.equal(explicitlyReferencesExistingWork(["Add this information to the task"]), true);
-	assert.equal(explicitlyReferencesExistingWork(["Update task #2149 with the revised colors"]), true);
+test("RAG never converts actions and requires a target for existing work", () => {
+	assert.equal(resolveProposedAction("update", false), "no_action");
+	assert.equal(resolveProposedAction("complete", false), "no_action");
+	assert.equal(resolveProposedAction("reopen", true), "reopen");
+});
+
+test("exact OpenProject references are resolved without semantic phrase matching", () => {
+	assert.equal(explicitWorkPackageId(["Update task #2149 with the revised colors"]), 2149);
+	assert.equal(explicitWorkPackageId(["See https://projects.example.org/work_packages/42/activity"], "https://projects.example.org"), 42);
+	assert.equal(explicitWorkPackageId(["See https://other.example/work_packages/42"], "https://projects.example.org"), undefined);
+	assert.equal(explicitWorkPackageId(["Update the existing sponsor task"]), undefined);
+});
+
+test("an invalid explicit target never falls back to a semantic match", async () => {
+	const result = await resolveProposalTarget({
+		action: "update",
+		sourceTexts: ["Update task #42"],
+		openProjectBaseUrl: "https://projects.example.org",
+		projectId: 7,
+		ragMode: "review",
+		suggestedMatch: { workPackageId: 99, similarity: 0.9 },
+		workPackage: async id => ({ id, subject: "Other", lockVersion: 1, project: { id: 8 }, _links: {} }),
+	});
+	assert.equal(result.action, "no_action");
+	assert.equal(result.match, undefined);
+	assert.equal(result.target, undefined);
 });
 
 test("OpenProject work packages follow HAL pagination beyond the first page", async () => {
@@ -175,22 +193,30 @@ test("RAG combines semantic candidates with lexical title matches", async () => 
 	) >= 0.3);
 });
 
-test("AI evaluator uses automatic-runtime create candidate semantics", () => {
-	const candidate = {
-		proposed_action: "create", completion_state: "incomplete", significance_score: 0.7, context_relation: "unclear",
-	};
-	assert.equal(isRuntimeCreateCandidate(candidate, 0.5), true);
-	assert.equal(isRuntimeCreateCandidate({ ...candidate, completion_state: "completed" }, 0.5), false);
-	assert.equal(isRuntimeCreateCandidate({ ...candidate, significance_score: 0.49 }, 0.5), false);
-	assert.equal(isRuntimeCreateCandidate({ ...candidate, proposed_action: "update" }, 0.5), false);
+test("AI evaluator uses production grounding and target semantics for every action", () => {
+	const candidate = { proposed_action: "update", source_message_ids: ["m1"], relevant_attachment_ids: [] };
+	const messages = [{ id: "m1", authorAlias: "USER_1", text: "Update it", timestamp: "2026-07-16T00:00:00Z", priority: true }];
+	assert.deepEqual(runtimeProposalCandidates([candidate], messages), []);
+	assert.deepEqual(runtimeProposalCandidates([candidate], messages, { availableTargetSourceMessageIds: [["m1"]] }), [candidate]);
+	assert.deepEqual(runtimeProposalCandidates([{ ...candidate, source_message_ids: ["other"] }], messages), []);
 });
 
-test("AI evaluator corpus accepts optional action, completion, and relevance expectations", () => {
+test("AI evaluator corpus accepts expected proposal lists", () => {
 	const parsed = corpusWindowSchema.parse({
-		id: "window", messages: [{ id: "m1", authorAlias: "USER_1", text: "Do it", timestamp: "2026-07-16T00:00:00Z" }],
-		expected: { taskExists: true, action: "create", completion: "incomplete", relevance: { m1: "relevant" } },
+		id: "window", mode: "automatic", messages: [{ id: "m1", authorAlias: "USER_1", text: "Do it", timestamp: "2026-07-16T00:00:00Z", priority: true }],
+		expected: { proposals: [{ action: "create", titleIncludes: ["task"], sourceMessageIds: ["m1"] }] },
 	});
-	assert.equal(parsed.expected.action, "create");
-	assert.equal(parsed.expected.completion, "incomplete");
-	assert.equal(parsed.expected.relevance.m1, "relevant");
+	assert.equal(parsed.expected.proposals[0].action, "create");
+	assert.deepEqual(parsed.expected.proposals[0].sourceMessageIds, ["m1"]);
+});
+
+test("automatic evaluation windows mirror one production focal message", () => {
+	assert.throws(() => corpusWindowSchema.parse({
+		id: "window", mode: "automatic",
+		messages: [
+			{ id: "m1", authorAlias: "USER_1", text: "First", timestamp: "2026-07-16T00:00:00Z", priority: true },
+			{ id: "m2", authorAlias: "USER_2", text: "Second", timestamp: "2026-07-16T00:01:00Z" },
+		],
+		expected: { proposals: [] },
+	}), /final position/);
 });

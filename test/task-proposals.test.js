@@ -5,7 +5,7 @@ import {
 	formatGeneratedTaskDescription,
 	isEffectivelyEmptyDescription,
 	planExistingTaskOperations,
-	taskSourcesAreRelevant,
+	taskReferencesAreValid,
 } from "../dist/task-proposals.js";
 
 test("effectively empty descriptions ignore managed provenance but preserve real context", () => {
@@ -56,16 +56,14 @@ test("Markdown composition deduplicates source links and appends its marker", ()
 	assert.ok(markdown.endsWith("<!-- marker -->"));
 });
 
-test("task citations must pass their per-message relevance review", () => {
-	const assessments = [
-		{ message_id: "recent", relevance: "relevant" },
-		{ message_id: "old-topic", relevance: "unrelated" },
-		{ message_id: "detail", relevance: "supporting" },
-	];
-	assert.equal(taskSourcesAreRelevant(["recent", "detail"], assessments), true);
-	assert.equal(taskSourcesAreRelevant(["recent", "old-topic"], assessments), false);
-	assert.equal(taskSourcesAreRelevant(["detail"], assessments), false);
-	assert.equal(taskSourcesAreRelevant(["missing"], assessments), false);
+test("task references require valid IDs and at least one focal message", () => {
+	const validMessages = new Set(["recent", "detail"]);
+	const focalMessages = new Set(["recent"]);
+	const validAttachments = new Set(["image"]);
+	assert.equal(taskReferencesAreValid({ source_message_ids: ["recent", "detail"], relevant_attachment_ids: ["image"] }, validMessages, focalMessages, validAttachments), true);
+	assert.equal(taskReferencesAreValid({ source_message_ids: ["detail"], relevant_attachment_ids: [] }, validMessages, focalMessages, validAttachments), false);
+	assert.equal(taskReferencesAreValid({ source_message_ids: ["recent", "missing"], relevant_attachment_ids: [] }, validMessages, focalMessages, validAttachments), false);
+	assert.equal(taskReferencesAreValid({ source_message_ids: ["recent"], relevant_attachment_ids: ["missing"] }, validMessages, focalMessages, validAttachments), false);
 });
 
 test("generated descriptions use bullets and one verified references section", () => {

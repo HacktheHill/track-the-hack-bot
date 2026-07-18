@@ -4,25 +4,73 @@ import { AzureEmbeddingClient, embeddingContentHash } from "./embeddings.js";
 import { OpenProjectClient, type WorkPackage } from "./openproject.js";
 
 export function resolveProposedAction(
-	action: "create" | "update" | "complete" | "reopen" | "no_action",
-	ragMode: IntegrationConfig["OPENPROJECT_RAG_MODE"],
-	hasMatch: boolean,
-	explicitExistingWork = true,
+	action: "create" | "update" | "complete" | "reopen",
+	hasTarget: boolean,
 ) {
-	if (action === "no_action") return "no_action" as const;
-	if (action === "create") return ragMode === "review" && hasMatch ? "update" as const : "create" as const;
-	if (action === "update" && !hasMatch && !explicitExistingWork) return "create" as const;
-	return ragMode === "review" && hasMatch ? action : "no_action" as const;
+	if (action === "create") return "create" as const;
+	return hasTarget ? action : "no_action" as const;
 }
 
-export function explicitlyReferencesExistingWork(texts: readonly string[]) {
-	return texts.some(text =>
-		/\b(?:existing|current|already[- ]?(?:tracked|open|created)|previously created)\s+(?:task|ticket|work package|issue)\b/i.test(text) ||
-		/\b(?:task|ticket|work package|issue)\s*#?\d+\b/i.test(text) ||
-		/\b(?:update|edit|change|close|complete|reopen)\s+(?:the|this|that)\s+(?:task|ticket|work package|issue)\b/i.test(text) ||
-		/\b(?:add|apply|post|record)\s+(?:(?:this|that)(?:\s+information)?|it)\s+(?:to|on)\s+(?:the|this|that)\s+(?:task|ticket|work package|issue)\b/i.test(text) ||
-		/https?:\/\/[^\s]*openproject[^\s]*\/work_packages\/\d+/i.test(text),
-	);
+export function explicitWorkPackageId(texts: readonly string[], openProjectBaseUrl?: string) {
+	const allowedOrigin = openProjectBaseUrl ? new URL(openProjectBaseUrl).origin : undefined;
+	for (const text of texts) {
+		const urls = text.match(/https?:\/\/[^\s>]+/gi) ?? [];
+		const urlId = urls.map(value => {
+			try {
+				const url = new URL(value);
+				if (allowedOrigin && url.origin !== allowedOrigin) return undefined;
+				return /\/work_packages\/(\d+)(?:\/|$)/.exec(url.pathname)?.[1];
+			} catch { return undefined; }
+		}).find(Boolean);
+		const reference = /\b(?:task|ticket|work package|issue)\s*#(\d+)\b/i.exec(text);
+		const value = urlId ?? reference?.[1];
+		if (value) return Number(value);
+	}
+	return undefined;
+}
+
+type ProposalAction = "create" | "update" | "complete" | "reopen";
+type TargetMatch = { workPackageId: number; similarity: number };
+
+function workPackageProjectId(workPackage?: WorkPackage) {
+	return (workPackage?.project?.id ?? Number(workPackage?._links.project?.href.split("/").at(-1))) || undefined;
+}
+
+export async function resolveProposalTarget(options: {
+	action: ProposalAction;
+	sourceTexts: readonly string[];
+	openProjectBaseUrl: string;
+	projectId?: number;
+	ragMode: IntegrationConfig["OPENPROJECT_RAG_MODE"];
+	suggestedMatch?: TargetMatch;
+	workPackage: (id: number) => Promise<WorkPackage>;
+}) {
+	if (options.action === "create") return { action: "create" as const, projectId: options.projectId };
+	const explicitTargetId = explicitWorkPackageId(options.sourceTexts, options.openProjectBaseUrl);
+	let match: TargetMatch | undefined;
+	let target: WorkPackage | undefined;
+	let projectId = options.projectId;
+	if (explicitTargetId !== undefined) {
+		target = await options.workPackage(explicitTargetId).catch(() => undefined);
+		const targetProjectId = workPackageProjectId(target);
+		if (target && targetProjectId && (!projectId || targetProjectId === projectId)) {
+			match = { workPackageId: target.id, similarity: 1 };
+			projectId = targetProjectId;
+		} else {
+			target = undefined;
+		}
+	} else if (options.ragMode === "review" && options.suggestedMatch) {
+		match = options.suggestedMatch;
+		target = await options.workPackage(match.workPackageId);
+		const targetProjectId = workPackageProjectId(target);
+		if (!targetProjectId || (projectId && targetProjectId !== projectId)) {
+			match = undefined;
+			target = undefined;
+		} else {
+			projectId = targetProjectId;
+		}
+	}
+	return { action: resolveProposedAction(options.action, Boolean(target)), projectId, match, target };
 }
 
 function descriptionOf(workPackage: WorkPackage) {

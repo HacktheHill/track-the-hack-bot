@@ -162,9 +162,8 @@ AI extraction runs in every channel except those listed in the blocked or
 excluded ID lists. Excluded category IDs apply to all descendant channels.
 
 Review outcomes store timestamps, status counters, token/latency values,
-per-field edits, minimized inputs, per-message relevance, and proposal
-revisions for 90 days. Raw Discord transcripts are never copied into task
-descriptions.
+per-field edits, minimized inputs, proposal decisions, and revisions for 90
+days. Raw Discord transcripts are never copied into task descriptions.
 Production uses `review` mode: AI may post a proposal, but only a permitted
 human reviewer can create or dismiss the task.
 
@@ -174,24 +173,28 @@ OpenProject title and description embeddings into PostgreSQL with pgvector but
 does not propose updates. The `sync:embeddings` job is suitable for a
 Container Apps scheduled job.
 
-When RAG review is enabled, close matches become reviewed updates instead of
-duplicates. Existing-task metadata is changed only when the discussion
+RAG matches are advisory: they are shown as possible duplicates and never turn
+a proposed new task into an update or suppress its review card without a
+reviewer decision. A reviewer can keep the new task or use the suggested
+existing task, which safely replans the proposal as an update. For an action
+that explicitly updates, completes, or reopens existing work, an exact task
+reference or a close RAG result nominates the target and the reviewer confirms
+its task ID. Existing-task metadata is changed only when the discussion
 explicitly requests that field. New requirements and clarifications are posted
 as Markdown activity comments, while a description is replaced only when the
 existing description has no substantive content or the discussion explicitly
-requests a rewrite. Metadata and comments can be applied together. Completion
-and reopening change status without replacing the title or description. Every
-mutation checks the OpenProject `lockVersion`, and correlated comments are
-deduplicated across retries.
+requests a rewrite. Every mutation checks the OpenProject `lockVersion`, and
+correlated comments are deduplicated across retries.
 
 AI-generated descriptions use Markdown headings and bullet lists when the
 discussion contains enough structure. Sparse discussions remain concise rather
 than receiving invented objectives, acceptance criteria, or notes.
 
 Azure OpenAI authentication uses managed identity rather than an API key. The
-bot bounds the context, aliases Discord identities, redacts common credentials
-and contact details, and rejects matching sensitive discussions before making
-an Azure request. For a manually requested draft, the requester can explicitly
+bot bounds the context and total image count, aliases Discord identities,
+redacts common credentials and contact details, and rejects matching sensitive
+text before making an Azure request. Image contents cannot be screened before
+they are sent to Azure. For a manually requested draft, the requester can explicitly
 override a false positive for that one minimized request; the approval expires
 after ten minutes and is never available to automatic extraction. This reduces
 exposure but is not a guarantee. Evaluate extraction on representative
@@ -204,10 +207,14 @@ the repository:
 npm run evaluate:ai -- /secure/path/discord-windows.jsonl
 ```
 
-Each line contains `id`, `messages`, and `expected`, where `expected` includes
-`taskExists` and may include `classification`, `assigneeAlias`, `dueDate`, and
-`sourceMessageIds`. The command writes mode-0600 JSON and Markdown reports next
-to the corpus. Use 100 representative windows and track 95% task precision,
+Each line contains `id`, `mode`, `messages`, and `expected.proposals`. Every
+expected proposal includes `action`, `titleIncludes`, and `sourceMessageIds`,
+and may include `assigneeAlias` and `dueDate`. Existing-task cases can list
+candidate-specific `routing.availableTargetSourceMessageIds` to model the
+validated project/RAG state. Use an empty
+proposal list for a no-action window. The command writes mode-0600 JSON and
+Markdown reports next to the corpus. Use 100
+representative windows and track 95% proposal precision,
 90% owner/deadline accuracy, and 99% valid structured output as improvement
 targets rather than automatic activation gates.
 Aggregate baselines and their limitations are recorded in

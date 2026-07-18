@@ -39,13 +39,13 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 	let request;
 	globalThis.fetch = async (url, init) => {
 		request = { url: String(url), headers: init.headers, body: JSON.parse(init.body) };
-		return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ summary: "", tasks: [], ambiguities: [] }) } }] }), { status: 200 });
+		return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ tasks: [], ambiguities: [] }) } }] }), { status: 200 });
 	};
 	try {
 		const extractor = new AzureTaskExtractor(config, async () => "managed-identity-token");
 		await extractor.extract(
 			[{ id: "m1", authorAlias: "USER_1", text: "Ship it", timestamp: "2026-07-13T00:00:00Z", contextRole: "primary" }],
-			{ metadata: { priorities: ["High"], sizes: ["Small"] } },
+			{ mode: "manual", metadata: { priorities: ["High"], sizes: ["Small"] } },
 		);
 		assert.equal(request.url, "https://azure.example/openai/v1/chat/completions");
 		assert.equal(request.body.model, "task-extractor");
@@ -53,21 +53,22 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 		assert.equal("max_tokens" in request.body, false);
 		assert.equal("temperature" in request.body, false);
 		assert.equal(request.headers.Authorization, "Bearer managed-identity-token");
-		assert.match(request.body.messages[0].content, /one or more messages have contextRole=primary/);
-		assert.match(request.body.messages[0].content, /Evaluate each primary message independently/);
+		assert.match(request.body.messages[0].content, /Manual extraction is intentionally broad/);
+		assert.match(request.body.messages[0].content, /Evaluate each focal message independently/);
 		assert.match(request.body.messages[0].content, /timestamps/);
 		assert.match(request.body.messages[0].content, /priority_name must exactly match one of: High/);
 		assert.match(request.body.messages[0].content, /size_name must exactly match one of: Small/);
 		assert.match(request.body.messages[0].content, /content_intent=update_note/);
 		assert.match(request.body.messages[0].content, /only explicitly requested existing-task metadata changes/);
 		assert.match(request.body.messages[0].content, /do not invent missing objectives/i);
-		assert.match(request.body.messages[0].content, /compare every cited message to that task's specific title and scope/);
 		assert.match(request.body.messages[0].content, /heading and bullet list/);
 		assert.match(request.body.messages[0].content, /application adds verified links separately/);
-		assert.match(request.body.messages[0].content, /most recent message has priority=true/);
-		assert.match(request.body.messages[0].content, /Tentative wording/);
-		assert.match(request.body.messages[0].content, /primary reply that endorses a preceding idea/);
+		assert.match(request.body.messages[0].content, /Human review decides whether to accept it/);
 		assert.ok(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("content_intent"));
+		assert.equal("message_assessments" in request.body.response_format.json_schema.schema.properties, false);
+		assert.equal(request.body.response_format.json_schema.schema.properties.tasks.items.properties.significance_score, undefined);
+		assert.deepEqual(request.body.response_format.json_schema.schema.properties.tasks.items.properties.proposed_action.enum, ["create", "update", "complete", "reopen"]);
+		assert.equal(request.body.response_format.json_schema.schema.properties.tasks.items.properties.metadata_change_fields.maxItems, 4);
 		assert.deepEqual(JSON.parse(request.body.messages[1].content[0].text)[0], {
 			id: "m1", authorAlias: "USER_1", text: "Ship it",
 			timestamp: "2026-07-13T00:00:00Z", contextRole: "primary",
@@ -82,15 +83,16 @@ test("Azure extractor sends image attachments as multimodal inputs", async () =>
 	let request;
 	globalThis.fetch = async (url, init) => {
 		request = { url: String(url), body: JSON.parse(init.body) };
-		return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ summary: "", tasks: [], ambiguities: [] }) } }] }), { status: 200 });
+		return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ tasks: [], ambiguities: [] }) } }] }), { status: 200 });
 	};
 	try {
 		await new AzureTaskExtractor({ ...config, OPENPROJECT_AI_MAX_IMAGE_ATTACHMENTS: 8 }, async () => "token").extract([{
 			id: "m1", authorAlias: "USER_1", text: "Review this screenshot", timestamp: "2026-07-13T00:00:00Z", contextRole: "primary",
 			attachments: [{ id: "a1", name: "schema.png", contentType: "image/png", url: "https://cdn.discordapp.com/attachments/1/2/schema.png" }],
 		}]);
-		assert.equal(request.body.messages[1].content[1].type, "image_url");
-		assert.equal(request.body.messages[1].content[1].image_url.detail, "high");
+		assert.equal(request.body.messages[1].content[1].text, "Attachment a1: schema.png");
+		assert.equal(request.body.messages[1].content[2].type, "image_url");
+		assert.equal(request.body.messages[1].content[2].image_url.detail, "high");
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
@@ -101,7 +103,7 @@ test("Azure extractor retries malformed structured output only once", async () =
 	let calls = 0;
 	globalThis.fetch = async () => {
 		calls += 1;
-		const content = calls === 1 ? "not-json" : JSON.stringify({ summary: "", tasks: [], ambiguities: [] });
+		const content = calls === 1 ? "not-json" : JSON.stringify({ tasks: [], ambiguities: [] });
 		return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
 	};
 	try {
@@ -122,7 +124,7 @@ test("Azure extractor retries truncated structured output with the full token bu
 		budgets.push(request.max_completion_tokens);
 		const truncated = budgets.length === 1;
 		return new Response(JSON.stringify({
-			choices: [{ finish_reason: truncated ? "length" : "stop", message: { content: truncated ? '{"summary":"' : JSON.stringify({ summary: "", tasks: [], ambiguities: [] }) } }],
+			choices: [{ finish_reason: truncated ? "length" : "stop", message: { content: truncated ? '{"tasks":[' : JSON.stringify({ tasks: [], ambiguities: [] }) } }],
 			usage: { completion_tokens: truncated ? 1024 : 20 },
 		}), { status: 200 });
 	};
@@ -136,16 +138,20 @@ test("Azure extractor retries truncated structured output with the full token bu
 	}
 });
 
-test("Azure extraction returns one assessment for every supplied message", async () => {
+test("Azure image limit applies globally across all messages", async () => {
 	const originalFetch = globalThis.fetch;
-	globalThis.fetch = async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ summary: "", message_assessments: [{ message_id: "m1", relevance: "relevant", significance_score: 0.8, rationale: "assignment" }], tasks: [], ambiguities: [] }) } }] }), { status: 200 });
+	let request;
+	globalThis.fetch = async (_url, init) => {
+		request = JSON.parse(init.body);
+		return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ tasks: [], ambiguities: [] }) } }] }), { status: 200 });
+	};
 	try {
-		const result = await new AzureTaskExtractor(config, async () => "token").extract([
-			{ id: "m1", authorAlias: "USER_1", text: "Ship it", timestamp: "2026-07-13T00:00:00Z" },
-			{ id: "m2", authorAlias: "USER_2", text: "Unrelated", timestamp: "2026-07-13T00:01:00Z" },
+		await new AzureTaskExtractor({ ...config, OPENPROJECT_AI_MAX_IMAGE_ATTACHMENTS: 1 }, async () => "token").extract([
+			{ id: "m1", authorAlias: "USER_1", text: "First", timestamp: "2026-07-13T00:00:00Z", priority: true, attachments: [{ id: "a1", name: "one.png", contentType: "image/png", url: "https://cdn.discordapp.com/attachments/1/2/one.png" }] },
+			{ id: "m2", authorAlias: "USER_2", text: "Second", timestamp: "2026-07-13T00:01:00Z", attachments: [{ id: "a2", name: "two.png", contentType: "image/png", url: "https://cdn.discordapp.com/attachments/1/2/two.png" }] },
 		]);
-		assert.deepEqual(result.result.message_assessments.map(item => item.message_id), ["m1", "m2"]);
-		assert.equal(result.result.message_assessments[1].relevance, "unclear");
+		assert.equal(request.messages[1].content.filter(part => part.type === "image_url").length, 1);
+		assert.equal(request.messages[1].content.filter(part => part.type === "text" && part.text.startsWith("Attachment ")).length, 1);
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
@@ -204,7 +210,7 @@ test("a manual override permits one explicitly approved sensitive request", asyn
 	globalThis.fetch = async () => {
 		requested = true;
 		return new Response(JSON.stringify({
-			choices: [{ message: { content: JSON.stringify({ summary: "", tasks: [], ambiguities: [] }) } }],
+			choices: [{ message: { content: JSON.stringify({ tasks: [], ambiguities: [] }) } }],
 		}), { status: 200 });
 	};
 	try {

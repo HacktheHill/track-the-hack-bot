@@ -19,6 +19,7 @@ import {
 	ButtonInteraction,
 	Message,
 	MessageFlags,
+	type InteractionEditReplyOptions,
 	PermissionFlagsBits,
 	StringSelectMenuBuilder,
 	UserSelectMenuBuilder,
@@ -29,9 +30,9 @@ import { randomUUID } from "node:crypto";
 import { isOrganizerGuild, type IntegrationConfig, type TeamMapping } from "./config.js";
 import { correctionFields, Database, type CorrectionFlags, type ProposalMetrics } from "./database.js";
 import { OpenProjectClient, OpenProjectRequestError, workPackageChangesApplied } from "./openproject.js";
-import { containsSensitiveContent, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, StructuredOutputError, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
-import { explicitlyReferencesExistingWork, resolveProposedAction, type OpenProjectRag } from "./rag.js";
-import { composeOpenProjectMarkdown, describeProposalOperations, formatGeneratedTaskDescription, planExistingTaskOperations, taskSourcesAreRelevant, type ProposalMetadataPatch } from "./task-proposals.js";
+import { containsSensitiveContent, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, StructuredOutputError, type ExtractedTasks, type ExtractionResult, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
+import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
+import { composeOpenProjectMarkdown, describeProposalOperations, formatGeneratedTaskDescription, planExistingTaskOperations, taskReferencesAreValid, type ProposalMetadataPatch } from "./task-proposals.js";
 
 export const taskCommand = new SlashCommandBuilder()
 	.setName("task")
@@ -205,15 +206,26 @@ async function deliverProposalReply(
 	interaction: MessageContextMenuCommandInteraction | ChatInputCommandInteraction | ButtonInteraction,
 	services: Services,
 	proposalId: string,
-	payload: Parameters<typeof interaction.editReply>[0],
+	payload: InteractionEditReplyOptions,
 	markInitialDeliveryFailure = true,
+	replaceReply = true,
 ) {
 	try {
-		await interaction.editReply(payload);
+		if (replaceReply) await interaction.editReply(payload);
+		else await interaction.followUp({ content: payload.content ?? undefined, components: payload.components, flags: MessageFlags.Ephemeral });
 	} catch (error) {
 		if (markInitialDeliveryFailure) await services.db.markProposalDeliveryFailed(proposalId, (error as Error).message);
 		throw error;
 	}
+}
+
+async function deliverAiStatus(
+	interaction: MessageContextMenuCommandInteraction | ChatInputCommandInteraction | ButtonInteraction,
+	content: string,
+	replaceReply: boolean,
+) {
+	if (replaceReply) await interaction.editReply(content);
+	else await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
 }
 
 async function contextDraft(id: string, userId: string, services: Services) {
@@ -387,11 +399,15 @@ export function citesExtractionFocus(sourceMessageIds: readonly string[], focusI
 	return sourceMessageIds.some(id => focusIds.has(id));
 }
 
-export function manualProposalButtons(proposalId: string, action: "create" | "update" | "complete" | "reopen") {
+export function manualProposalButtons(proposalId: string, action: "create" | "update" | "complete" | "reopen", suggestedWorkPackageId?: number) {
 	const buttons = [new ButtonBuilder()
 		.setCustomId(`op-review:${proposalId}`)
 		.setLabel(action === "create" ? "Review and edit" : "Review and apply")
 		.setStyle(ButtonStyle.Primary)];
+	if (action === "create" && suggestedWorkPackageId) buttons.push(new ButtonBuilder()
+		.setCustomId(`op-use-existing:${proposalId}:${suggestedWorkPackageId}`)
+		.setLabel(`Use existing #${suggestedWorkPackageId}`)
+		.setStyle(ButtonStyle.Secondary));
 	if (action === "create") buttons.push(new ButtonBuilder()
 		.setCustomId(`op-duplicate:${proposalId}`)
 		.setLabel("Already tracked")
@@ -1281,64 +1297,64 @@ async function completeAiContext(
 	const tentativeSizes = tentativeProjectId ? await services.openProject.sizeOptions(tentativeProjectId) : [];
 	const extraction = await services.extractor.extract(context.messages, {
 		allowSensitiveContent,
+		mode: "manual",
 		metadata: { priorities: priorities.map(priority => priority.name), sizes: tentativeSizes.map(size => size.value) },
 	});
 	const { result, deployment } = extraction;
 	const inputSnapshot = context.messages.map(({ id, authorAlias, text, timestamp, contextRole }) => ({ id, authorAlias, text, timestamp, contextRole }));
 	const decisionTelemetry = { taskCount: result.tasks.length, primaryMessageIds: [...context.focusIds] };
-	const candidate = result.tasks.find(task =>
-		task.proposed_action !== "no_action" &&
-		(task.proposed_action !== "create" || task.completion_state === "incomplete" || task.completion_state === "unknown") &&
-		(task.proposed_action !== "complete" || task.completion_state === "completed") &&
-		task.significance_score >= services.config.OPENPROJECT_AI_SIGNIFICANCE_THRESHOLD * (task.proposed_action === "create" ? 0.7 : 0.5) &&
-		["new_assignment", "clarification", "additional_requirements", "status_update", "completion_evidence", "question", "unclear"].includes(task.context_relation) &&
-		citesExtractionFocus(task.source_message_ids, context.focusIds) &&
-		taskSourcesAreRelevant(task.source_message_ids, result.message_assessments) &&
-		task.source_message_ids.every(id => context.validIds.has(id)) &&
-		task.relevant_attachment_ids.every(id => [...context.sourceRecords.values()].some(record => record.attachments.some(attachment => attachment.id === id))),
-	);
-	if (!candidate) {
-		const strongest = [...result.tasks].sort((left, right) => right.significance_score - left.significance_score)[0];
-		const rejectionReasons: string[] = [];
-		if (strongest) {
-			if (strongest.proposed_action === "no_action") rejectionReasons.push("the strongest candidate was marked no action");
-			if (strongest.proposed_action === "create" && !["incomplete", "unknown"].includes(strongest.completion_state)) rejectionReasons.push(`it was marked ${strongest.completion_state}`);
-			if (strongest.proposed_action === "complete" && strongest.completion_state !== "completed") rejectionReasons.push("completion was not confirmed");
-			const threshold = services.config.OPENPROJECT_AI_SIGNIFICANCE_THRESHOLD * (strongest.proposed_action === "create" ? 0.7 : 0.5);
-			if (strongest.significance_score < threshold) rejectionReasons.push(`its significance score ${strongest.significance_score.toFixed(2)} was below ${threshold.toFixed(2)}`);
-			if (!["new_assignment", "clarification", "additional_requirements", "status_update", "completion_evidence", "question", "unclear"].includes(strongest.context_relation)) rejectionReasons.push(`its relation was ${strongest.context_relation}`);
-			if (!citesExtractionFocus(strongest.source_message_ids, context.focusIds)) rejectionReasons.push("it did not cite the newest focus message");
-			if (!taskSourcesAreRelevant(strongest.source_message_ids, result.message_assessments)) rejectionReasons.push("one or more cited messages failed relevance review");
-			if (!strongest.source_message_ids.every(id => context.validIds.has(id))) rejectionReasons.push("it cited a message outside the selected context");
-		}
+	const validAttachmentIds = new Set([...context.sourceRecords.values()].flatMap(record => record.attachments.map(attachment => attachment.id)));
+	const candidates = result.tasks.filter(task => taskReferencesAreValid(task, context.validIds, context.focusIds, validAttachmentIds));
+	if (!candidates.length) {
 		await services.db.recordExtraction({
 			source: "manual", outcome: "no_task", modelDeployment: deployment, triggerId: context.primaryId,
 			 taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
-			inputSnapshot, messageAssessments: result.message_assessments, decision: { ...decisionTelemetry, outcome: "no_task" },
+			inputSnapshot, decision: { ...decisionTelemetry, outcome: "no_task", invalidGroundingCount: result.tasks.length },
 		});
-		const detail = strongest
-			? `AI returned ${result.tasks.length} candidate${result.tasks.length === 1 ? "" : "s"}; the strongest was rejected because ${rejectionReasons.join(", ") || "it did not pass the proposal gates"}.`
-			: "AI returned no task candidates. The newest message was treated as the focus and older messages as supporting context.";
-		await interaction.editReply(`No significant incomplete work was found in the selected context. ${detail}`);
+		const detail = result.tasks.length ? "The returned candidates did not cite the selected message or used unknown source IDs." : "AI returned no actionable candidates.";
+		await interaction.editReply(`No task proposal was found in the selected context. ${detail}`);
 		return;
 	}
+	for (const [index, candidate] of candidates.entries()) {
+		try {
+			await completeAiCandidate(interaction, services, context, extraction, candidate, priorities, inputSnapshot, decisionTelemetry, index === 0);
+		} catch (error) {
+			if (index === 0) throw error;
+			await interaction.followUp({ content: `Another candidate could not be prepared: ${(error as Error).message}`, flags: MessageFlags.Ephemeral });
+		}
+	}
+}
+
+async function completeAiCandidate(
+	interaction: MessageContextMenuCommandInteraction | ChatInputCommandInteraction | ButtonInteraction,
+	services: Services,
+	context: CollectedContext,
+	extraction: ExtractionResult,
+	candidate: ExtractedTasks["tasks"][number],
+	priorities: Awaited<ReturnType<OpenProjectClient["priorities"]>>,
+	inputSnapshot: Array<{ id: string; authorAlias: string; text: string; timestamp: string; contextRole?: MinimizedMessage["contextRole"] }>,
+	decisionTelemetry: { taskCount: number; primaryMessageIds: string[] },
+	replaceReply: boolean,
+) {
+	const { result, deployment } = extraction;
 	const assigneeId = context.explicitAssigneeId ?? (candidate.assignee_alias ? context.reverseAliases.get(candidate.assignee_alias) : undefined);
 	const accountableId = context.primaryAuthorId;
 	const assigneeMember = assigneeId ? await interaction.guild!.members.fetch(assigneeId).catch(() => null) : null;
-	const projectId = await resolveProject(null, interaction.channelId, interaction.guild!, assigneeMember, services);
+	const initialProjectId = await resolveProject(null, interaction.channelId, interaction.guild!, assigneeMember, services);
+	let projectId = initialProjectId;
 	const project = projectId ? (await services.openProject.projects()).find(item => item.id === projectId) : undefined;
 	const priority = candidate.priority_name
 		? priorities.find(item => item.name.toLocaleLowerCase() === candidate.priority_name!.toLocaleLowerCase())
 		: undefined;
 	const sizes = projectId ? await services.openProject.sizeOptions(projectId) : [];
-	const size = candidate.size_name
+	let size = candidate.size_name
 		? sizes.find(item => item.value.toLocaleLowerCase() === candidate.size_name!.toLocaleLowerCase())
 		: undefined;
 	const inferredDate = (value: string | null) => {
 		try { return validIsoDate(value); } catch { return undefined; }
 	};
 	const startDate = inferredDate(candidate.start_date);
-	const dueDate = inferredDate(candidate.due_date) ?? defaultAiDueDate(new Date(), priority?.name, size?.value, services.config.BOT_TIME_ZONE);
+	let dueDate = inferredDate(candidate.due_date) ?? defaultAiDueDate(new Date(), priority?.name, size?.value, services.config.BOT_TIME_ZONE);
 	const description = formatAiTaskDescription(
 		candidate.description,
 		context.messages,
@@ -1351,34 +1367,37 @@ async function completeAiContext(
 		return messageUrl(interaction.guildId!, source?.channelId ?? interaction.channelId!, id);
 	});
 	const similar = projectId && services.rag ? await services.rag.findSimilar(projectId, candidate.title, description) : [];
-	const match = services.config.OPENPROJECT_RAG_MODE === "review" && similar[0]?.similarity >= services.config.OPENPROJECT_RAG_SIMILARITY_THRESHOLD ? similar[0] : undefined;
-	const explicitExistingWork = explicitlyReferencesExistingWork(candidate.source_message_ids.map(id => context.sourceRecords.get(id)?.text ?? ""));
-	const action = resolveProposedAction(candidate.proposed_action, services.config.OPENPROJECT_RAG_MODE, Boolean(match), explicitExistingWork);
+	const suggestedMatch = services.config.OPENPROJECT_RAG_MODE === "review" && similar[0]?.similarity >= services.config.OPENPROJECT_RAG_SIMILARITY_THRESHOLD ? similar[0] : undefined;
+	const targetResolution = await resolveProposalTarget({
+		action: candidate.proposed_action,
+		sourceTexts: candidate.source_message_ids.map(id => context.sourceRecords.get(id)?.text ?? ""),
+		openProjectBaseUrl: services.config.OPENPROJECT_BASE_URL,
+		projectId,
+		ragMode: services.config.OPENPROJECT_RAG_MODE,
+		suggestedMatch,
+		workPackage: id => services.openProject.workPackage(id),
+	});
+	projectId = targetResolution.projectId;
+	if (projectId !== initialProjectId) {
+		const targetSizes = projectId ? await services.openProject.sizeOptions(projectId) : [];
+		size = candidate.size_name ? targetSizes.find(item => item.value.toLocaleLowerCase() === candidate.size_name!.toLocaleLowerCase()) : undefined;
+		dueDate = inferredDate(candidate.due_date) ?? defaultAiDueDate(new Date(), priority?.name, size?.value, services.config.BOT_TIME_ZONE);
+	}
+	const { action, match, target } = targetResolution;
 	if (action === "no_action") {
 		await services.db.recordExtraction({
 			source: "manual", outcome: "no_task", modelDeployment: deployment, triggerId: context.primaryId,
 			taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
-			inputSnapshot, messageAssessments: result.message_assessments,
+			inputSnapshot,
 			decision: { ...decisionTelemetry, requestedAction: candidate.proposed_action, outcome: "no_existing_match" },
 		});
-		await interaction.editReply("The discussion suggests an existing-task change, but no sufficiently close OpenProject task was found.");
-		return;
-	}
-	if (action !== "create" && !match) {
-		await services.db.recordExtraction({
-			source: "manual", outcome: "no_task", modelDeployment: deployment, triggerId: context.primaryId,
-			taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
-			inputSnapshot, messageAssessments: result.message_assessments,
-			decision: { ...decisionTelemetry, requestedAction: candidate.proposed_action, outcome: "no_existing_match" },
-		});
-		await interaction.editReply("The discussion suggests an existing-task change, but no sufficiently close OpenProject task was found.");
+		await deliverAiStatus(interaction, `The discussion suggests an existing-task ${candidate.proposed_action}, but no sufficiently close OpenProject task was found.`, replaceReply);
 		return;
 	}
 	if (projectId && match && action !== "create") {
-		const target = await services.openProject.workPackage(match.workPackageId);
 		const operations = planExistingTaskOperations({
-			workPackage: target,
-			requestedAction: candidate.proposed_action === "no_action" ? "update" : candidate.proposed_action,
+			workPackage: target!,
+			requestedAction: candidate.proposed_action,
 			contentIntent: candidate.content_intent,
 			description,
 			metadataFields: candidate.metadata_change_fields,
@@ -1389,7 +1408,7 @@ async function completeAiContext(
 			},
 		});
 		if (operations.contentOperation === "none" && Object.keys(operations.metadataPatch).length === 0) {
-			await interaction.editReply("The discussion matched an existing task but did not contain an explicit update to apply.");
+			await deliverAiStatus(interaction, "The discussion matched an existing task but did not contain an explicit update to apply.", replaceReply);
 			return;
 		}
 		const proposal = await services.db.createProposal({
@@ -1398,11 +1417,11 @@ async function completeAiContext(
 			priorityId: priority?.id, sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate, dueDate,
 			estimatedHours: candidate.estimated_hours ?? undefined, sourceMessageIds: candidate.source_message_ids,
 			sourceLinks,
-			classification: candidate.classification, modelDeployment: deployment, evidence: candidate.evidence,
+			modelDeployment: deployment, evidence: candidate.evidence,
 			ambiguities: [...result.ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: extraction.latencyMs,
 			tokenUsage: extraction.usage, escalationReason: extraction.escalationReason,
 			retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS, action,
-			targetWorkPackageId: match.workPackageId, targetLockVersion: target.lockVersion,
+			targetWorkPackageId: match.workPackageId, targetLockVersion: target!.lockVersion,
 			metadataPatch: operations.metadataPatch, contentOperation: operations.contentOperation,
 			contentMarkdown: operations.contentMarkdown,
 			initialSnapshot: proposalSnapshot({
@@ -1417,21 +1436,21 @@ async function completeAiContext(
 			await services.db.recordExtraction({
 				source: "manual", outcome: "duplicate", modelDeployment: deployment, triggerId: context.primaryId,
 				taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
-				inputSnapshot, messageAssessments: result.message_assessments,
+				inputSnapshot,
 				decision: { ...decisionTelemetry, action, targetWorkPackageId: match.workPackageId, outcome: "duplicate" },
 			});
 			const existing = await services.db.proposal(proposal.id);
 			if (!existing || !proposalIsReviewable(existing)) {
-				await interaction.editReply("This discussion already has a task update proposal that is no longer pending.");
+				await deliverAiStatus(interaction, "This discussion already has a task update proposal that is no longer pending.", replaceReply);
 				return;
 			}
 			if (!existing.operation_schema_version || !existing.content_operation) {
 				await services.db.supersedeLegacyProposal(existing.id);
-				await interaction.editReply("The existing proposal used the older unsafe update format and was invalidated. Run extraction again.");
+				await deliverAiStatus(interaction, "The existing proposal used the older unsafe update format and was invalidated. Run extraction again.", replaceReply);
 				return;
 			}
 			if (!await canReviewProposal(interaction, existing, services)) {
-				await interaction.editReply("This discussion already has a pending task update proposal, but you are not one of its reviewers.");
+				await deliverAiStatus(interaction, "This discussion already has a pending task update proposal, but you are not one of its reviewers.", replaceReply);
 				return;
 			}
 			redisplayed = existing;
@@ -1439,7 +1458,7 @@ async function completeAiContext(
 			await services.db.recordExtraction({
 				source: "manual", outcome: "proposal", modelDeployment: deployment, triggerId: context.primaryId,
 				taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
-				inputSnapshot, messageAssessments: result.message_assessments,
+				inputSnapshot,
 				decision: { ...decisionTelemetry, action, targetWorkPackageId: match.workPackageId, similarity: match.similarity, outcome: "proposal" },
 			});
 		}
@@ -1452,23 +1471,12 @@ async function completeAiContext(
 		await deliverProposalReply(interaction, services, proposal.id, {
 			content: boundedDiscordContent(`**Possible ${displayedAction} for #${displayedTarget}**\n${operationSummary.map(item => `- ${item}`).join("\n")}${warning}\n\n${redisplayed?.title ?? candidate.title}\n${redisplayed?.description ?? description}${redisplayed ? "" : `\n\nSimilarity: ${Math.round(match.similarity * 100)}%`}`),
 			components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...manualProposalButtons(proposal.id, displayedAction))],
-		}, !proposal.reused);
+		}, !proposal.reused, replaceReply);
 		return;
 	}
-	if (projectId) {
-		const duplicate = await services.openProject.possibleDuplicate(projectId, candidate.title);
-		if (duplicate) {
-			await services.db.recordExtraction({
-				source: "manual", outcome: "duplicate", modelDeployment: deployment,
-				taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
-			inputSnapshot, messageAssessments: result.message_assessments, decision: {
-				...decisionTelemetry, outcome: "duplicate", ragMatch: similar[0] ? { workPackageId: similar[0].workPackageId, similarity: similar[0].similarity } : null,
-			},
-			});
-			await interaction.editReply(`A similar open task already exists: ${services.openProject.workPackageUrl(duplicate.id)}`);
-			return;
-		}
-	}
+	const advisory = suggestedMatch
+		? `Possible existing task: #${suggestedMatch.workPackageId} (${Math.round(suggestedMatch.similarity * 100)}% similarity). This proposal will still create a new task.`
+		: undefined;
 	const proposal = await services.db.createProposal({
 		requesterId: interaction.user.id, channelId: interaction.channelId, projectId,
 		title: candidate.title, description,
@@ -1476,8 +1484,8 @@ async function completeAiContext(
 		sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined,
 		startDate, dueDate, estimatedHours: candidate.estimated_hours ?? undefined,
 		sourceMessageIds: candidate.source_message_ids,
-		classification: candidate.classification, modelDeployment: deployment,
-		evidence: candidate.evidence, ambiguities: result.ambiguities,
+		modelDeployment: deployment,
+		evidence: candidate.evidence, ambiguities: [...result.ambiguities, ...(advisory ? [advisory] : [])],
 		latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
 					escalationReason: extraction.escalationReason,
 					sourceLinks,
@@ -1493,15 +1501,15 @@ async function completeAiContext(
 		await services.db.recordExtraction({
 			source: "manual", outcome: "duplicate", modelDeployment: deployment,
 			taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
-			inputSnapshot, messageAssessments: result.message_assessments, decision: { ...decisionTelemetry, outcome: "proposal" },
+			inputSnapshot, decision: { ...decisionTelemetry, outcome: "proposal" },
 		});
 		const existing = await services.db.proposal(proposal.id);
 		if (!existing || !proposalIsReviewable(existing)) {
-			await interaction.editReply("This discussion already has a task proposal that is no longer pending.");
+			await deliverAiStatus(interaction, "This discussion already has a task proposal that is no longer pending.", replaceReply);
 			return;
 		}
 		if (!await canReviewProposal(interaction, existing, services)) {
-			await interaction.editReply("This discussion already has a pending task proposal, but you are not one of its reviewers.");
+			await deliverAiStatus(interaction, "This discussion already has a pending task proposal, but you are not one of its reviewers.", replaceReply);
 			return;
 		}
 		redisplayed = existing;
@@ -1509,7 +1517,7 @@ async function completeAiContext(
 		await services.db.recordExtraction({
 			source: "manual", outcome: "proposal", modelDeployment: deployment, triggerId: context.primaryId,
 			taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
-			inputSnapshot, messageAssessments: result.message_assessments, decision: {
+			inputSnapshot, decision: {
 				...decisionTelemetry, action: "create", outcome: "proposal", ragMatch: similar[0] ? { workPackageId: similar[0].workPackageId, similarity: similar[0].similarity } : null,
 			},
 		});
@@ -1523,10 +1531,14 @@ async function completeAiContext(
 		`Dates: ${startDate ?? "Not set"} → ${dueDate}`,
 		`Estimate: ${candidate.estimated_hours !== null ? `${candidate.estimated_hours}h` : "Not inferred"}`,
 	].join("\n");
+	const displayedAction = redisplayed?.action ?? "create";
+	const displayedTarget = displayedAction !== "create" && redisplayed?.target_work_package_id
+		? `Possible ${displayedAction} for #${redisplayed.target_work_package_id}\n\n`
+		: "";
 	await deliverProposalReply(interaction, services, proposal.id, {
-		content: boundedDiscordContent(`**${redisplayed?.title ?? candidate.title}**\n${redisplayed?.description ?? description}${details ? `\n\n${details}` : ""}${redisplayed ? "" : `\n\nClassification: ${candidate.classification}${result.ambiguities.length ? `\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`}`),
-		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...manualProposalButtons(proposal.id, "create"))],
-	}, !proposal.reused);
+		content: boundedDiscordContent(`${displayedTarget}**${redisplayed?.title ?? candidate.title}**\n${redisplayed?.description ?? description}${details ? `\n\n${details}` : ""}${redisplayed ? "" : `${advisory ? `\n\n${advisory}` : ""}${result.ambiguities.length ? `\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`}`),
+		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...manualProposalButtons(proposal.id, displayedAction, displayedAction === "create" ? suggestedMatch?.workPackageId : undefined))],
+	}, !proposal.reused, replaceReply);
 }
 
 async function handleSensitiveOverrideButton(interaction: ButtonInteraction, services: Services) {
@@ -1545,13 +1557,45 @@ async function handleSensitiveOverrideButton(interaction: ButtonInteraction, ser
 }
 
 async function handleProposalButton(interaction: ButtonInteraction, services: Services) {
-	if (!interaction.customId.startsWith("op-review:") && !interaction.customId.startsWith("op-dismiss:") && !interaction.customId.startsWith("op-duplicate:")) return;
+	if (!interaction.customId.startsWith("op-review:") && !interaction.customId.startsWith("op-dismiss:") && !interaction.customId.startsWith("op-duplicate:") && !interaction.customId.startsWith("op-use-existing:")) return;
 	const id = interaction.customId.split(":")[1];
 	const proposal = await services.db.proposal(id);
 	if (!proposal || !proposalIsReviewable(proposal) || !await canReviewProposal(interaction, proposal, services)) throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
-	if (proposal.action !== "create" && (!proposal.operation_schema_version || !proposal.content_operation)) {
+	if (proposal.action !== "create" && (!proposal.operation_schema_version || !proposal.content_operation || !proposal.target_work_package_id || proposal.target_lock_version === null)) {
 		await services.db.supersedeLegacyProposal(proposal.id);
 		throw new Error("This older update proposal was invalidated. Extract the discussion again.");
+	}
+	if (interaction.customId.startsWith("op-use-existing:")) {
+		if (proposal.action !== "create") throw new Error("This proposal already targets existing work.");
+		const targetId = Number(interaction.customId.split(":")[2]);
+		if (!Number.isSafeInteger(targetId) || targetId <= 0) throw new Error("The suggested OpenProject task is invalid.");
+		const target = await services.openProject.workPackage(targetId);
+		const targetProjectId = (target.project?.id ?? Number(target._links.project?.href.split("/").at(-1))) || undefined;
+		if (!targetProjectId || (proposal.project_id && targetProjectId !== proposal.project_id)) throw new Error("The suggested task is not in the proposal's project.");
+		const operations = planExistingTaskOperations({
+			workPackage: target,
+			requestedAction: "update",
+			contentIntent: "update_note",
+			description: proposal.description,
+			metadataFields: [],
+			values: { title: proposal.title },
+		});
+		await services.db.convertProposalToUpdate({
+			id: proposal.id,
+			projectId: targetProjectId,
+			targetWorkPackageId: target.id,
+			targetLockVersion: target.lockVersion,
+			metadataPatch: operations.metadataPatch,
+			contentOperation: operations.contentOperation,
+			contentMarkdown: operations.contentMarkdown,
+		});
+		const buttons = manualProposalButtons(proposal.id, "update");
+		if (!interaction.message.flags.has(MessageFlags.Ephemeral)) buttons.push(new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary));
+		await interaction.update({
+			content: boundedDiscordContent(`Proposal will update OpenProject task #${target.id}: **${proposal.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch).map(item => `- ${item}`).join("\n")}`),
+			components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons)],
+		});
+		return;
 	}
 	if (interaction.customId.startsWith("op-dismiss:")) {
 		if (!await services.db.setProposalStatus(id, "dismissed", interaction.user.id)) {
@@ -1601,7 +1645,7 @@ async function handleProposalButton(interaction: ButtonInteraction, services: Se
 		...(metadataPending && Object.hasOwn(metadataPatch, "startDate") ? [new TextInputBuilder().setCustomId("start_date").setLabel("New start date (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(metadataPatch.startDate ?? "")] : []),
 		...(metadataPending && Object.hasOwn(metadataPatch, "dueDate") ? [new TextInputBuilder().setCustomId("due_date").setLabel("New due date (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(metadataPatch.dueDate ?? "")] : []),
 		...(metadataPending && Object.hasOwn(metadataPatch, "estimatedHours") ? [new TextInputBuilder().setCustomId("estimated_hours").setLabel("New estimate in hours (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(metadataPatch.estimatedHours?.toString() ?? "")] : []),
-	].slice(0, 5);
+	];
 	if (!fields.length) fields.push(new TextInputBuilder().setCustomId("confirm").setLabel("Confirm the changes shown in the card").setStyle(TextInputStyle.Short).setRequired(false).setValue("Apply"));
 	modal.addComponents(...fields.map(field => new ActionRowBuilder<TextInputBuilder>().addComponents(field)));
 	await interaction.showModal(modal);
@@ -1681,7 +1725,7 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 	const draft = interaction.customId.startsWith("op-task2:") ? await contextDraft(entityId, interaction.user.id, services) : null;
 	const proposal = interaction.customId.startsWith("op-ai:") ? await services.db.proposal(entityId) : null;
 	if (proposal && (!proposalIsReviewable(proposal) || !await canReviewProposal(interaction, proposal, services))) throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
-	if (proposal && proposal.action !== "create" && (!proposal.operation_schema_version || !proposal.content_operation)) {
+	if (proposal && proposal.action !== "create" && (!proposal.operation_schema_version || !proposal.content_operation || !proposal.target_work_package_id || proposal.target_lock_version === null)) {
 		await services.db.supersedeLegacyProposal(proposal.id);
 		throw new Error("This older update proposal was invalidated. Extract the discussion again.");
 	}
@@ -1709,11 +1753,16 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 		};
 		if (!await services.db.claimProposal(proposal.id, interaction.user.id)) throw new Error("This proposal is already being handled.");
 		try {
-			if (proposal.action !== "create" && proposal.target_work_package_id) {
+			if (proposal.action !== "create") {
+				if (!proposal.target_work_package_id) throw new Error("Existing-task proposals require a target OpenProject task.");
 				if (!proposal.operation_schema_version || !proposal.content_operation) throw new Error("This older update proposal was invalidated. Extract the discussion again.");
 				if (!proposal.project_id) throw new Error("The matched task has no resolved OpenProject project.");
 				await requireProjectAccess(interaction, proposal.project_id, services);
-				const metadataPatch: ProposalMetadataPatch = { ...(proposal.metadata_patch ?? {}) };
+				const storedMetadataPatch = proposal.metadata_patch ?? {};
+				const metadataPatch: ProposalMetadataPatch = {};
+				if (Object.hasOwn(storedMetadataPatch, "priorityId")) metadataPatch.priorityId = storedMetadataPatch.priorityId;
+				if (Object.hasOwn(storedMetadataPatch, "sizeHref")) metadataPatch.sizeHref = storedMetadataPatch.sizeHref;
+				if (storedMetadataPatch.status) metadataPatch.status = storedMetadataPatch.status;
 				if (hasField("title")) metadataPatch.subject = args.title;
 				if (hasField("assignee")) metadataPatch.assigneeDiscordId = reviewedAssigneeId ?? null;
 				if (hasField("start_date")) metadataPatch.startDate = validIsoDate(fieldValue("start_date") || undefined) ?? null;
