@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { corpusWindowSchema, isRuntimeCreateCandidate } from "../dist/evaluate-ai.js";
 import { OpenProjectClient, workPackageChangesApplied } from "../dist/openproject.js";
-import { lexicalTitleSimilarity, OpenProjectRag, resolveProposedAction } from "../dist/rag.js";
+import { explicitlyReferencesExistingWork, lexicalTitleSimilarity, OpenProjectRag, resolveProposedAction } from "../dist/rag.js";
 
 test("RAG shadow mode never changes proposal actions", () => {
 	assert.equal(resolveProposedAction("create", "shadow", true), "create");
@@ -10,6 +10,15 @@ test("RAG shadow mode never changes proposal actions", () => {
 	assert.equal(resolveProposedAction("complete", "off", true), "no_action");
 	assert.equal(resolveProposedAction("create", "review", true), "update");
 	assert.equal(resolveProposedAction("complete", "review", true), "complete");
+});
+
+test("unmatched provisional updates fall back to creation only for new ideas", () => {
+	assert.equal(resolveProposedAction("update", "review", false, false), "create");
+	assert.equal(resolveProposedAction("update", "review", false, true), "no_action");
+	assert.equal(resolveProposedAction("complete", "review", false, false), "no_action");
+	assert.equal(explicitlyReferencesExistingWork(["What if we reach out to the student union for bulk fruit prices?"]), false);
+	assert.equal(explicitlyReferencesExistingWork(["Add this information to the task"]), true);
+	assert.equal(explicitlyReferencesExistingWork(["Update task #2149 with the revised colors"]), true);
 });
 
 test("OpenProject work packages follow HAL pagination beyond the first page", async () => {

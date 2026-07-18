@@ -7,10 +7,22 @@ export function resolveProposedAction(
 	action: "create" | "update" | "complete" | "reopen" | "no_action",
 	ragMode: IntegrationConfig["OPENPROJECT_RAG_MODE"],
 	hasMatch: boolean,
+	explicitExistingWork = true,
 ) {
 	if (action === "no_action") return "no_action" as const;
 	if (action === "create") return ragMode === "review" && hasMatch ? "update" as const : "create" as const;
+	if (action === "update" && !hasMatch && !explicitExistingWork) return "create" as const;
 	return ragMode === "review" && hasMatch ? action : "no_action" as const;
+}
+
+export function explicitlyReferencesExistingWork(texts: readonly string[]) {
+	return texts.some(text =>
+		/\b(?:existing|current|already[- ]?(?:tracked|open|created)|previously created)\s+(?:task|ticket|work package|issue)\b/i.test(text) ||
+		/\b(?:task|ticket|work package|issue)\s*#?\d+\b/i.test(text) ||
+		/\b(?:update|edit|change|close|complete|reopen)\s+(?:the|this|that)\s+(?:task|ticket|work package|issue)\b/i.test(text) ||
+		/\b(?:add|apply|post|record)\s+(?:(?:this|that)(?:\s+information)?|it)\s+(?:to|on)\s+(?:the|this|that)\s+(?:task|ticket|work package|issue)\b/i.test(text) ||
+		/https?:\/\/[^\s]*openproject[^\s]*\/work_packages\/\d+/i.test(text),
+	);
 }
 
 function descriptionOf(workPackage: WorkPackage) {

@@ -4,7 +4,7 @@ import { isOrganizerGuild, type IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient } from "./openproject.js";
 import { boundedDiscordContent, defaultAiDueDate, formatAiTaskDescription } from "./tasks.js";
-import { resolveProposedAction, type OpenProjectRag } from "./rag.js";
+import { explicitlyReferencesExistingWork, resolveProposedAction, type OpenProjectRag } from "./rag.js";
 import { describeProposalOperations, planExistingTaskOperations, taskSourcesAreRelevant } from "./task-proposals.js";
 
 type AutomaticServices = { config: IntegrationConfig; db: Database; extractor: TaskExtractor; openProject: OpenProjectClient; rag?: OpenProjectRag };
@@ -118,7 +118,8 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					workPackageId: similar[0]?.workPackageId, similarity: similar[0]?.similarity,
 				});
 				const match = services.config.OPENPROJECT_RAG_MODE === "review" && similar[0]?.similarity >= services.config.OPENPROJECT_RAG_SIMILARITY_THRESHOLD ? similar[0] : undefined;
-				const action = resolveProposedAction(task.proposed_action, services.config.OPENPROJECT_RAG_MODE, Boolean(match));
+				const explicitExistingWork = explicitlyReferencesExistingWork(task.source_message_ids.map(id => sourceRecords.get(id)?.text ?? ""));
+				const action = resolveProposedAction(task.proposed_action, services.config.OPENPROJECT_RAG_MODE, Boolean(match), explicitExistingWork);
 				if (action === "no_action") continue;
 				if (action !== "create" && !match) continue;
 				if (match && action !== "create") {

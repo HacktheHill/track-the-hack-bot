@@ -30,7 +30,7 @@ import { isOrganizerGuild, type IntegrationConfig, type TeamMapping } from "./co
 import { correctionFields, Database, type CorrectionFlags, type ProposalMetrics } from "./database.js";
 import { OpenProjectClient, OpenProjectRequestError, workPackageChangesApplied } from "./openproject.js";
 import { containsSensitiveContent, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, StructuredOutputError, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
-import { resolveProposedAction, type OpenProjectRag } from "./rag.js";
+import { explicitlyReferencesExistingWork, resolveProposedAction, type OpenProjectRag } from "./rag.js";
 import { composeOpenProjectMarkdown, describeProposalOperations, formatGeneratedTaskDescription, planExistingTaskOperations, taskSourcesAreRelevant, type ProposalMetadataPatch } from "./task-proposals.js";
 
 export const taskCommand = new SlashCommandBuilder()
@@ -1336,7 +1336,8 @@ async function completeAiContext(
 	});
 	const similar = projectId && services.rag ? await services.rag.findSimilar(projectId, candidate.title, description) : [];
 	const match = services.config.OPENPROJECT_RAG_MODE === "review" && similar[0]?.similarity >= services.config.OPENPROJECT_RAG_SIMILARITY_THRESHOLD ? similar[0] : undefined;
-	const action = resolveProposedAction(candidate.proposed_action, services.config.OPENPROJECT_RAG_MODE, Boolean(match));
+	const explicitExistingWork = explicitlyReferencesExistingWork(candidate.source_message_ids.map(id => context.sourceRecords.get(id)?.text ?? ""));
+	const action = resolveProposedAction(candidate.proposed_action, services.config.OPENPROJECT_RAG_MODE, Boolean(match), explicitExistingWork);
 	if (action === "no_action") {
 		await services.db.recordExtraction({
 			source: "manual", outcome: "no_task", modelDeployment: deployment, triggerId: context.primaryId,
