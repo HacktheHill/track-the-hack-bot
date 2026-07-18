@@ -65,6 +65,8 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 		assert.match(request.body.messages[0].content, /heading and bullet list/);
 		assert.match(request.body.messages[0].content, /application adds verified links separately/);
 		assert.match(request.body.messages[0].content, /most recent message has priority=true/);
+		assert.match(request.body.messages[0].content, /Tentative wording/);
+		assert.match(request.body.messages[0].content, /primary reply that endorses a preceding idea/);
 		assert.ok(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("content_intent"));
 		assert.deepEqual(JSON.parse(request.body.messages[1].content[0].text)[0], {
 			id: "m1", authorAlias: "USER_1", text: "Ship it",

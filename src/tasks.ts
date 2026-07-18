@@ -1298,12 +1298,28 @@ async function completeAiContext(
 		task.relevant_attachment_ids.every(id => [...context.sourceRecords.values()].some(record => record.attachments.some(attachment => attachment.id === id))),
 	);
 	if (!candidate) {
+		const strongest = [...result.tasks].sort((left, right) => right.significance_score - left.significance_score)[0];
+		const rejectionReasons: string[] = [];
+		if (strongest) {
+			if (strongest.proposed_action === "no_action") rejectionReasons.push("the strongest candidate was marked no action");
+			if (strongest.proposed_action === "create" && !["incomplete", "unknown"].includes(strongest.completion_state)) rejectionReasons.push(`it was marked ${strongest.completion_state}`);
+			if (strongest.proposed_action === "complete" && strongest.completion_state !== "completed") rejectionReasons.push("completion was not confirmed");
+			const threshold = services.config.OPENPROJECT_AI_SIGNIFICANCE_THRESHOLD * (strongest.proposed_action === "create" ? 0.7 : 0.5);
+			if (strongest.significance_score < threshold) rejectionReasons.push(`its significance score ${strongest.significance_score.toFixed(2)} was below ${threshold.toFixed(2)}`);
+			if (!["new_assignment", "clarification", "additional_requirements", "status_update", "completion_evidence", "question", "unclear"].includes(strongest.context_relation)) rejectionReasons.push(`its relation was ${strongest.context_relation}`);
+			if (!citesExtractionFocus(strongest.source_message_ids, context.focusIds)) rejectionReasons.push("it did not cite the newest focus message");
+			if (!taskSourcesAreRelevant(strongest.source_message_ids, result.message_assessments)) rejectionReasons.push("one or more cited messages failed relevance review");
+			if (!strongest.source_message_ids.every(id => context.validIds.has(id))) rejectionReasons.push("it cited a message outside the selected context");
+		}
 		await services.db.recordExtraction({
 			source: "manual", outcome: "no_task", modelDeployment: deployment, triggerId: context.primaryId,
 			 taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
 			inputSnapshot, messageAssessments: result.message_assessments, decision: { ...decisionTelemetry, outcome: "no_task" },
 		});
-		await interaction.editReply("No significant incomplete work was found in the selected context.");
+		const detail = strongest
+			? `AI returned ${result.tasks.length} candidate${result.tasks.length === 1 ? "" : "s"}; the strongest was rejected because ${rejectionReasons.join(", ") || "it did not pass the proposal gates"}.`
+			: "AI returned no task candidates. The newest message was treated as the focus and older messages as supporting context.";
+		await interaction.editReply(`No significant incomplete work was found in the selected context. ${detail}`);
 		return;
 	}
 	const assigneeId = context.explicitAssigneeId ?? (candidate.assignee_alias ? context.reverseAliases.get(candidate.assignee_alias) : undefined);
