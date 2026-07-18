@@ -65,6 +65,25 @@ test("OpenProject work packages follow HAL pagination beyond the first page", as
 	}
 });
 
+test("manual user linking includes invited users but excludes locked accounts and groups", async () => {
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => Response.json({
+		_embedded: { elements: [
+			{ id: 1, name: "Active Person", status: "active", _type: "User" },
+			{ id: 2, name: "Invited Person", status: "invited", _type: "User" },
+			{ id: 3, name: "Locked Person", status: "locked", _type: "User" },
+			{ id: 4, name: "Organizers", status: "active", _type: "Group" },
+		] },
+		_links: {},
+	});
+	try {
+		const client = new OpenProjectClient({ OPENPROJECT_BASE_URL: "https://openproject.example", OPENPROJECT_API_KEY: "secret", OPENPROJECT_CACHE_TTL_MS: 1000 });
+		assert.deepEqual((await client.linkableUsers()).map(user => [user.id, user.status]), [[1, "active"], [2, "invited"]]);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
 test("OpenProject updates reject stale proposal lock versions before PATCH", async () => {
 	const originalFetch = globalThis.fetch;
 	let calls = 0;

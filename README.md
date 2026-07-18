@@ -167,6 +167,12 @@ days. Raw Discord transcripts are never copied into task descriptions.
 Production uses `review` mode: AI may post a proposal, but only a permitted
 human reviewer can create or dismiss the task.
 
+`/task link-user` can link Discord members to active or invited OpenProject
+accounts. Linked accounts can be used as Assignee or Accountable without being
+project members; OpenProject's work-package form remains the final validation
+authority for both relationships. Task creators do not need an OpenProject
+account or project membership; Discord project access controls creation.
+
 RAG is independently controlled by `OPENPROJECT_RAG_MODE`. The recommended
 rollout is `off`, then `shadow`, then `review`. `shadow` synchronizes
 OpenProject title and description embeddings into PostgreSQL with pgvector but

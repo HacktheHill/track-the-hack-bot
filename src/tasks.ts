@@ -542,22 +542,11 @@ async function createAndAnnounce(args: {
 	const projectId = await resolveProject(args.projectText, interaction.channelId!, guild, assignee, services);
 	if (!projectId) throw new Error("Select a project; no channel or assignee-team default is configured.");
 	await requireProjectAccess(interaction, projectId, services);
-	const creatorOpenProjectId = await services.db.openProjectUserId(interaction.user.id);
-	if (!creatorOpenProjectId) throw new Error("Your Discord account is not linked to an OpenProject user.");
-	if (!await services.openProject.isProjectMember(projectId, creatorOpenProjectId)) {
-		throw new Error("You are not a member of the selected OpenProject project.");
-	}
-	if (assigneeOpenProjectId && !await services.openProject.isProjectMember(projectId, assigneeOpenProjectId)) {
-		throw new Error("The assignee is not a member of the selected OpenProject project.");
-	}
 	const projects = await services.openProject.projects();
 	const project = projects.find(item => item.id === projectId);
 	if (!project) throw new Error("The selected OpenProject project is inactive or inaccessible.");
 	const accountable = await accountableFor(assignee, services);
 	const accountableOpenProjectId = accountableOverride ?? accountable?.openProjectId;
-	if (accountableOpenProjectId && !await services.openProject.isProjectMember(projectId, accountableOpenProjectId)) {
-		throw new Error("The accountable user is not a member of the selected OpenProject project.");
-	}
 	validateDateOrder(args.startDate, args.dueDate);
 	const duplicate = await services.openProject.possibleDuplicate(projectId, args.title);
 	if (duplicate && !args.allowDuplicate) {
@@ -677,7 +666,10 @@ async function handleAutocomplete(interaction: AutocompleteInteraction, services
 			: await categoryProject(interaction.channelId, interaction.guild!, services);
 		if (projectId) choices = (await services.openProject.sizeOptions(projectId)).map(option => ({ name: option.value, value: `/api/v3/custom_options/${option.id}` }));
 	} else if (focused.name === "openproject_user") {
-		choices = (await services.openProject.users()).map(user => ({ name: user.name, value: String(user.id) }));
+		choices = (await services.openProject.linkableUsers()).map(user => ({
+			name: `${user.name}${user.status === "invited" ? " (Invited)" : ""}`.slice(0, 100),
+			value: String(user.id),
+		}));
 	}
 	await interaction.respond(choices.filter(choice => choice.name.toLowerCase().includes(query)).slice(0, 25));
 }
@@ -711,8 +703,8 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 		const discordUser = interaction.options.getUser("discord_user", true);
 		const openProjectId = Number(interaction.options.getString("openproject_user", true));
 		if (!Number.isInteger(openProjectId)) throw new Error("Select a valid OpenProject user.");
-		const user = (await services.openProject.users()).find(item => item.id === openProjectId);
-		if (!user) throw new Error("The selected OpenProject user is not assignable in a configured project.");
+		const user = (await services.openProject.linkableUsers()).find(item => item.id === openProjectId);
+		if (!user) throw new Error("Select an active or invited OpenProject user.");
 		const mappings = await services.db.openProjectUserMappings();
 		const collision = [...mappings].find(([discordId, mappedId]) => mappedId === openProjectId && discordId !== discordUser.id);
 		if (collision) throw new Error(`That OpenProject user is already mapped to <@${collision[0]}>.`);

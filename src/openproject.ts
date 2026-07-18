@@ -169,6 +169,15 @@ export class OpenProjectClient {
 		});
 	}
 
+	async linkableUsers() {
+		return this.cached("linkable-users", async () => {
+			const users = await this.collection<OpenProjectUser>("/api/v3/users?pageSize=500");
+			return users
+				.filter(user => (user._type === "User" || !user._type) && (!user.status || user.status === "active" || user.status === "invited"))
+				.sort((left, right) => left.name.localeCompare(right.name));
+		});
+	}
+
 	async availableAssignees(projectId: number) {
 		return this.cached(`assignees:${projectId}`, async () => this.collection<OpenProjectUser>(
 			`/api/v3/workspaces/${projectId}/available_assignees?pageSize=500`,
