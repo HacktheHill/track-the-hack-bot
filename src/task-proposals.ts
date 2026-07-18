@@ -8,6 +8,10 @@ export const metadataFieldNames = [
 export type MetadataFieldName = typeof metadataFieldNames[number];
 export type ContentIntent = "none" | "update_note" | "replace_description";
 export type ContentOperation = "none" | "descriptionReplacement" | "postComment";
+export type MessageAssessment = {
+	message_id: string;
+	relevance: "relevant" | "supporting" | "unrelated" | "completion" | "superseding" | "unclear";
+};
 
 export type ProposalMetadataPatch = {
 	subject?: string;
@@ -66,10 +70,97 @@ export function isEffectivelyEmptyDescription(value: string) {
 	return remaining.length === 0;
 }
 
+export function taskSourcesAreRelevant(sourceMessageIds: readonly string[], assessments: readonly MessageAssessment[]) {
+	const byId = new Map(assessments.map(assessment => [assessment.message_id, assessment.relevance]));
+	const relevance = sourceMessageIds.map(id => byId.get(id));
+	return relevance.length > 0 &&
+		relevance.every(value => value === "relevant" || value === "supporting" || value === "completion") &&
+		relevance.some(value => value === "relevant" || value === "completion");
+}
+
+function stripGeneratedReferenceSections(value: string) {
+	const lines = value.split(/\r?\n/);
+	const output: string[] = [];
+	for (let index = 0; index < lines.length; index++) {
+		if (!/^\s*(?:#{1,6}\s*)?(?:related\s+(?:links|references)|references|source(?:\s+conversation)?)\s*:?\s*$/i.test(lines[index])) {
+			output.push(lines[index]);
+			continue;
+		}
+		let next = index + 1;
+		while (next < lines.length && !lines[next].trim()) next++;
+		const firstLink = next;
+		while (next < lines.length && /^\s*[-*]\s+https?:\/\/\S+\s*$/i.test(lines[next])) next++;
+		if (next === firstLink) {
+			output.push(lines[index]);
+			continue;
+		}
+		index = next - 1;
+	}
+	return output.join("\n").trim();
+}
+
+function bulletizeDescription(value: string) {
+	if (!value.trim()) return "";
+	const output: string[] = [];
+	let prose: string[] = [];
+	let hasHeading = false;
+	const flush = () => {
+		if (!prose.length) return;
+		const sentences = prose.join(" ").split(/(?<=[.!?])\s+(?=[\p{Lu}\p{N}])/u).map(item => item.trim()).filter(Boolean);
+		output.push(...sentences.map(sentence => `- ${sentence}`));
+		prose = [];
+	};
+	for (const rawLine of value.split(/\r?\n/)) {
+		const line = rawLine.trim();
+		if (/^#{1,6}\s+\S/.test(line)) {
+			flush();
+			if (output.length && output.at(-1) !== "") output.push("");
+			output.push(line, "");
+			hasHeading = true;
+		} else if (/^(?:[-*+]\s+|\d+[.)]\s+)/.test(line)) {
+			flush();
+			output.push(line);
+		} else if (line) {
+			prose.push(line);
+		} else {
+			flush();
+			if (output.length && output.at(-1) !== "") output.push("");
+		}
+	}
+	flush();
+	const body = output.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+	return hasHeading ? body : `## Details\n\n${body}`;
+}
+
+export function formatGeneratedTaskDescription(value: string, referenceLinks: readonly string[] = []) {
+	const links = [...new Set(referenceLinks.map(link => link.trim()).filter(Boolean))];
+	let cleaned = stripGeneratedReferenceSections(value);
+	cleaned = cleaned
+		.replace(/\[([^\]]+)\]\(https?:\/\/[^)]+\)/gi, "$1")
+		.replace(/\s+at\s+https?:\/\/[^\s<>()]+/gi, "")
+		.replace(/https?:\/\/[^\s<>()]+/gi, "")
+		.replace(/[ \t]+([.,;:!?])/g, "$1")
+		.replace(/[ \t]+\n/g, "\n");
+	const body = bulletizeDescription(cleaned);
+	let references = "";
+	for (const link of links) {
+		const addition = `${references ? "" : "## References\n\n"}- ${link}\n`;
+		if (references.length + addition.length > 2000) break;
+		references += addition;
+	}
+	const separator = body && references ? "\n\n" : "";
+	const bodyLimit = Math.max(0, 4000 - separator.length - references.trimEnd().length);
+	return `${body.slice(0, bodyLimit).trimEnd()}${separator}${references.trimEnd()}`;
+}
+
 export function composeOpenProjectMarkdown(body: string, sourceLinks: string[], marker?: string) {
 	const links = [...new Set(sourceLinks.map(link => link.trim()).filter(Boolean))];
 	const source = links.length ? `## Source\n\n${links.map(link => `- ${link}`).join("\n")}` : "";
-	return [body.trim(), source, marker ? `<!-- ${marker} -->` : ""].filter(Boolean).join("\n\n");
+	const withoutSource = body.replace(
+		/(?:^|\n)\s*(?:#{1,6}\s*)?source(?:\s+conversation)?\s*:?\s*\n(?:\s*[-*]\s+https?:\/\/\S+\s*\n?)*/gi,
+		"\n",
+	).trim();
+	return [withoutSource, source, marker ? `<!-- ${marker} -->` : ""].filter(Boolean).join("\n\n");
 }
 
 export function planExistingTaskOperations(input: ExistingTaskPlanInput) {

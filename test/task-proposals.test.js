@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	composeOpenProjectMarkdown,
+	formatGeneratedTaskDescription,
 	isEffectivelyEmptyDescription,
 	planExistingTaskOperations,
+	taskSourcesAreRelevant,
 } from "../dist/task-proposals.js";
 
 test("effectively empty descriptions ignore managed provenance but preserve real context", () => {
@@ -47,8 +49,37 @@ test("unresolved metadata is preserved instead of being cleared", () => {
 });
 
 test("Markdown composition deduplicates source links and appends its marker", () => {
-	const markdown = composeOpenProjectMarkdown("## Objective\n\nShip it.", ["https://example.test/source", "https://example.test/source"], "marker");
+	const markdown = composeOpenProjectMarkdown("## Objective\n\nShip it.\n\n## Source\n\n- https://stale.test/source", ["https://example.test/source", "https://example.test/source"], "marker");
 	assert.equal(markdown.match(/https:\/\/example\.test\/source/g)?.length, 1);
+	assert.equal(markdown.includes("https://stale.test/source"), false);
 	assert.match(markdown, /## Source/);
 	assert.ok(markdown.endsWith("<!-- marker -->"));
+});
+
+test("task citations must pass their per-message relevance review", () => {
+	const assessments = [
+		{ message_id: "recent", relevance: "relevant" },
+		{ message_id: "old-topic", relevance: "unrelated" },
+		{ message_id: "detail", relevance: "supporting" },
+	];
+	assert.equal(taskSourcesAreRelevant(["recent", "detail"], assessments), true);
+	assert.equal(taskSourcesAreRelevant(["recent", "old-topic"], assessments), false);
+	assert.equal(taskSourcesAreRelevant(["detail"], assessments), false);
+	assert.equal(taskSourcesAreRelevant(["missing"], assessments), false);
+});
+
+test("generated descriptions use bullets and one verified references section", () => {
+	const description = formatGeneratedTaskDescription(
+		"Update the sponsor graphic colors using the [mockup](https://verified.test/mockup). Reorganize the tier layout.\n\n- Preserve the sponsor logos.\n\nAdd mobile spacing. Ignore https://hallucinated.test.\n\nRelated references:\n- https://unverified.test\n\nRelated links:\n- https://duplicate.test",
+		["https://verified.test/mockup", "https://verified.test/mockup"],
+	);
+	assert.match(description, /^## Details\n\n- Update the sponsor graphic colors using the mockup\.\n- Reorganize the tier layout\./);
+	assert.match(description, /- Preserve the sponsor logos\.[\s\S]*- Add mobile spacing\./);
+	assert.equal((description.match(/## References/g) ?? []).length, 1);
+	assert.equal((description.match(/https:\/\/verified\.test\/mockup/g) ?? []).length, 1);
+	assert.match(description, /https:\/\/verified\.test\/mockup/);
+	assert.equal(description.includes("unverified.test"), false);
+	assert.equal(description.includes("hallucinated.test"), false);
+	assert.equal(description.includes("[mockup]()"), false);
+	assert.equal(description.includes("Related links"), false);
 });

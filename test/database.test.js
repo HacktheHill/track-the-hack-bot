@@ -125,7 +125,7 @@ test("existing-task proposals persist explicit operations and independent checkp
 	assert.match(queries[2].sql, /comment_activity_id/);
 });
 
-test("proposal review start and completion persist timing and correction metadata", async () => {
+test("proposal submission and completion persist timing and correction metadata", async () => {
 	const queries = [];
 	const db = databaseWithPool({
 		async query(sql, values) {
@@ -133,7 +133,7 @@ test("proposal review start and completion persist timing and correction metadat
 			return { rowCount: 1, rows: [{ id: "proposal" }] };
 		},
 	});
-	assert.equal(await db.startProposalReview("proposal", "reviewer"), true);
+	assert.equal(await db.claimProposal("proposal", "reviewer"), true);
 	const corrections = {
 		title: true, description: false, project: false, assignee: false, accountable: false,
 		priority: false, size: false, startDate: false, dueDate: true, estimate: false,

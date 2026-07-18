@@ -111,20 +111,21 @@ export interface TaskExtractor {
 	extract(messages: MinimizedMessage[], options?: ExtractionOptions): Promise<ExtractionResult>;
 }
 
-const credentialPattern = /(?:api[_-]?key|token|password|secret|private[_-]?key|seed phrase|recovery phrase)\s*[:=]?\s*\S+/gi;
+const credentialPattern = /(?:(?:api[_-]?key|token|password|private[_-]?key|seed phrase|recovery phrase)\s*[:=]?\s*\S+|secret\s*[:=]\s*\S+)/gi;
 const emailPattern = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
 const phonePattern = /(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}/g;
 const invitePattern = /https?:\/\/(?:www\.)?(?:discord\.gg|discord(?:app)?\.com\/invite)\/\S+/gi;
 
-const sensitivePatterns = [
-	/\[REDACTED_(?:CREDENTIAL|EMAIL|PHONE|INVITE)\]/i,
-	/\b(?:password|api[_ -]?key|access token|secret|credential|private key|seed phrase|recovery phrase)\b/i,
-	/\b(?:salary|payroll|bank account|routing number|payment authorization|invoice|credit card|financial account)\b/i,
-	/\b(?:medical|diagnos(?:is|ed)|accommodation|disability|health information)\b/i,
-	/\b(?:harassment|discipline|conduct complaint|member dispute|personnel|termination|performance review)\b/i,
-	/\b(?:legal advice|lawyer|attorney|privileged|litigation|contract negotiation|board meeting|executive session)\b/i,
-	/\b(?:sponsorship agreement|sponsorship obligation|confidential commitment)\b/i,
-];
+const sensitiveChecks = [
+	{ label: "Credential or secret pattern", pattern: /\[REDACTED_CREDENTIAL\]|\b(?:password|api[_ -]?key|access token|credential|private key|seed phrase|recovery phrase)\b/i },
+	{ label: "Email address", pattern: /\[REDACTED_EMAIL\]/i },
+	{ label: "Phone number", pattern: /\[REDACTED_PHONE\]/i },
+	{ label: "Discord invite", pattern: /\[REDACTED_INVITE\]/i },
+	{ label: "Financial, payroll, or payment information", pattern: /\b(?:salary|payroll|bank account|routing number|payment authorization|credit card|financial account)\b/i },
+	{ label: "Medical, disability, or accommodation information", pattern: /\b(?:medical|diagnos(?:is|ed)|accommodation|disability|health information)\b/i },
+	{ label: "Personnel, conduct, or member-dispute information", pattern: /\b(?:harassment|discipline|conduct complaint|member dispute|personnel|termination|performance review)\b/i },
+	{ label: "Legal, privileged, litigation, or executive-session information", pattern: /\b(?:legal advice|attorney-client|privileged|litigation|executive session)\b/i },
+] as const;
 
 export function minimizeText(text: string) {
 	return text
@@ -135,8 +136,22 @@ export function minimizeText(text: string) {
 		.replace(/https?:\/\S+\.(?:png|jpe?g|gif|webp)(?:\?\S*)?/gi, "[REMOVED_ATTACHMENT]");
 }
 
+export function sensitiveContentReasons(messages: MinimizedMessage[]) {
+	const reasons = new Set<string>();
+	for (const message of messages) {
+		let matched = false;
+		for (const check of sensitiveChecks) {
+			if (!check.pattern.test(message.text)) continue;
+			reasons.add(check.label);
+			matched = true;
+		}
+		if (message.containedSensitiveData && !matched) reasons.add("Content pre-classified as sensitive before minimization");
+	}
+	return [...reasons];
+}
+
 export function containsSensitiveContent(messages: MinimizedMessage[]) {
-	return messages.some(message => message.containedSensitiveData || sensitivePatterns.some(pattern => pattern.test(message.text)));
+	return sensitiveContentReasons(messages).length > 0;
 }
 
 export class StructuredOutputError extends Error {
@@ -144,7 +159,11 @@ export class StructuredOutputError extends Error {
 		super(message);
 	}
 }
-export class SensitiveContentError extends Error {}
+export class SensitiveContentError extends Error {
+	constructor(readonly reasons: string[]) {
+		super("AI extraction was skipped because the conversation may contain sensitive information.");
+	}
+}
 
 function parseResponse(json: unknown, provider: string, latencyMs: number, maxCompletionTokens: number): ExtractionResult {
 	const choice = (json as { choices?: Array<{ finish_reason?: string; message?: { content?: string } }> }).choices?.[0];
@@ -292,18 +311,18 @@ async function invokeCompatible(options: {
 						"referenced_history messages were selected to resolve an artifact reference in the primary message. Use their concrete scope and URLs only when they clearly describe the same artifact or assignment.",
 						"Use timestamps and replyTo relationships literally. Do not merge discussions separated in time or infer that an old topic continues merely because it appears in the context.",
 						"If supporting messages contain another topic, owner, or task, ignore it. Evaluate each primary message independently; do not merge unrelated primary messages. If a primary message cannot be interpreted without mixing topics, classify it as insufficient_context and explain the ambiguity rather than extracting an unrelated task.",
-						"For automatic batches with no primary message, extract significant incomplete work even when nobody is explicitly assigned; do not create tasks for trivial suggestions, completed work, cancellations, or superseded work.",
+						"For automatic batches with no contextRole=primary, the most recent message has priority=true and is the extraction focus. Every task must cite that message; use older messages only when they are relevant context for its topic. Extract significant incomplete work even when nobody is explicitly assigned; do not create tasks for trivial suggestions, completed work, cancellations, or superseded work.",
 						"Set proposed_action=create only for significant incomplete new work. Use update for material new requirements on existing work, complete when the discussion confirms completion, reopen when work must resume, and no_action for cancelled, superseded, trivial, or already-resolved work.",
 						"For existing work, set content_intent=update_note for new requirements, clarifications, progress, or evidence that should be recorded without replacing canonical scope. Set replace_description only when the discussion explicitly asks to replace or rewrite the task description. Use none for metadata-only changes. For create, use none.",
 						"List only explicitly requested existing-task metadata changes in metadata_change_fields. Do not list inferred, default, unresolved, or clearing values. Use subject for an explicit rename; assignee, priority, size, start_date, due_date, or estimated_hours only when a concrete new value is explicit. Field clearing is not supported by this extraction schema.",
 						"For complete or reopen, still return the task-shaped record with the existing work's best title and description so retrieval can locate it. Never turn completion, cancellation, or supersession into a new create action.",
-						"Cite a subsequent message when it confirms completion, clarifies the task, or supplies its deliverable URL. Include every relevant non-Discord URL from cited messages in the task description. Resolve an assignee only from an explicit assignment or commitment to a supplied USER alias.",
+						"Cite a subsequent message when it confirms completion, clarifies the task, or supplies its deliverable URL. Do not copy URLs into the task description; the application adds verified URLs from cited messages. Resolve an assignee only from an explicit assignment or commitment to a supplied USER alias.",
 						"Assess every supplied message exactly once in message_assessments, including unrelated messages. Use source_message_ids only for messages assessed as relevant, supporting, or completion evidence.",
-						"Include every relevant source_message_id and relevant_attachment_id needed to support the task. Do not cite messages or attachments that are unrelated.",
+						"Include every relevant source_message_id and relevant_attachment_id needed to support the task. Do not cite messages or attachments that are unrelated. Before returning a task, compare every cited message to that task's specific title and scope; omit citations about a different deliverable, owner, or topic even when they are nearby in time.",
 						"Classify each primary message's relationship to the work as new_assignment, clarification, additional_requirements, status_update, completion_evidence, question, unrelated, or unclear. A clarification or additional_requirements message may define a task only when the supporting assignment is also cited.",
 						"If an image attachment contains requirements, inspect it and cite its attachment ID. If text in an image is uncertain, put the uncertainty in ambiguities instead of inventing details.",
 						"Treat names in assignment labels or parenthetical assignee fields as people responsible for the task. Use clear, action-oriented wording grounded in the source.",
-						"Descriptions may be brief when the discussion is brief. When several requirements are present, use concise Markdown headings and bullet lists; do not invent missing objectives, acceptance criteria, or notes merely to fill a template.",
+						"Write description content as concise Markdown with a heading and bullet list, even when the discussion is brief. Split distinct requirements into separate bullets and never return one dense paragraph. Do not invent missing objectives, acceptance criteria, or notes merely to fill a template. Do not add Related links, Related references, References, Source, or Source conversation sections; the application adds verified links separately.",
 						"Extract explicitly stated absolute or relative dates, using message timestamps to resolve relative timing. Dates must be YYYY-MM-DD. Use null when timing is unspecified; the application applies its scheduling defaults. Infer estimated_hours only when clearly supported.",
 						priorities.length ? `priority_name must exactly match one of: ${priorities.join(", ")}; otherwise use null.` : "Use null for priority_name because no allowed priorities were supplied.",
 						sizes.length ? `size_name must exactly match one of: ${sizes.join(", ")}; otherwise use null.` : "Use null for size_name because no allowed sizes were supplied.",
@@ -345,8 +364,9 @@ export class AzureTaskExtractor implements TaskExtractor {
 		if (!this.config.AZURE_OPENAI_ENDPOINT || !deployment) {
 			throw new Error("Azure OpenAI extraction is not configured.");
 		}
-		if (containsSensitiveContent(messages) && !options.allowSensitiveContent) {
-			throw new SensitiveContentError("AI extraction was skipped because the conversation may contain sensitive information.");
+		const sensitiveReasons = sensitiveContentReasons(messages);
+		if (sensitiveReasons.length && !options.allowSensitiveContent) {
+			throw new SensitiveContentError(sensitiveReasons);
 		}
 		let maxCompletionTokens = this.config.AZURE_OPENAI_MAX_COMPLETION_TOKENS;
 		for (let attempt = 0; ; attempt++) {

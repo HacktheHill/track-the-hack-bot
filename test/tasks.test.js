@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, isExcludedChannel, precedingUntilGap, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, taskCommand, validIsoDate } from "../dist/tasks.js";
+import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, isExcludedChannel, manualProposalButtons, precedingUntilGap, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, taskCommand, validIsoDate } from "../dist/tasks.js";
 import { normalizeTaskTitle, OpenProjectClient, titlesLikelyDuplicate } from "../dist/openproject.js";
 
 test("task defaults start today and use the configured due offset", () => {
@@ -75,9 +75,9 @@ test("category exclusions apply to descendant channels but channel exclusions st
 	assert.equal(await isExcludedChannel("child", guild, new Set(["child"])), true);
 });
 
-test("forced extraction accepts evidence from every requested message", () => {
-	const focusIds = new Set(["older", "newest"]);
-	assert.equal(citesExtractionFocus(["older"], focusIds), true);
+test("forced extraction requires evidence from its newest-message focus", () => {
+	const focusIds = new Set(["newest"]);
+	assert.equal(citesExtractionFocus(["older"], focusIds), false);
 	assert.equal(citesExtractionFocus(["newest"], focusIds), true);
 	assert.equal(citesExtractionFocus(["supporting"], focusIds), false);
 });
@@ -135,8 +135,14 @@ test("AI task descriptions retain URLs from cited messages", () => {
 		{ id: "primary", authorAlias: "USER_1", text: "Create a spreadsheet", timestamp: "2026-07-06T21:50:00Z" },
 		{ id: "followup", authorAlias: "USER_2", text: "Created: https://docs.google.com/spreadsheets/d/example", timestamp: "2026-07-06T21:59:00Z" },
 	], ["primary", "followup"]);
-	assert.match(description, /Related links:/);
+	assert.match(description, /## References/);
+	assert.match(description, /- Create the outreach tracker\./);
 	assert.match(description, /https:\/\/docs\.google\.com\/spreadsheets\/d\/example/);
+});
+
+test("ephemeral proposal controls omit Dismiss and remain actionable", () => {
+	assert.deepEqual(manualProposalButtons("proposal", "update").map(button => button.toJSON().custom_id), ["op-review:proposal"]);
+	assert.deepEqual(manualProposalButtons("proposal", "create").map(button => button.toJSON().custom_id), ["op-review:proposal", "op-duplicate:proposal"]);
 });
 
 test("AI task descriptions retain attachment links without verbatim source text", () => {

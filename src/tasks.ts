@@ -31,7 +31,7 @@ import { correctionFields, Database, type CorrectionFlags, type ProposalMetrics 
 import { OpenProjectClient, OpenProjectRequestError, workPackageChangesApplied } from "./openproject.js";
 import { containsSensitiveContent, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, StructuredOutputError, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 import { resolveProposedAction, type OpenProjectRag } from "./rag.js";
-import { composeOpenProjectMarkdown, describeProposalOperations, planExistingTaskOperations, type ProposalMetadataPatch } from "./task-proposals.js";
+import { composeOpenProjectMarkdown, describeProposalOperations, formatGeneratedTaskDescription, planExistingTaskOperations, taskSourcesAreRelevant, type ProposalMetadataPatch } from "./task-proposals.js";
 
 export const taskCommand = new SlashCommandBuilder()
 	.setName("task")
@@ -177,7 +177,7 @@ export function formatProposalMetrics(metrics: ProposalMetrics) {
 		`Proposals: ${metrics.proposals} · approved: ${metrics.approved} · dismissed: ${metrics.dismissed} · duplicates: ${metrics.duplicates} · failures: ${metrics.failures}`,
 		`Approval rate: ${percent(metrics.approvalRate)} · duplicate rate: ${percent(metrics.duplicateRate)} · reconciliations: ${metrics.reconciliations}`,
 		`Assignee accepted: ${percent(metrics.assigneeAcceptanceRate)} · deadline accepted: ${percent(metrics.deadlineAcceptanceRate)}`,
-		`Average review: ${Math.round(metrics.averageReviewDurationMs / 1000)}s · extraction: ${Math.round(metrics.averageExtractionLatencyMs)}ms · tokens: ${metrics.totalTokens} · invalid outputs: ${metrics.invalidOutputs}`,
+		`Average approval processing: ${Math.round(metrics.averageReviewDurationMs / 1000)}s · extraction: ${Math.round(metrics.averageExtractionLatencyMs)}ms · tokens: ${metrics.totalTokens} · invalid outputs: ${metrics.invalidOutputs}`,
 		`Field edit rates — ${edits}`,
 	].join("\n");
 }
@@ -185,6 +185,11 @@ export function formatProposalMetrics(metrics: ProposalMetrics) {
 export function boundedDiscordContent(value: string, limit = 2000) {
 	if (value.length <= limit) return value;
 	return `${value.slice(0, Math.max(0, limit - 24)).trimEnd()}\n\n[Preview truncated]`;
+}
+
+function sensitiveContentNotice(scope: "channel" | "selected context", error: SensitiveContentError) {
+	const reasons = error.reasons.length ? error.reasons.map(reason => `- ${reason}`).join("\n") : "- Unclassified local sensitivity signal";
+	return `This ${scope} was not sent to AI for review because the local sensitive-content heuristic detected:\n${reasons}\n\nThis check uses keyword and pattern categories and can produce false positives. No matched message text or values are displayed.`;
 }
 
 function proposalSnapshot(input: {
@@ -201,11 +206,12 @@ async function deliverProposalReply(
 	services: Services,
 	proposalId: string,
 	payload: Parameters<typeof interaction.editReply>[0],
+	markInitialDeliveryFailure = true,
 ) {
 	try {
 		await interaction.editReply(payload);
 	} catch (error) {
-		await services.db.markProposalDeliveryFailed(proposalId, (error as Error).message);
+		if (markInitialDeliveryFailure) await services.db.markProposalDeliveryFailed(proposalId, (error as Error).message);
 		throw error;
 	}
 }
@@ -345,7 +351,7 @@ async function requireCreator(interaction: ChatInputCommandInteraction | Message
 }
 
 async function canReviewProposal(
-	interaction: ButtonInteraction | ModalSubmitInteraction,
+	interaction: TaskInteraction | MessageContextMenuCommandInteraction,
 	proposal: { permitted_reviewer_ids: string[]; requester_discord_id: string | null },
 	services: Services,
 ) {
@@ -379,6 +385,18 @@ export function proposalIsReviewable(proposal: { status: string; expires_at: str
 
 export function citesExtractionFocus(sourceMessageIds: readonly string[], focusIds: ReadonlySet<string>) {
 	return sourceMessageIds.some(id => focusIds.has(id));
+}
+
+export function manualProposalButtons(proposalId: string, action: "create" | "update" | "complete" | "reopen") {
+	const buttons = [new ButtonBuilder()
+		.setCustomId(`op-review:${proposalId}`)
+		.setLabel(action === "create" ? "Review and edit" : "Review and apply")
+		.setStyle(ButtonStyle.Primary)];
+	if (action === "create") buttons.push(new ButtonBuilder()
+		.setCustomId(`op-duplicate:${proposalId}`)
+		.setLabel("Already tracked")
+		.setStyle(ButtonStyle.Secondary));
+	return buttons;
 }
 
 export async function isExcludedChannel(channelId: string, guild: Guild, excludedIds: ReadonlySet<string>) {
@@ -707,8 +725,8 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 			await completeAiContext(interaction, services, context);
 		} catch (error) {
 			if (error instanceof SensitiveContentError) {
-				await services.db.recordExtraction({ source: "manual", outcome: "sensitive_block" }).catch(() => undefined);
-				await interaction.editReply("This channel matched the sensitive-content heuristic. Nothing was sent to Azure.");
+				await services.db.recordExtraction({ source: "manual", outcome: "sensitive_block", decision: { reasons: error.reasons } }).catch(() => undefined);
+				await interaction.editReply(sensitiveContentNotice("channel", error));
 				return;
 			}
 			await services.db.recordExtraction({
@@ -929,13 +947,7 @@ export function appendRelevantUrls(description: string, messages: MinimizedMessa
 			if (!/^https?:\/\/(?:www\.)?discord(?:app)?\.com\//i.test(url) && !description.includes(url)) urls.add(url);
 		}
 	}
-	let result = description.trim();
-	for (const url of urls) {
-		const addition = `${result ? "\n\n" : ""}${result.includes("Related links:") ? "" : "Related links:\n"}- ${url}`;
-		if (result.length + addition.length > 4000) break;
-		result += addition;
-	}
-	return result;
+	return formatGeneratedTaskDescription(sanitizeGeneratedDescription(description), [...urls]);
 }
 
 export function appendSourceLinks(
@@ -948,9 +960,31 @@ export function appendSourceLinks(
 	const links = [...new Set(sourceIds.flatMap(id => records.get(id)?.attachments
 		.filter(attachment => !relevant || relevant.has(attachment.id))
 		.map(attachment => attachment.url) ?? []))];
-	if (!links.length) return sanitizeGeneratedDescription(description);
-	const addition = `Related links:\n${links.map(link => `- ${link}`).join("\n")}`;
-	return `${sanitizeGeneratedDescription(description)}\n\n${addition}`.slice(0, 4000);
+	return formatGeneratedTaskDescription(sanitizeGeneratedDescription(description), links);
+}
+
+export function formatAiTaskDescription(
+	description: string,
+	messages: MinimizedMessage[],
+	records: CollectedContext["sourceRecords"],
+	sourceIds: string[],
+	relevantAttachmentIds?: string[],
+) {
+	const references = new Set<string>();
+	for (const message of messages) {
+		if (!sourceIds.includes(message.id)) continue;
+		for (const match of message.text.matchAll(/https?:\/\/[^\s<>()]+/gi)) {
+			const url = match[0].replace(/[.,;:!?]+$/, "");
+			if (!/^https?:\/\/(?:www\.)?discord(?:app)?\.com\//i.test(url)) references.add(url);
+		}
+	}
+	const relevant = relevantAttachmentIds ? new Set(relevantAttachmentIds) : null;
+	for (const id of sourceIds) {
+		for (const attachment of records.get(id)?.attachments ?? []) {
+			if (!relevant || relevant.has(attachment.id)) references.add(attachment.url);
+		}
+	}
+	return formatGeneratedTaskDescription(sanitizeGeneratedDescription(description), [...references]);
 }
 
 type ContextRole = NonNullable<MinimizedMessage["contextRole"]>;
@@ -1182,6 +1216,7 @@ async function collectRecentContext(interaction: ChatInputCommandInteraction, li
 			id: attachment.id, name: attachment.name ?? "attachment", contentType: attachment.contentType ?? undefined, url: attachment.url,
 		})),
 	}]));
+	const primary = source.at(-1)!;
 	const messages = source.map(message => {
 		const raw = message.content.replace(/<@!?(\d+)>/g, (_, id: string) => aliasFor(id));
 		return {
@@ -1190,15 +1225,14 @@ async function collectRecentContext(interaction: ChatInputCommandInteraction, li
 			attachments: [...message.attachments.values()].map(attachment => ({
 				id: attachment.id, name: attachment.name ?? "attachment", contentType: attachment.contentType ?? undefined, url: attachment.url,
 			})),
-			contextRole: "primary" as const,
-			priority: true,
+			contextRole: message.id === primary.id ? "primary" as const : "preceding" as const,
+			priority: message.id === primary.id,
 			containedSensitiveData: containsSensitiveContent([{ id: message.id, authorAlias: "", text: raw, timestamp: "" }]),
 		};
 	});
-	const primary = source.at(-1)!;
 	const mentionedIds = [...primary.mentions.users.keys()].filter(id => id !== primary.author.id);
 	return {
-		messages, sourceRecords, reverseAliases, validIds: new Set(source.map(message => message.id)), focusIds: new Set(source.map(message => message.id)),
+		messages, sourceRecords, reverseAliases, validIds: new Set(source.map(message => message.id)), focusIds: new Set([primary.id]),
 		primaryId: primary.id, primaryAuthorId: primary.author.id,
 		explicitAssigneeId: mentionedIds.length === 1 ? mentionedIds[0] : undefined,
 	};
@@ -1222,13 +1256,13 @@ async function handleAiContext(interaction: MessageContextMenuCommandInteraction
 			}).catch(auditError => console.error("AI extraction metrics failed", { error: (auditError as Error).message }));
 			throw error;
 		}
-		await services.db.recordExtraction({ source: "manual", outcome: "sensitive_block", triggerId: context.primaryId, decision: { trigger: "context_menu" } })
+		await services.db.recordExtraction({ source: "manual", outcome: "sensitive_block", triggerId: context.primaryId, decision: { trigger: "context_menu", reasons: error.reasons } })
 			.catch(auditError => console.error("AI extraction metrics failed", { error: (auditError as Error).message }));
 		const id = randomUUID();
 		sensitiveOverrides.set(id, { userId: interaction.user.id, context, expiresAt: Date.now() + 10 * 60_000 });
 		setTimeout(() => sensitiveOverrides.delete(id), 10 * 60_000).unref();
 		await interaction.editReply({
-			content: "This context matched the sensitive-data heuristic. Nothing was sent to Azure. If this is a false positive, you can explicitly send the minimized context for this request only.",
+			content: `${sensitiveContentNotice("selected context", error)}\n\nIf this is a false positive, you can explicitly send the minimized context for this request only.`,
 			components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
 				new ButtonBuilder().setCustomId(`op-sensitive-override:${id}`).setLabel("Send minimized context").setStyle(ButtonStyle.Danger),
 			)],
@@ -1259,6 +1293,7 @@ async function completeAiContext(
 		task.significance_score >= services.config.OPENPROJECT_AI_SIGNIFICANCE_THRESHOLD * (task.proposed_action === "create" ? 0.7 : 0.5) &&
 		["new_assignment", "clarification", "additional_requirements", "status_update", "completion_evidence", "question", "unclear"].includes(task.context_relation) &&
 		citesExtractionFocus(task.source_message_ids, context.focusIds) &&
+		taskSourcesAreRelevant(task.source_message_ids, result.message_assessments) &&
 		task.source_message_ids.every(id => context.validIds.has(id)) &&
 		task.relevant_attachment_ids.every(id => [...context.sourceRecords.values()].some(record => record.attachments.some(attachment => attachment.id === id))),
 	);
@@ -1288,8 +1323,9 @@ async function completeAiContext(
 	};
 	const startDate = inferredDate(candidate.start_date);
 	const dueDate = inferredDate(candidate.due_date) ?? defaultAiDueDate(new Date(), priority?.name, size?.value, services.config.BOT_TIME_ZONE);
-	const description = appendSourceLinks(
-		appendRelevantUrls(candidate.description, context.messages, candidate.source_message_ids),
+	const description = formatAiTaskDescription(
+		candidate.description,
+		context.messages,
 		context.sourceRecords,
 		candidate.source_message_ids,
 		candidate.relevant_attachment_ids,
@@ -1359,6 +1395,7 @@ async function completeAiContext(
 				sourceMessageIds: candidate.source_message_ids, sourceLinks,
 			}),
 		});
+		let redisplayed: Awaited<ReturnType<Database["proposal"]>>;
 		if (proposal.reused) {
 			await services.db.recordExtraction({
 				source: "manual", outcome: "duplicate", modelDeployment: deployment, triggerId: context.primaryId,
@@ -1366,24 +1403,39 @@ async function completeAiContext(
 				inputSnapshot, messageAssessments: result.message_assessments,
 				decision: { ...decisionTelemetry, action, targetWorkPackageId: match.workPackageId, outcome: "duplicate" },
 			});
-			await interaction.editReply(`This discussion already has a pending task update proposal.`);
-			return;
+			const existing = await services.db.proposal(proposal.id);
+			if (!existing || !proposalIsReviewable(existing)) {
+				await interaction.editReply("This discussion already has a task update proposal that is no longer pending.");
+				return;
+			}
+			if (!existing.operation_schema_version || !existing.content_operation) {
+				await services.db.supersedeLegacyProposal(existing.id);
+				await interaction.editReply("The existing proposal used the older unsafe update format and was invalidated. Run extraction again.");
+				return;
+			}
+			if (!await canReviewProposal(interaction, existing, services)) {
+				await interaction.editReply("This discussion already has a pending task update proposal, but you are not one of its reviewers.");
+				return;
+			}
+			redisplayed = existing;
+		} else {
+			await services.db.recordExtraction({
+				source: "manual", outcome: "proposal", modelDeployment: deployment, triggerId: context.primaryId,
+				taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+				inputSnapshot, messageAssessments: result.message_assessments,
+				decision: { ...decisionTelemetry, action, targetWorkPackageId: match.workPackageId, similarity: match.similarity, outcome: "proposal" },
+			});
 		}
-		await services.db.recordExtraction({
-			source: "manual", outcome: "proposal", modelDeployment: deployment, triggerId: context.primaryId,
-			taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
-			inputSnapshot, messageAssessments: result.message_assessments,
-			decision: { ...decisionTelemetry, action, targetWorkPackageId: match.workPackageId, similarity: match.similarity, outcome: "proposal" },
-		});
-		const operationSummary = describeProposalOperations(operations.contentOperation, operations.metadataPatch);
-		const warning = operations.contentOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : "";
+		const displayedOperation = redisplayed?.content_operation ?? operations.contentOperation;
+		const displayedPatch = redisplayed?.metadata_patch ?? operations.metadataPatch;
+		const displayedAction = redisplayed?.action ?? action;
+		const displayedTarget = redisplayed?.target_work_package_id ?? match.workPackageId;
+		const operationSummary = describeProposalOperations(displayedOperation, displayedPatch);
+		const warning = displayedOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : "";
 		await deliverProposalReply(interaction, services, proposal.id, {
-			content: boundedDiscordContent(`**Possible ${action} for #${match.workPackageId}**\n${operationSummary.map(item => `- ${item}`).join("\n")}${warning}\n\n${candidate.title}\n${description}\n\nSimilarity: ${Math.round(match.similarity * 100)}%`),
-			components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
-				new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and apply").setStyle(ButtonStyle.Primary),
-				new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
-			)],
-		});
+			content: boundedDiscordContent(`**Possible ${displayedAction} for #${displayedTarget}**\n${operationSummary.map(item => `- ${item}`).join("\n")}${warning}\n\n${redisplayed?.title ?? candidate.title}\n${redisplayed?.description ?? description}${redisplayed ? "" : `\n\nSimilarity: ${Math.round(match.similarity * 100)}%`}`),
+			components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...manualProposalButtons(proposal.id, displayedAction))],
+		}, !proposal.reused);
 		return;
 	}
 	if (projectId) {
@@ -1419,26 +1471,33 @@ async function completeAiContext(
 				estimatedHours: candidate.estimated_hours, action: "create", sourceMessageIds: candidate.source_message_ids, sourceLinks,
 			}),
 	});
+	let redisplayed: Awaited<ReturnType<Database["proposal"]>>;
 	if (proposal.reused) {
 		await services.db.recordExtraction({
 			source: "manual", outcome: "duplicate", modelDeployment: deployment,
 			taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
 			inputSnapshot, messageAssessments: result.message_assessments, decision: { ...decisionTelemetry, outcome: "proposal" },
 		});
-		await interaction.editReply("This discussion already has a pending or created task proposal.");
-		return;
+		const existing = await services.db.proposal(proposal.id);
+		if (!existing || !proposalIsReviewable(existing)) {
+			await interaction.editReply("This discussion already has a task proposal that is no longer pending.");
+			return;
+		}
+		if (!await canReviewProposal(interaction, existing, services)) {
+			await interaction.editReply("This discussion already has a pending task proposal, but you are not one of its reviewers.");
+			return;
+		}
+		redisplayed = existing;
+	} else {
+		await services.db.recordExtraction({
+			source: "manual", outcome: "proposal", modelDeployment: deployment, triggerId: context.primaryId,
+			taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+			inputSnapshot, messageAssessments: result.message_assessments, decision: {
+				...decisionTelemetry, action: "create", outcome: "proposal", ragMatch: similar[0] ? { workPackageId: similar[0].workPackageId, similarity: similar[0].similarity } : null,
+			},
+		});
 	}
-	await services.db.recordExtraction({
-		source: "manual", outcome: "proposal", modelDeployment: deployment, triggerId: context.primaryId,
-		taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
-		inputSnapshot, messageAssessments: result.message_assessments, decision: {
-			...decisionTelemetry, action: "create", outcome: "proposal", ragMatch: similar[0] ? { workPackageId: similar[0].workPackageId, similarity: similar[0].similarity } : null,
-		},
-	});
-	const review = new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and edit").setStyle(ButtonStyle.Primary);
-	const dismiss = new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary);
-	const duplicate = new ButtonBuilder().setCustomId(`op-duplicate:${proposal.id}`).setLabel("Already tracked").setStyle(ButtonStyle.Secondary);
-	const details = [
+	const details = redisplayed ? "" : [
 		`Project: ${project?.name ?? "Not resolved"}`,
 		`Assignee: ${assigneeId ? `<@${assigneeId}>` : "Not inferred"}`,
 		`Accountable: <@${accountableId}>`,
@@ -1448,9 +1507,9 @@ async function completeAiContext(
 		`Estimate: ${candidate.estimated_hours !== null ? `${candidate.estimated_hours}h` : "Not inferred"}`,
 	].join("\n");
 	await deliverProposalReply(interaction, services, proposal.id, {
-		content: boundedDiscordContent(`**${candidate.title}**\n${description}${details ? `\n\n${details}` : ""}\n\nClassification: ${candidate.classification}${result.ambiguities.length ? `\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`),
-		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(review, dismiss, duplicate)],
-	});
+		content: boundedDiscordContent(`**${redisplayed?.title ?? candidate.title}**\n${redisplayed?.description ?? description}${details ? `\n\n${details}` : ""}${redisplayed ? "" : `\n\nClassification: ${candidate.classification}${result.ambiguities.length ? `\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`}`),
+		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...manualProposalButtons(proposal.id, "create"))],
+	}, !proposal.reused);
 }
 
 async function handleSensitiveOverrideButton(interaction: ButtonInteraction, services: Services) {
@@ -1528,9 +1587,6 @@ async function handleProposalButton(interaction: ButtonInteraction, services: Se
 	].slice(0, 5);
 	if (!fields.length) fields.push(new TextInputBuilder().setCustomId("confirm").setLabel("Confirm the changes shown in the card").setStyle(TextInputStyle.Short).setRequired(false).setValue("Apply"));
 	modal.addComponents(...fields.map(field => new ActionRowBuilder<TextInputBuilder>().addComponents(field)));
-	if (!await services.db.startProposalReview(id, interaction.user.id)) {
-		throw new Error("This proposal was already handled by another reviewer.");
-	}
 	await interaction.showModal(modal);
 }
 

@@ -621,17 +621,6 @@ export class Database {
 		);
 	}
 
-	async startProposalReview(id: string, reviewerId: string) {
-		const result = await this.pool.query(
-			`UPDATE task_proposals SET review_started_at=COALESCE(review_started_at, now()),
-			 status='pending_review', claim_expires_at=NULL, reviewer_discord_id=$2, updated_at=now()
-			 WHERE id=$1 AND (status='pending_review' OR (status='creating' AND claim_expires_at < now()))
-			 AND expires_at > now() RETURNING id`,
-			[id, reviewerId],
-		);
-		return result.rowCount === 1;
-	}
-
 	async supersedeLegacyProposal(id: string) {
 		await this.pool.query(
 			`UPDATE task_proposals SET status='superseded', review_outcome='superseded',
@@ -672,6 +661,7 @@ export class Database {
 	async claimProposal(id: string, reviewerId: string) {
 		const result = await this.pool.query(
 			`UPDATE task_proposals SET status='creating', reviewer_discord_id=$2,
+			 review_started_at=COALESCE(review_started_at, now()),
 			 claim_expires_at=now() + interval '15 minutes', updated_at=now()
 			 WHERE id=$1 AND (status='pending_review' OR (status='creating' AND claim_expires_at < now()))
 			 AND expires_at > now() RETURNING id`,

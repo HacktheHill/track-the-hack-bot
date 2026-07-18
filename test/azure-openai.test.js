@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AzureTaskExtractor, containsSensitiveContent, minimizeText, normalizeExtractedDate, SensitiveContentError } from "../dist/azure-openai.js";
+import { AzureTaskExtractor, containsSensitiveContent, minimizeText, normalizeExtractedDate, sensitiveContentReasons, SensitiveContentError } from "../dist/azure-openai.js";
 
 test("minimizeText removes common credentials and personal contact data", () => {
 	const value = minimizeText(
@@ -60,7 +60,11 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 		assert.match(request.body.messages[0].content, /size_name must exactly match one of: Small/);
 		assert.match(request.body.messages[0].content, /content_intent=update_note/);
 		assert.match(request.body.messages[0].content, /only explicitly requested existing-task metadata changes/);
-		assert.match(request.body.messages[0].content, /do not invent missing objectives/);
+		assert.match(request.body.messages[0].content, /do not invent missing objectives/i);
+		assert.match(request.body.messages[0].content, /compare every cited message to that task's specific title and scope/);
+		assert.match(request.body.messages[0].content, /heading and bullet list/);
+		assert.match(request.body.messages[0].content, /application adds verified links separately/);
+		assert.match(request.body.messages[0].content, /most recent message has priority=true/);
 		assert.ok(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("content_intent"));
 		assert.deepEqual(JSON.parse(request.body.messages[1].content[0].text)[0], {
 			id: "m1", authorAlias: "USER_1", text: "Ship it",
@@ -170,6 +174,20 @@ test("sensitive content is rejected before an Azure request", async () => {
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
+});
+
+test("sensitive-content decisions expose safe categories without matched values", () => {
+	assert.deepEqual(sensitiveContentReasons([
+		{ id: "m1", authorAlias: "USER_1", text: "Please send the payroll spreadsheet", timestamp: "2026-07-13T00:00:00Z" },
+		{ id: "m2", authorAlias: "USER_2", text: "Contact [REDACTED_EMAIL]", timestamp: "2026-07-13T00:01:00Z" },
+	]), ["Financial, payroll, or payment information", "Email address"]);
+});
+
+test("ordinary organizer agreements and board work are not treated as sensitive", () => {
+	assert.equal(containsSensitiveContent([
+		{ id: "m1", authorAlias: "USER_1", text: "Review the sponsorship agreement, invoice, contract negotiation notes, and board meeting agenda.", timestamp: "2026-07-13T00:00:00Z" },
+	]), false);
+	assert.equal(minimizeText("Keep the sponsor reveal secret until launch."), "Keep the sponsor reveal secret until launch.");
 });
 
 test("a manual override permits one explicitly approved sensitive request", async () => {

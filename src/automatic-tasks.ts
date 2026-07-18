@@ -3,9 +3,9 @@ import { containsSensitiveContent, minimizeText, StructuredOutputError, type Min
 import { isOrganizerGuild, type IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient } from "./openproject.js";
-import { appendSourceLinks, boundedDiscordContent, defaultAiDueDate } from "./tasks.js";
+import { boundedDiscordContent, defaultAiDueDate, formatAiTaskDescription } from "./tasks.js";
 import { resolveProposedAction, type OpenProjectRag } from "./rag.js";
-import { describeProposalOperations, planExistingTaskOperations } from "./task-proposals.js";
+import { describeProposalOperations, planExistingTaskOperations, taskSourcesAreRelevant } from "./task-proposals.js";
 
 type AutomaticServices = { config: IntegrationConfig; db: Database; extractor: TaskExtractor; openProject: OpenProjectClient; rag?: OpenProjectRag };
 type Batch = { messages: Message[]; timer: NodeJS.Timeout };
@@ -54,6 +54,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			}
 			return alias;
 		};
+		const primary = source.at(-1);
 		const minimized: MinimizedMessage[] = source.map(message => {
 			const raw = message.content.replace(/<@!?(\d+)>/g, (_, id: string) => aliasFor(id));
 			return {
@@ -62,7 +63,8 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				authorAlias: aliasFor(message.author.id),
 				text: minimizeText(raw),
 				timestamp: message.createdAt.toISOString(),
-					replyTo: message.reference?.messageId,
+				replyTo: message.reference?.messageId,
+				priority: message.id === primary?.id,
 				attachments: [...message.attachments.values()].map(attachment => ({
 					id: attachment.id,
 					name: attachment.name ?? "attachment",
@@ -101,13 +103,15 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				item.significance_score >= services.config.OPENPROJECT_AI_SIGNIFICANCE_THRESHOLD &&
 				["new_assignment", "clarification", "additional_requirements", "status_update", "completion_evidence", "unclear"].includes(item.context_relation))) {
 				if (!task.source_message_ids.every(id => source.some(message => message.id === id))) continue;
+				if (!task.source_message_ids.includes(primary?.id ?? "")) continue;
+				if (!taskSourcesAreRelevant(task.source_message_ids, result.message_assessments)) continue;
 				const assigneeId = task.assignee_alias ? reverse.get(task.assignee_alias) : undefined;
 				const accountableId = source.find(message => task.source_message_ids.includes(message.id))?.author.id;
 				const priority = task.priority_name ? priorities.find(item => item.name.toLocaleLowerCase() === task.priority_name!.toLocaleLowerCase()) : undefined;
 				const size = task.size_name ? sizes.find(item => item.value.toLocaleLowerCase() === task.size_name!.toLocaleLowerCase()) : undefined;
 				const dueDate = task.due_date ?? defaultAiDueDate(new Date(), priority?.name, size?.value, services.config.BOT_TIME_ZONE);
 				const sourceLinks = task.source_message_ids.map(id => `https://discord.com/channels/${source[0]?.guildId ?? ""}/${source.find(item => item.id === id)?.channelId ?? channelId}/${id}`);
-				const description = appendSourceLinks(task.description, sourceRecords, task.source_message_ids, task.relevant_attachment_ids);
+				const description = formatAiTaskDescription(task.description, minimized, sourceRecords, task.source_message_ids, task.relevant_attachment_ids);
 				const similar = projectId && services.rag ? await services.rag.findSimilar(projectId, task.title, description) : [];
 				ragEvaluations.push({
 					title: task.title, proposedAction: task.proposed_action,
