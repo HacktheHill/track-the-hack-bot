@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { corpusWindowSchema, isRuntimeCreateCandidate } from "../dist/evaluate-ai.js";
-import { OpenProjectClient } from "../dist/openproject.js";
+import { OpenProjectClient, workPackageChangesApplied } from "../dist/openproject.js";
 import { lexicalTitleSimilarity, OpenProjectRag, resolveProposedAction } from "../dist/rag.js";
 
 test("RAG shadow mode never changes proposal actions", () => {
@@ -48,6 +48,75 @@ test("OpenProject updates reject stale proposal lock versions before PATCH", asy
 	try {
 		const client = new OpenProjectClient({ OPENPROJECT_BASE_URL: "https://openproject.example", OPENPROJECT_API_KEY: "secret", OPENPROJECT_CACHE_TTL_MS: 1000 });
 		await assert.rejects(client.updateWorkPackage(42, { subject: "Proposed" }, 3), /changed since this proposal/);
+		assert.equal(calls, 1);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("OpenProject updates enforce the freshly fetched lock version", async () => {
+	const originalFetch = globalThis.fetch;
+	let payload;
+	globalThis.fetch = async (_url, init = {}) => {
+		if ((init.method ?? "GET") === "PATCH") {
+			payload = JSON.parse(init.body);
+			return Response.json({ id: 42, subject: "Updated", lockVersion: 6, _links: {} });
+		}
+		return Response.json({ id: 42, subject: "Current", lockVersion: 5, _links: {} });
+	};
+	try {
+		const client = new OpenProjectClient({ OPENPROJECT_BASE_URL: "https://openproject.example", OPENPROJECT_API_KEY: "secret", OPENPROJECT_CACHE_TTL_MS: 1000 });
+		await client.updateWorkPackage(42, { subject: "Updated", lockVersion: 999 }, 5);
+		assert.equal(payload.lockVersion, 5);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("already-applied OpenProject changes can recover a lost checkpoint", () => {
+	const workPackage = {
+		id: 42, subject: "Updated", description: { raw: "New scope" }, lockVersion: 6,
+		dueDate: "2026-07-31", estimatedTime: "PT4H",
+		_links: { assignee: { href: "/api/v3/users/8" } }, customField2: { href: "/api/v3/custom_options/3" },
+	};
+	assert.equal(workPackageChangesApplied(workPackage, {
+		subject: "Updated", description: { format: "markdown", raw: "New scope" }, dueDate: "2026-07-31",
+		estimatedTime: "PT4H", _links: { assignee: { href: "/api/v3/users/8" } }, customField2: { href: "/api/v3/custom_options/3" },
+	}), true);
+	assert.equal(workPackageChangesApplied(workPackage, { dueDate: "2026-08-01" }), false);
+});
+
+test("OpenProject comments are Markdown activities and deduplicate by proposal marker", async () => {
+	const originalFetch = globalThis.fetch;
+	const requests = [];
+	globalThis.fetch = async (url, init = {}) => {
+		requests.push({ url: String(url), method: init.method ?? "GET", body: init.body ? JSON.parse(init.body) : undefined });
+		if ((init.method ?? "GET") === "POST") return Response.json({ id: 9, comment: { raw: init.body }, _links: {} }, { status: 201 });
+		return Response.json({ _embedded: { elements: [] }, _links: {} });
+	};
+	try {
+		const client = new OpenProjectClient({ OPENPROJECT_BASE_URL: "https://openproject.example", OPENPROJECT_API_KEY: "secret", OPENPROJECT_CACHE_TTL_MS: 1000 });
+		const activity = await client.commentWorkPackage(42, "## Update\n\n- Ship it", ["https://discord.com/channels/1/2/3"], "proposal");
+		assert.equal(activity.id, 9);
+		assert.equal(requests[1].url, "https://openproject.example/api/v3/work_packages/42/activities");
+		assert.equal(requests[1].method, "POST");
+		assert.match(requests[1].body.comment.raw, /track-the-hack-proposal:proposal:comment/);
+		assert.match(requests[1].body.comment.raw, /## Source/);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("OpenProject comments reuse an existing correlated activity", async () => {
+	const originalFetch = globalThis.fetch;
+	let calls = 0;
+	globalThis.fetch = async () => {
+		calls++;
+		return Response.json({ _embedded: { elements: [{ id: 7, comment: { raw: "<!-- track-the-hack-proposal:proposal:comment -->" } }] }, _links: {} });
+	};
+	try {
+		const client = new OpenProjectClient({ OPENPROJECT_BASE_URL: "https://openproject.example", OPENPROJECT_API_KEY: "secret", OPENPROJECT_CACHE_TTL_MS: 1000 });
+		assert.equal((await client.commentWorkPackage(42, "Update", [], "proposal")).id, 7);
 		assert.equal(calls, 1);
 	} finally {
 		globalThis.fetch = originalFetch;

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, isExcludedChannel, precedingUntilGap, proposalCorrections, proposalReviewAllowed, taskCommand, validIsoDate } from "../dist/tasks.js";
+import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, isExcludedChannel, precedingUntilGap, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, taskCommand, validIsoDate } from "../dist/tasks.js";
 import { normalizeTaskTitle, OpenProjectClient, titlesLikelyDuplicate } from "../dist/openproject.js";
 
 test("task defaults start today and use the configured due offset", () => {
@@ -90,6 +90,14 @@ test("proposal review permits participants, organizers, and server managers", ()
 	assert.equal(proposalReviewAllowed("member", [], null), false);
 });
 
+test("expired proposal claims can be reviewed again", () => {
+	const future = new Date(Date.now() + 60_000).toISOString();
+	const past = new Date(Date.now() - 60_000).toISOString();
+	assert.equal(proposalIsReviewable({ status: "pending_review", expires_at: future }), true);
+	assert.equal(proposalIsReviewable({ status: "creating", expires_at: future, claim_expires_at: past }), true);
+	assert.equal(proposalIsReviewable({ status: "creating", expires_at: future, claim_expires_at: future }), false);
+});
+
 test("older messages can resolve a high-confidence artifact reference", () => {
 	const score = historicalContinuityScore(
 		"I'm working on the same doc as last year; I made a new tab.",
@@ -135,12 +143,16 @@ test("AI task descriptions retain attachment links without verbatim source text"
 	const description = appendSourceLinks("Summary", new Map([
 		["m1", {
 			author: "Daniel", timestamp: "2026-07-06T22:00:00Z", text: "These are the fields to replace.",
-			attachments: [{ id: "a1", name: "schema.png", contentType: "image/png", url: "https://cdn.discordapp.com/attachments/1/2/schema.png" }],
+			attachments: [
+				{ id: "a1", name: "schema.png", contentType: "image/png", url: "https://cdn.discordapp.com/attachments/1/2/schema.png" },
+				{ id: "a2", name: "unrelated.png", contentType: "image/png", url: "https://cdn.discordapp.com/attachments/1/2/unrelated.png" },
+			],
 		}],
-	]), ["m1"]);
+	]), ["m1"], ["a1"]);
 	assert.equal(description.includes("## Source conversation"), false);
 	assert.equal(description.includes("These are the fields to replace."), false);
 	assert.match(description, /schema\.png/);
+	assert.equal(description.includes("unrelated.png"), false);
 });
 
 test("proposal cards stay within Discord's message limit", () => {

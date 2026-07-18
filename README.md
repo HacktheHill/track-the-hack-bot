@@ -130,9 +130,10 @@ first names disambiguated by configured Discord team role and OpenProject group.
 Existing mappings are never overwritten; ambiguous matches require
 `/task link-user`.
 
-For AI proposals, the selected message's author is Accountable and an explicit
-Discord mention or uniquely resolved Organizer nickname is the Assignee. When
-no deadline is stated, the bot derives one from the validated priority and size:
+For new-task AI proposals, the selected message's author is Accountable and an
+explicit Discord mention or uniquely resolved Organizer nickname is the
+Assignee. When no deadline is stated for a new task, the bot derives one from
+the validated priority and size:
 Normal starts at 14 days, with shorter windows for High/Immediate work and
 additional time for Medium, Large, and X-Large work.
 
@@ -174,9 +175,18 @@ does not propose updates. The `sync:embeddings` job is suitable for a
 Container Apps scheduled job.
 
 When RAG review is enabled, close matches become reviewed updates instead of
-duplicates. The same review path can apply requirement updates, completion, or
-reopening while checking the OpenProject `lockVersion` immediately before the
-change.
+duplicates. Existing-task metadata is changed only when the discussion
+explicitly requests that field. New requirements and clarifications are posted
+as Markdown activity comments, while a description is replaced only when the
+existing description has no substantive content or the discussion explicitly
+requests a rewrite. Metadata and comments can be applied together. Completion
+and reopening change status without replacing the title or description. Every
+mutation checks the OpenProject `lockVersion`, and correlated comments are
+deduplicated across retries.
+
+AI-generated descriptions use Markdown headings and bullet lists when the
+discussion contains enough structure. Sparse discussions remain concise rather
+than receiving invented objectives, acceptance criteria, or notes.
 
 Azure OpenAI authentication uses managed identity rather than an API key. The
 bot bounds the context, aliases Discord identities, redacts common credentials

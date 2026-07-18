@@ -1,6 +1,7 @@
 import { DefaultAzureCredential } from "@azure/identity";
 import { z } from "zod";
 import type { IntegrationConfig } from "./config.js";
+import { metadataFieldNames } from "./task-proposals.js";
 
 export function normalizeExtractedDate(value?: string | null) {
 	if (!value) return null;
@@ -34,6 +35,8 @@ const taskSchema = z.object({
 		evidence: z.string().max(500),
 		context_relation: z.enum(["new_assignment", "clarification", "additional_requirements", "status_update", "completion_evidence", "question", "unrelated", "unclear"]),
 		proposed_action: z.enum(["create", "update", "complete", "reopen", "no_action"]).default("create"),
+		content_intent: z.enum(["none", "update_note", "replace_description"]).default("none"),
+		metadata_change_fields: z.array(z.enum(metadataFieldNames)).max(metadataFieldNames.length).default([]),
 		completion_state: z.enum(["incomplete", "completed", "cancelled", "superseded", "unknown"]).default("unknown"),
 		significance_score: z.number().min(0).max(1).default(0.5),
 		classification: z.enum([
@@ -55,7 +58,7 @@ const taskJsonSchema = {
 			} } },
 			ambiguities: { type: "array", items: { type: "string", maxLength: 300 } },
 		tasks: { type: "array", maxItems: 5, items: { type: "object", additionalProperties: false,
-			required: ["title", "description", "assignee_alias", "start_date", "due_date", "priority_name", "size_name", "estimated_hours", "source_message_ids", "relevant_attachment_ids", "evidence", "context_relation", "proposed_action", "completion_state", "significance_score", "classification"],
+			required: ["title", "description", "assignee_alias", "start_date", "due_date", "priority_name", "size_name", "estimated_hours", "source_message_ids", "relevant_attachment_ids", "evidence", "context_relation", "proposed_action", "content_intent", "metadata_change_fields", "completion_state", "significance_score", "classification"],
 			properties: {
 				title: { type: "string", maxLength: 255 }, description: { type: "string", maxLength: 4000 },
 				assignee_alias: { type: ["string", "null"] },
@@ -67,6 +70,8 @@ const taskJsonSchema = {
 				evidence: { type: "string", maxLength: 500 },
 				context_relation: { type: "string", enum: ["new_assignment", "clarification", "additional_requirements", "status_update", "completion_evidence", "question", "unrelated", "unclear"] },
 				proposed_action: { type: "string", enum: ["create", "update", "complete", "reopen", "no_action"] },
+				content_intent: { type: "string", enum: ["none", "update_note", "replace_description"] },
+				metadata_change_fields: { type: "array", maxItems: metadataFieldNames.length, items: { type: "string", enum: metadataFieldNames } },
 				completion_state: { type: "string", enum: ["incomplete", "completed", "cancelled", "superseded", "unknown"] },
 				significance_score: { type: "number", minimum: 0, maximum: 1 },
 				classification: { type: "string", enum: [
@@ -289,6 +294,8 @@ async function invokeCompatible(options: {
 						"If supporting messages contain another topic, owner, or task, ignore it. Evaluate each primary message independently; do not merge unrelated primary messages. If a primary message cannot be interpreted without mixing topics, classify it as insufficient_context and explain the ambiguity rather than extracting an unrelated task.",
 						"For automatic batches with no primary message, extract significant incomplete work even when nobody is explicitly assigned; do not create tasks for trivial suggestions, completed work, cancellations, or superseded work.",
 						"Set proposed_action=create only for significant incomplete new work. Use update for material new requirements on existing work, complete when the discussion confirms completion, reopen when work must resume, and no_action for cancelled, superseded, trivial, or already-resolved work.",
+						"For existing work, set content_intent=update_note for new requirements, clarifications, progress, or evidence that should be recorded without replacing canonical scope. Set replace_description only when the discussion explicitly asks to replace or rewrite the task description. Use none for metadata-only changes. For create, use none.",
+						"List only explicitly requested existing-task metadata changes in metadata_change_fields. Do not list inferred, default, unresolved, or clearing values. Use subject for an explicit rename; assignee, priority, size, start_date, due_date, or estimated_hours only when a concrete new value is explicit. Field clearing is not supported by this extraction schema.",
 						"For complete or reopen, still return the task-shaped record with the existing work's best title and description so retrieval can locate it. Never turn completion, cancellation, or supersession into a new create action.",
 						"Cite a subsequent message when it confirms completion, clarifies the task, or supplies its deliverable URL. Include every relevant non-Discord URL from cited messages in the task description. Resolve an assignee only from an explicit assignment or commitment to a supplied USER alias.",
 						"Assess every supplied message exactly once in message_assessments, including unrelated messages. Use source_message_ids only for messages assessed as relevant, supporting, or completion evidence.",
@@ -296,6 +303,7 @@ async function invokeCompatible(options: {
 						"Classify each primary message's relationship to the work as new_assignment, clarification, additional_requirements, status_update, completion_evidence, question, unrelated, or unclear. A clarification or additional_requirements message may define a task only when the supporting assignment is also cited.",
 						"If an image attachment contains requirements, inspect it and cite its attachment ID. If text in an image is uncertain, put the uncertainty in ambiguities instead of inventing details.",
 						"Treat names in assignment labels or parenthetical assignee fields as people responsible for the task. Use clear, action-oriented wording grounded in the source.",
+						"Descriptions may be brief when the discussion is brief. When several requirements are present, use concise Markdown headings and bullet lists; do not invent missing objectives, acceptance criteria, or notes merely to fill a template.",
 						"Extract explicitly stated absolute or relative dates, using message timestamps to resolve relative timing. Dates must be YYYY-MM-DD. Use null when timing is unspecified; the application applies its scheduling defaults. Infer estimated_hours only when clearly supported.",
 						priorities.length ? `priority_name must exactly match one of: ${priorities.join(", ")}; otherwise use null.` : "Use null for priority_name because no allowed priorities were supplied.",
 						sizes.length ? `size_name must exactly match one of: ${sizes.join(", ")}; otherwise use null.` : "Use null for size_name because no allowed sizes were supplied.",

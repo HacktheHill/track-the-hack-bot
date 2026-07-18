@@ -5,6 +5,7 @@ import { Database } from "./database.js";
 import { OpenProjectClient } from "./openproject.js";
 import { appendSourceLinks, boundedDiscordContent, defaultAiDueDate } from "./tasks.js";
 import { resolveProposedAction, type OpenProjectRag } from "./rag.js";
+import { describeProposalOperations, planExistingTaskOperations } from "./task-proposals.js";
 
 type AutomaticServices = { config: IntegrationConfig; db: Database; extractor: TaskExtractor; openProject: OpenProjectClient; rag?: OpenProjectRag };
 type Batch = { messages: Message[]; timer: NodeJS.Timeout };
@@ -72,9 +73,13 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			};
 		});
 		try {
-			const extraction = await services.extractor.extract(minimized);
-			const { result, deployment } = extraction;
+			const projectId = source[0] ? await categoryProject(source[0], services) : undefined;
 			const priorities = await services.openProject.priorities();
+			const sizes = projectId ? await services.openProject.sizeOptions(projectId) : [];
+			const extraction = await services.extractor.extract(minimized, {
+				metadata: { priorities: priorities.map(priority => priority.name), sizes: sizes.map(size => size.value) },
+			});
+			const { result, deployment } = extraction;
 			let createdProposals = 0;
 			let duplicates = 0;
 			const ragEvaluations: Array<{ title: string; proposedAction: string; workPackageId?: number; similarity?: number }> = [];
@@ -98,13 +103,11 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				if (!task.source_message_ids.every(id => source.some(message => message.id === id))) continue;
 				const assigneeId = task.assignee_alias ? reverse.get(task.assignee_alias) : undefined;
 				const accountableId = source.find(message => task.source_message_ids.includes(message.id))?.author.id;
-				const projectId = source[0] ? await categoryProject(source[0], services) : undefined;
 				const priority = task.priority_name ? priorities.find(item => item.name.toLocaleLowerCase() === task.priority_name!.toLocaleLowerCase()) : undefined;
-				const sizes = projectId ? await services.openProject.sizeOptions(projectId) : [];
 				const size = task.size_name ? sizes.find(item => item.value.toLocaleLowerCase() === task.size_name!.toLocaleLowerCase()) : undefined;
 				const dueDate = task.due_date ?? defaultAiDueDate(new Date(), priority?.name, size?.value, services.config.BOT_TIME_ZONE);
 				const sourceLinks = task.source_message_ids.map(id => `https://discord.com/channels/${source[0]?.guildId ?? ""}/${source.find(item => item.id === id)?.channelId ?? channelId}/${id}`);
-				const description = appendSourceLinks(task.description, sourceRecords, task.source_message_ids);
+				const description = appendSourceLinks(task.description, sourceRecords, task.source_message_ids, task.relevant_attachment_ids);
 				const similar = projectId && services.rag ? await services.rag.findSimilar(projectId, task.title, description) : [];
 				ragEvaluations.push({
 					title: task.title, proposedAction: task.proposed_action,
@@ -115,6 +118,21 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				if (action === "no_action") continue;
 				if (action !== "create" && !match) continue;
 				if (match && action !== "create") {
+					const target = await services.openProject.workPackage(match.workPackageId);
+					const operations = planExistingTaskOperations({
+						workPackage: target,
+						requestedAction: task.proposed_action === "no_action" ? "update" : task.proposed_action,
+						contentIntent: task.content_intent,
+						description,
+						metadataFields: task.metadata_change_fields,
+						values: {
+							title: task.title, assigneeDiscordId: assigneeId, priorityId: priority?.id,
+							sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined,
+							startDate: task.start_date ?? undefined, dueDate: task.due_date ?? undefined,
+							estimatedHours: task.estimated_hours ?? undefined,
+						},
+					});
+					if (operations.contentOperation === "none" && Object.keys(operations.metadataPatch).length === 0) continue;
 					const reviewers = new Set<string>(source.filter(message => task.source_message_ids.includes(message.id)).map(message => message.author.id));
 					if (assigneeId) reviewers.add(assigneeId);
 					if (accountableId) reviewers.add(accountableId);
@@ -126,7 +144,9 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						sourceMessageIds: task.source_message_ids, sourceLinks,
 						classification: task.classification, modelDeployment: deployment, permittedReviewerIds: [...reviewers], evidence: task.evidence,
 						ambiguities: [...result.ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
-						action, targetWorkPackageId: match.workPackageId, targetLockVersion: match.lockVersion,
+						action, targetWorkPackageId: match.workPackageId, targetLockVersion: target.lockVersion,
+						metadataPatch: operations.metadataPatch, contentOperation: operations.contentOperation,
+						contentMarkdown: operations.contentMarkdown,
 						initialSnapshot: {
 							title: task.title, description, projectId, assigneeId, accountableId, priorityId: priority?.id,
 							sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate: task.start_date,
@@ -139,7 +159,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						const channel = source.at(-1)?.channel;
 						if (channel?.isSendable()) try {
 							await channel.send({
-							content: boundedDiscordContent(`${assigneeId ? `<@${assigneeId}> ` : ""}${accountableId && accountableId !== assigneeId ? `<@${accountableId}> ` : ""}Proposed ${action} for OpenProject task #${match.workPackageId}: **${task.title}**`),
+							content: boundedDiscordContent(`${assigneeId ? `<@${assigneeId}> ` : ""}${accountableId && accountableId !== assigneeId ? `<@${accountableId}> ` : ""}Proposed ${action} for OpenProject task #${match.workPackageId}: **${task.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch).map(item => `- ${item}`).join("\n")}${operations.contentOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : ""}`),
 							components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
 								new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and apply").setStyle(ButtonStyle.Primary),
 								new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),

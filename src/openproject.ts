@@ -1,4 +1,5 @@
 import type { IntegrationConfig } from "./config.js";
+import { composeOpenProjectMarkdown } from "./task-proposals.js";
 
 type HalLink = { href: string; title?: string };
 type Collection<T> = { _embedded: { elements: T[] }; _links?: { next?: HalLink } };
@@ -7,6 +8,7 @@ export type Project = { id: number; name: string; active: boolean; _links: Recor
 export type OpenProjectUser = { id: number; name: string; login?: string; status?: string; _type?: string };
 export type ProjectMembership = { id: number; _links: Record<string, HalLink> };
 export type WorkPackage = {
+	[key: string]: unknown;
 	id: number;
 	subject: string;
 	description?: { raw?: string } | string | null;
@@ -14,8 +16,10 @@ export type WorkPackage = {
 	lockVersion: number;
 	startDate?: string | null;
 	dueDate?: string | null;
+	estimatedTime?: string | null;
 	_links: Record<string, HalLink>;
 };
+export type Activity = { id: number; comment?: { raw?: string } | null; _links?: Record<string, HalLink> };
 
 export class OpenProjectRequestError extends Error {
 	constructor(message: string, readonly ambiguous = false) {
@@ -52,6 +56,23 @@ export function titlesLikelyDuplicate(left: string, right: string) {
 	const intersection = [...leftWords].filter(word => rightWords.has(word)).length;
 	const union = new Set([...leftWords, ...rightWords]).size;
 	return union > 0 && intersection >= 2 && intersection / union >= 0.6;
+}
+
+export function workPackageChangesApplied(workPackage: WorkPackage, changes: Record<string, unknown>) {
+	return Object.entries(changes).every(([field, expected]) => {
+		if (field === "_links") {
+			return Object.entries(expected as Record<string, { href: string | null }>).every(([name, link]) =>
+				(workPackage._links[name]?.href ?? null) === link.href);
+		}
+		if (field === "description") {
+			const current = typeof workPackage.description === "string" ? workPackage.description : workPackage.description?.raw ?? "";
+			return current === (expected as { raw?: string })?.raw;
+		}
+		if (expected && typeof expected === "object" && "href" in expected) {
+			return ((workPackage[field] as { href?: string } | null)?.href ?? null) === (expected as { href?: string | null }).href;
+		}
+		return workPackage[field] === expected;
+	});
 }
 
 export class OpenProjectClient {
@@ -203,11 +224,11 @@ export class OpenProjectClient {
 	}
 
 	async createWorkPackage(input: WorkPackageInput) {
-		const context = input.sourceLinks.length
-			? `---\nRelated links:\n${input.sourceLinks.map(link => `- ${link}`).join("\n")}`
-			: "";
-		const correlation = input.correlationId ? `<!-- track-the-hack-correlation:${input.correlationId} -->` : "";
-		const description = [input.description.trim(), context, correlation].filter(Boolean).join("\n\n");
+		const description = composeOpenProjectMarkdown(
+			input.description,
+			input.sourceLinks,
+			input.correlationId ? `track-the-hack-correlation:${input.correlationId}` : undefined,
+		);
 		const payload: Record<string, unknown> = {
 			subject: input.subject,
 			description: { format: "markdown", raw: description },
@@ -263,8 +284,30 @@ export class OpenProjectClient {
 		}
 		return this.request<WorkPackage>(`/api/v3/work_packages/${id}`, {
 			method: "PATCH",
-			body: JSON.stringify({ lockVersion: current.lockVersion, ...changes }),
+			body: JSON.stringify({ ...changes, lockVersion: current.lockVersion }),
 		});
+	}
+
+	async workPackageActivities(id: number) {
+		return this.collection<Activity>(`/api/v3/work_packages/${id}/activities?pageSize=100`);
+	}
+
+	async commentWorkPackage(id: number, markdown: string, sourceLinks: string[], correlationId: string) {
+		const marker = `track-the-hack-proposal:${correlationId}:comment`;
+		const body = composeOpenProjectMarkdown(markdown, sourceLinks, marker);
+		const existing = (await this.workPackageActivities(id)).find(activity => activity.comment?.raw?.includes(`<!-- ${marker} -->`));
+		if (existing) return existing;
+		try {
+			return await this.request<Activity>(`/api/v3/work_packages/${id}/activities`, {
+				method: "POST",
+				body: JSON.stringify({ comment: { raw: body } }),
+			});
+		} catch (error) {
+			if (!(error instanceof OpenProjectRequestError) || !error.ambiguous) throw error;
+			const recovered = (await this.workPackageActivities(id)).find(activity => activity.comment?.raw?.includes(`<!-- ${marker} -->`));
+			if (recovered) return recovered;
+			throw error;
+		}
 	}
 
 	async possibleDuplicate(projectId: number, title: string) {

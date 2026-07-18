@@ -103,6 +103,28 @@ test("AI proposal metadata is persisted for reviewed task creation", async () =>
 	assert.deepEqual(inserted.values.slice(7, 13), ["accountable", 4, "/api/v3/custom_options/5", "2026-07-14", "2026-07-21", 6]);
 });
 
+test("existing-task proposals persist explicit operations and independent checkpoints", async () => {
+	const queries = [];
+	const db = databaseWithPool({
+		async query(sql, values) {
+			queries.push({ sql, values });
+			return { rowCount: 1, rows: [{ id: "proposal" }] };
+		},
+	});
+	await db.createProposal({
+		channelId: "channel", projectId: 3, title: "Update wording", description: "Add the revisions",
+		sourceMessageIds: ["message"], classification: "direct_assignment", modelDeployment: "model",
+		action: "update", targetWorkPackageId: 2149, targetLockVersion: 0,
+		metadataPatch: { dueDate: "2026-07-31" }, contentOperation: "postComment", contentMarkdown: "- Change wording",
+	});
+	assert.match(queries[0].sql, /operation_schema_version, metadata_patch, content_operation, content_markdown/);
+	assert.deepEqual(queries[0].values.slice(27, 31), [1, '{"dueDate":"2026-07-31"}', "postComment", "- Change wording"]);
+	await db.markProposalPatchApplied("proposal", 2);
+	await db.markProposalCommentApplied("proposal", 99);
+	assert.match(queries[1].sql, /patch_applied_at/);
+	assert.match(queries[2].sql, /comment_activity_id/);
+});
+
 test("proposal review start and completion persist timing and correction metadata", async () => {
 	const queries = [];
 	const db = databaseWithPool({
@@ -120,6 +142,32 @@ test("proposal review start and completion persist timing and correction metadat
 	assert.match(queries[0].sql, /review_started_at=COALESCE/);
 	assert.match(queries[1].sql, /review_outcome='approved'/);
 	assert.deepEqual(queries[1].values[4], corrections);
+});
+
+test("existing-task proposal finalization commits status, audit, and revision together", async () => {
+	const queries = [];
+	const client = {
+		async query(sql, values) {
+			queries.push({ sql, values });
+			if (sql.includes("UPDATE task_proposals")) return { rowCount: 1, rows: [{ revision: 2 }] };
+			return { rowCount: null, rows: [] };
+		},
+		release() {},
+	};
+	const db = databaseWithPool({ async connect() { return client; } });
+	const corrections = {
+		title: false, description: false, project: false, assignee: false, accountable: false,
+		priority: false, size: false, startDate: false, dueDate: false, estimate: false,
+	};
+	await db.finalizeProposalUpdate({
+		id: "proposal", reviewerId: "reviewer", workPackageId: 42, corrections,
+		action: "update", finalSnapshot: { contentOperation: "postComment" },
+	});
+	assert.equal(queries[0].sql, "BEGIN");
+	assert.match(queries[1].sql, /revision=revision \+ 1/);
+	assert.match(queries[2].sql, /task_audit_log/);
+	assert.match(queries[3].sql, /task_proposal_revisions/);
+	assert.equal(queries[4].sql, "COMMIT");
 });
 
 test("extraction events retain structured metrics but no message content", async () => {
@@ -148,6 +196,14 @@ test("proposal delivery failures become retryable failed proposals", async () =>
 	assert.match(query.sql, /status='failed'/);
 	assert.match(query.sql, /delivery_failed/);
 	assert.deepEqual(query.values, ["proposal", "Discord rejected the message"]);
+});
+
+test("proposal claims use an expiring lease", async () => {
+	let query;
+	const db = databaseWithPool({ async query(sql, values) { query = { sql, values }; return { rowCount: 1, rows: [{ id: "proposal" }] }; } });
+	assert.equal(await db.claimProposal("proposal", "reviewer"), true);
+	assert.match(query.sql, /claim_expires_at=now\(\) \+ interval '15 minutes'/);
+	assert.match(query.sql, /status='creating' AND claim_expires_at < now\(\)/);
 });
 
 test("handled proposal revisions use AI evaluation retention instead of proposal expiry", async () => {

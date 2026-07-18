@@ -1,6 +1,7 @@
 import pg from "pg";
 import type { IntegrationConfig } from "./config.js";
 import { randomUUID } from "node:crypto";
+import { proposalMetadataPatchSchema, type ContentOperation, type ProposalMetadataPatch } from "./task-proposals.js";
 
 const { Pool } = pg;
 
@@ -110,6 +111,14 @@ export class Database {
 				review_outcome TEXT,
 				correction_flags JSONB NOT NULL DEFAULT '{}',
 				review_failure_count INTEGER NOT NULL DEFAULT 0,
+				operation_schema_version INTEGER,
+				metadata_patch JSONB NOT NULL DEFAULT '{}',
+				content_operation TEXT,
+				content_markdown TEXT,
+				patch_applied_at TIMESTAMPTZ,
+				applied_lock_version INTEGER,
+				comment_activity_id INTEGER,
+				claim_expires_at TIMESTAMPTZ,
 				expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '30 days'),
 				created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 				updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -225,6 +234,17 @@ export class Database {
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS target_work_package_id INTEGER");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS target_lock_version INTEGER");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS revision INTEGER NOT NULL DEFAULT 1");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS operation_schema_version INTEGER");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS metadata_patch JSONB NOT NULL DEFAULT '{}'");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS content_operation TEXT");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS content_markdown TEXT");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS patch_applied_at TIMESTAMPTZ");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS applied_lock_version INTEGER");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS comment_activity_id INTEGER");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS claim_expires_at TIMESTAMPTZ");
+		await this.pool.query(`UPDATE task_proposals SET status='superseded', review_outcome='superseded',
+			error='This proposal predates safe update operations. Extract the discussion again.', reviewed_at=now(), updated_at=now()
+			WHERE status='pending_review' AND action <> 'create' AND operation_schema_version IS NULL`);
 		await this.pool.query("ALTER TABLE task_proposals DROP CONSTRAINT IF EXISTS task_proposals_openproject_work_package_id_key");
 		await this.pool.query("ALTER TABLE ai_extraction_events ADD COLUMN IF NOT EXISTS trigger_id TEXT");
 		await this.pool.query("ALTER TABLE ai_extraction_events ADD COLUMN IF NOT EXISTS input_snapshot JSONB");
@@ -504,6 +524,9 @@ export class Database {
 		targetWorkPackageId?: number;
 		targetLockVersion?: number;
 		initialSnapshot?: Record<string, unknown>;
+		metadataPatch?: ProposalMetadataPatch;
+		contentOperation?: ContentOperation;
+		contentMarkdown?: string | null;
 	}) {
 		const id = randomUUID();
 		const fingerprint = [...input.sourceMessageIds].sort().join(":") + `:${input.action ?? "create"}:${input.targetWorkPackageId ?? "new"}:${input.title.toLowerCase()}`;
@@ -513,9 +536,10 @@ export class Database {
 			 assignee_discord_id, accountable_discord_id, priority_id, size_href, start_date, due_date, estimated_hours,
 			 source_message_ids, source_fingerprint, source_links,
 			 classification, status, model_deployment, permitted_reviewer_ids, action, target_work_package_id, target_lock_version,
-			 evidence, ambiguities, latency_ms, token_usage, escalation_reason, expires_at)
+			 evidence, ambiguities, latency_ms, token_usage, escalation_reason,
+			 operation_schema_version, metadata_patch, content_operation, content_markdown, expires_at)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'pending_review',$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,
-			 now() + ($28::text || ' days')::interval)
+			 $28,$29,$30,$31,now() + ($32::text || ' days')::interval)
 			ON CONFLICT(source_fingerprint) DO UPDATE SET
 			 requester_discord_id=excluded.requester_discord_id, channel_id=excluded.channel_id,
 			 project_id=excluded.project_id, title=excluded.title, description=excluded.description,
@@ -528,10 +552,13 @@ export class Database {
 			 status='pending_review', model_deployment=excluded.model_deployment,
 			 permitted_reviewer_ids=excluded.permitted_reviewer_ids, evidence=excluded.evidence,
 			 ambiguities=excluded.ambiguities, latency_ms=excluded.latency_ms,
-			 token_usage=excluded.token_usage, escalation_reason=excluded.escalation_reason,
-			 reviewer_discord_id=NULL, openproject_work_package_id=NULL,
+				 token_usage=excluded.token_usage, escalation_reason=excluded.escalation_reason,
+				 operation_schema_version=excluded.operation_schema_version, metadata_patch=excluded.metadata_patch,
+				 content_operation=excluded.content_operation, content_markdown=excluded.content_markdown,
+				 patch_applied_at=NULL, applied_lock_version=NULL, comment_activity_id=NULL,
+				 reviewer_discord_id=NULL, openproject_work_package_id=NULL,
 				 confirmation_message_id=NULL, error=NULL, expires_at=excluded.expires_at, updated_at=now()
-			WHERE task_proposals.status IN ('dismissed','duplicate','failed')
+			WHERE task_proposals.status IN ('dismissed','duplicate','failed','superseded')
 			RETURNING id`,
 			[id, input.requesterId, input.channelId, input.projectId ?? null, input.title,
 			 input.description, input.assigneeDiscordId ?? null, input.accountableDiscordId ?? null,
@@ -541,7 +568,8 @@ export class Database {
 			 input.permittedReviewerIds ?? (input.requesterId ? [input.requesterId] : []), input.action ?? "create", input.targetWorkPackageId ?? null, input.targetLockVersion ?? null,
 			 input.evidence ?? null, input.ambiguities ?? [], input.latencyMs ?? null,
 			 input.tokenUsage ?? null, input.escalationReason ?? null,
-			 input.retentionDays ?? 30],
+			 input.action && input.action !== "create" ? 1 : null, jsonParameter(input.metadataPatch ?? {}),
+			 input.contentOperation ?? null, input.contentMarkdown ?? null, input.retentionDays ?? 30],
 		);
 		if (result.rows[0]) {
 			if (input.initialSnapshot) await this.recordProposalRevision(result.rows[0].id, 1, "initial", input.initialSnapshot);
@@ -565,8 +593,13 @@ export class Database {
 			 source_message_ids: string[]; source_links: string[]; status: string; permitted_reviewer_ids: string[];
 			 expires_at: string; openproject_work_package_id: number | null;
 			 action: "create" | "update" | "complete" | "reopen"; target_work_package_id: number | null; target_lock_version: number | null;
+			 operation_schema_version: number | null; metadata_patch: ProposalMetadataPatch;
+			 content_operation: ContentOperation | null; content_markdown: string | null;
+			 patch_applied_at: string | null; applied_lock_version: number | null; comment_activity_id: number | null;
+			 claim_expires_at: string | null;
 		}>("SELECT * FROM task_proposals WHERE id=$1", [id]);
-		return result.rows[0];
+		const row = result.rows[0];
+		return row ? { ...row, metadata_patch: proposalMetadataPatchSchema.parse(row.metadata_patch ?? {}) } : undefined;
 	}
 
 	async setProposalStatus(id: string, status: string, reviewerId: string) {
@@ -591,11 +624,21 @@ export class Database {
 	async startProposalReview(id: string, reviewerId: string) {
 		const result = await this.pool.query(
 			`UPDATE task_proposals SET review_started_at=COALESCE(review_started_at, now()),
-			 reviewer_discord_id=$2, updated_at=now()
-			 WHERE id=$1 AND status='pending_review' AND expires_at > now() RETURNING id`,
+			 status='pending_review', claim_expires_at=NULL, reviewer_discord_id=$2, updated_at=now()
+			 WHERE id=$1 AND (status='pending_review' OR (status='creating' AND claim_expires_at < now()))
+			 AND expires_at > now() RETURNING id`,
 			[id, reviewerId],
 		);
 		return result.rowCount === 1;
+	}
+
+	async supersedeLegacyProposal(id: string) {
+		await this.pool.query(
+			`UPDATE task_proposals SET status='superseded', review_outcome='superseded',
+			 error='This proposal predates safe update operations. Extract the discussion again.', reviewed_at=now(), updated_at=now()
+			 WHERE id=$1 AND action <> 'create' AND operation_schema_version IS NULL AND status IN ('pending_review','creating')`,
+			[id],
+		);
 	}
 
 	async updateProposalMetadata(id: string, reviewerId: string, fields: {
@@ -628,8 +671,10 @@ export class Database {
 
 	async claimProposal(id: string, reviewerId: string) {
 		const result = await this.pool.query(
-			`UPDATE task_proposals SET status='creating', reviewer_discord_id=$2, updated_at=now()
-			 WHERE id=$1 AND status='pending_review' AND expires_at > now() RETURNING id`,
+			`UPDATE task_proposals SET status='creating', reviewer_discord_id=$2,
+			 claim_expires_at=now() + interval '15 minutes', updated_at=now()
+			 WHERE id=$1 AND (status='pending_review' OR (status='creating' AND claim_expires_at < now()))
+			 AND expires_at > now() RETURNING id`,
 			[id, reviewerId],
 		);
 		return result.rowCount === 1;
@@ -637,10 +682,24 @@ export class Database {
 
 	async releaseProposal(id: string, error: string) {
 		await this.pool.query(
-			`UPDATE task_proposals SET status='pending_review', reviewer_discord_id=NULL,
+			`UPDATE task_proposals SET status='pending_review', reviewer_discord_id=NULL, claim_expires_at=NULL,
 			 error=$2, review_failure_count=review_failure_count + 1, updated_at=now()
 			 WHERE id=$1 AND status='creating' AND expires_at > now()`,
 			[id, error.slice(0, 1000)],
+		);
+	}
+
+	async markProposalPatchApplied(id: string, lockVersion: number) {
+		await this.pool.query(
+			"UPDATE task_proposals SET patch_applied_at=now(), applied_lock_version=$2, updated_at=now() WHERE id=$1 AND status='creating'",
+			[id, lockVersion],
+		);
+	}
+
+	async markProposalCommentApplied(id: string, activityId: number) {
+		await this.pool.query(
+			"UPDATE task_proposals SET comment_activity_id=$2, updated_at=now() WHERE id=$1 AND status='creating'",
+			[id, activityId],
 		);
 	}
 
@@ -649,6 +708,7 @@ export class Database {
 			`UPDATE task_proposals SET status='created', reviewer_discord_id=$2,
 				 openproject_work_package_id=$3, confirmation_message_id=$4, error=NULL,
 				 review_outcome='approved', reviewed_at=now(), correction_flags=$5,
+				 claim_expires_at=NULL,
 				 review_duration_ms=GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(review_started_at, created_at))) * 1000)::integer,
 				 updated_at=now() WHERE id=$1 AND status='creating'`,
 			[id, reviewerId, workPackageId, confirmationMessageId ?? null, corrections ?? {}],
@@ -662,7 +722,7 @@ export class Database {
 	async markProposalUpdated(id: string, reviewerId: string, workPackageId: number, corrections?: CorrectionFlags, action = "update") {
 		await this.pool.query(
 			`UPDATE task_proposals SET status='created', reviewer_discord_id=$2, openproject_work_package_id=$3,
-			 review_outcome=$5, reviewed_at=now(), correction_flags=$4,
+			 review_outcome=$5, reviewed_at=now(), correction_flags=$4, claim_expires_at=NULL,
 			 review_duration_ms=GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(review_started_at, created_at))) * 1000)::integer,
 			 updated_at=now() WHERE id=$1 AND status='creating'`,
 			[id, reviewerId, workPackageId, corrections ?? {}, action],
@@ -673,10 +733,43 @@ export class Database {
 		);
 	}
 
+	async finalizeProposalUpdate(input: {
+		id: string; reviewerId: string; workPackageId: number; corrections: CorrectionFlags;
+		action: string; finalSnapshot: Record<string, unknown>;
+	}) {
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			const result = await client.query<{ revision: number }>(
+				`UPDATE task_proposals SET status='created', reviewer_discord_id=$2, openproject_work_package_id=$3,
+				 review_outcome=$5, reviewed_at=now(), correction_flags=$4, claim_expires_at=NULL,
+				 revision=revision + 1,
+				 review_duration_ms=GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(review_started_at, created_at))) * 1000)::integer,
+				 updated_at=now() WHERE id=$1 AND status='creating' RETURNING revision`,
+				[input.id, input.reviewerId, input.workPackageId, input.corrections, input.action],
+			);
+			if (result.rowCount !== 1) throw new Error("This proposal is no longer being applied.");
+			await client.query(
+				"INSERT INTO task_audit_log(proposal_id,event,actor_discord_id,metadata) VALUES($1,$2,$3,$4)",
+				[input.id, input.action, input.reviewerId, { workPackageId: input.workPackageId }],
+			);
+			await client.query(
+				"INSERT INTO task_proposal_revisions(proposal_id,revision,phase,payload) VALUES($1,$2,'final',$3)",
+				[input.id, result.rows[0].revision, jsonParameter(input.finalSnapshot)],
+			);
+			await client.query("COMMIT");
+		} catch (error) {
+			await client.query("ROLLBACK");
+			throw error;
+		} finally {
+			client.release();
+		}
+	}
+
 	async markProposalFailed(id: string, status: "failed" | "needs_reconciliation", reviewerId: string, error: string) {
 		await this.pool.query(
 			`UPDATE task_proposals SET status=$2, reviewer_discord_id=$3, error=$4,
-			 review_outcome=$2, reviewed_at=now(), review_failure_count=review_failure_count + 1,
+			 review_outcome=$2, reviewed_at=now(), review_failure_count=review_failure_count + 1, claim_expires_at=NULL,
 			 review_duration_ms=GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(review_started_at, created_at))) * 1000)::integer,
 			 updated_at=now() WHERE id=$1 AND status='creating'`,
 			[id, status, reviewerId, error.slice(0, 1000)],

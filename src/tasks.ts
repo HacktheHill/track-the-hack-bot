@@ -28,9 +28,10 @@ import {
 import { randomUUID } from "node:crypto";
 import { isOrganizerGuild, type IntegrationConfig, type TeamMapping } from "./config.js";
 import { correctionFields, Database, type CorrectionFlags, type ProposalMetrics } from "./database.js";
-import { OpenProjectClient, OpenProjectRequestError } from "./openproject.js";
+import { OpenProjectClient, OpenProjectRequestError, workPackageChangesApplied } from "./openproject.js";
 import { containsSensitiveContent, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, StructuredOutputError, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 import { resolveProposedAction, type OpenProjectRag } from "./rag.js";
+import { composeOpenProjectMarkdown, describeProposalOperations, planExistingTaskOperations, type ProposalMetadataPatch } from "./task-proposals.js";
 
 export const taskCommand = new SlashCommandBuilder()
 	.setName("task")
@@ -367,6 +368,13 @@ export function proposalReviewAllowed(
 	canManageGuild = false,
 ) {
 	return permittedReviewerIds.includes(userId) || requesterId === userId || isOrganizer || canManageGuild;
+}
+
+export function proposalIsReviewable(proposal: { status: string; expires_at: string; claim_expires_at?: string | null }) {
+	if (new Date(proposal.expires_at).getTime() <= Date.now()) return false;
+	return proposal.status === "pending_review" || (
+		proposal.status === "creating" && Boolean(proposal.claim_expires_at) && new Date(proposal.claim_expires_at!).getTime() <= Date.now()
+	);
 }
 
 export function citesExtractionFocus(sourceMessageIds: readonly string[], focusIds: ReadonlySet<string>) {
@@ -934,8 +942,12 @@ export function appendSourceLinks(
 	description: string,
 	records: CollectedContext["sourceRecords"],
 	sourceIds: string[],
+	relevantAttachmentIds?: string[],
 ) {
-	const links = [...new Set(sourceIds.flatMap(id => records.get(id)?.attachments.map(attachment => attachment.url) ?? []))];
+	const relevant = relevantAttachmentIds ? new Set(relevantAttachmentIds) : null;
+	const links = [...new Set(sourceIds.flatMap(id => records.get(id)?.attachments
+		.filter(attachment => !relevant || relevant.has(attachment.id))
+		.map(attachment => attachment.url) ?? []))];
 	if (!links.length) return sanitizeGeneratedDescription(description);
 	const addition = `Related links:\n${links.map(link => `- ${link}`).join("\n")}`;
 	return `${sanitizeGeneratedDescription(description)}\n\n${addition}`.slice(0, 4000);
@@ -1280,6 +1292,7 @@ async function completeAiContext(
 		appendRelevantUrls(candidate.description, context.messages, candidate.source_message_ids),
 		context.sourceRecords,
 		candidate.source_message_ids,
+		candidate.relevant_attachment_ids,
 	);
 	const sourceLinks = candidate.source_message_ids.map(id => {
 		const source = context.messages.find(message => message.id === id);
@@ -1309,6 +1322,23 @@ async function completeAiContext(
 		return;
 	}
 	if (projectId && match && action !== "create") {
+		const target = await services.openProject.workPackage(match.workPackageId);
+		const operations = planExistingTaskOperations({
+			workPackage: target,
+			requestedAction: candidate.proposed_action === "no_action" ? "update" : candidate.proposed_action,
+			contentIntent: candidate.content_intent,
+			description,
+			metadataFields: candidate.metadata_change_fields,
+			values: {
+				title: candidate.title, assigneeDiscordId: assigneeId, priorityId: priority?.id,
+				sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined,
+				startDate, dueDate: inferredDate(candidate.due_date), estimatedHours: candidate.estimated_hours ?? undefined,
+			},
+		});
+		if (operations.contentOperation === "none" && Object.keys(operations.metadataPatch).length === 0) {
+			await interaction.editReply("The discussion matched an existing task but did not contain an explicit update to apply.");
+			return;
+		}
 		const proposal = await services.db.createProposal({
 			requesterId: interaction.user.id, channelId: interaction.channelId, projectId,
 			title: candidate.title, description, assigneeDiscordId: assigneeId, accountableDiscordId: accountableId,
@@ -1319,7 +1349,9 @@ async function completeAiContext(
 			ambiguities: [...result.ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: extraction.latencyMs,
 			tokenUsage: extraction.usage, escalationReason: extraction.escalationReason,
 			retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS, action,
-			targetWorkPackageId: match.workPackageId, targetLockVersion: match.lockVersion,
+			targetWorkPackageId: match.workPackageId, targetLockVersion: target.lockVersion,
+			metadataPatch: operations.metadataPatch, contentOperation: operations.contentOperation,
+			contentMarkdown: operations.contentMarkdown,
 			initialSnapshot: proposalSnapshot({
 				title: candidate.title, description, projectId, assigneeId, accountableId, priorityId: priority?.id,
 				sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate, dueDate,
@@ -1343,8 +1375,10 @@ async function completeAiContext(
 			inputSnapshot, messageAssessments: result.message_assessments,
 			decision: { ...decisionTelemetry, action, targetWorkPackageId: match.workPackageId, similarity: match.similarity, outcome: "proposal" },
 		});
+		const operationSummary = describeProposalOperations(operations.contentOperation, operations.metadataPatch);
+		const warning = operations.contentOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : "";
 		await deliverProposalReply(interaction, services, proposal.id, {
-			content: boundedDiscordContent(`**Possible ${action} for #${match.workPackageId}**\n${candidate.title}\n${description}\n\nSimilarity: ${Math.round(match.similarity * 100)}%`),
+			content: boundedDiscordContent(`**Possible ${action} for #${match.workPackageId}**\n${operationSummary.map(item => `- ${item}`).join("\n")}${warning}\n\n${candidate.title}\n${description}\n\nSimilarity: ${Math.round(match.similarity * 100)}%`),
 			components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
 				new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and apply").setStyle(ButtonStyle.Primary),
 				new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
@@ -1438,7 +1472,11 @@ async function handleProposalButton(interaction: ButtonInteraction, services: Se
 	if (!interaction.customId.startsWith("op-review:") && !interaction.customId.startsWith("op-dismiss:") && !interaction.customId.startsWith("op-duplicate:")) return;
 	const id = interaction.customId.split(":")[1];
 	const proposal = await services.db.proposal(id);
-	if (proposal?.status !== "pending_review" || new Date(proposal.expires_at).getTime() <= Date.now() || !await canReviewProposal(interaction, proposal, services)) throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
+	if (!proposal || !proposalIsReviewable(proposal) || !await canReviewProposal(interaction, proposal, services)) throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
+	if (proposal.action !== "create" && (!proposal.operation_schema_version || !proposal.content_operation)) {
+		await services.db.supersedeLegacyProposal(proposal.id);
+		throw new Error("This older update proposal was invalidated. Extract the discussion again.");
+	}
 	if (interaction.customId.startsWith("op-dismiss:")) {
 		if (!await services.db.setProposalStatus(id, "dismissed", interaction.user.id)) {
 			throw new Error("This proposal was already handled by another reviewer.");
@@ -1457,21 +1495,38 @@ async function handleProposalButton(interaction: ButtonInteraction, services: Se
 	}
 	const project = proposal.project_id ? (await services.openProject.projects()).find(item => item.id === proposal.project_id) : undefined;
 	const assignee = proposal.assignee_discord_id ? await interaction.guild!.members.fetch(proposal.assignee_discord_id).catch(() => null) : null;
+	const metadataPatch = proposal.metadata_patch ?? {};
 	let dueDate = databaseDate(proposal.due_date);
-	if (!dueDate) {
+	if (proposal.action === "create" && !dueDate) {
 		const priority = proposal.priority_id ? (await services.openProject.priorities()).find(item => item.id === proposal.priority_id) : undefined;
 		const sizeId = proposal.size_href ? Number(proposal.size_href.split("/").at(-1)) : undefined;
 		const size = proposal.project_id && sizeId ? (await services.openProject.sizeOptions(proposal.project_id)).find(item => item.id === sizeId) : undefined;
 		dueDate = defaultAiDueDate(new Date(), priority?.name, size?.value, services.config.BOT_TIME_ZONE);
 	}
-	const modal = new ModalBuilder().setCustomId(`op-ai:${id}`).setTitle("Review proposed task");
-	const fields = [
+	const modal = new ModalBuilder().setCustomId(`op-ai:${id}`).setTitle(proposal.action === "create" ? "Review proposed task" : "Review task update");
+	const contentPending = proposal.content_operation === "postComment"
+		? !proposal.comment_activity_id
+		: proposal.content_operation === "descriptionReplacement" ? !proposal.patch_applied_at : false;
+	const metadataPending = !proposal.patch_applied_at;
+	const fields = proposal.action === "create" ? [
 		new TextInputBuilder().setCustomId("title").setLabel("Title").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(255).setValue(proposal.title),
 		new TextInputBuilder().setCustomId("description").setLabel("Description (optional)").setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(4000).setValue(proposal.description.slice(0, 4000)),
 		new TextInputBuilder().setCustomId("project").setLabel("Project name").setStyle(TextInputStyle.Short).setRequired(true).setValue(project?.name ?? ""),
 		new TextInputBuilder().setCustomId("assignee").setLabel("Assignee name (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(assignee?.displayName ?? ""),
-		new TextInputBuilder().setCustomId("due_date").setLabel("Due date YYYY-MM-DD").setStyle(TextInputStyle.Short).setRequired(true).setValue(dueDate),
-	];
+		new TextInputBuilder().setCustomId("due_date").setLabel("Due date YYYY-MM-DD").setStyle(TextInputStyle.Short).setRequired(true).setValue(dueDate ?? ""),
+	] : [
+		...(contentPending ? [new TextInputBuilder()
+			.setCustomId("description")
+			.setLabel(proposal.content_operation === "postComment" ? "Update comment" : "Replacement description")
+			.setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(4000)
+			.setValue((proposal.content_markdown ?? proposal.description).slice(0, 4000))] : []),
+		...(metadataPending && metadataPatch.subject !== undefined ? [new TextInputBuilder().setCustomId("title").setLabel("New title").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(255).setValue(metadataPatch.subject)] : []),
+		...(metadataPending && Object.hasOwn(metadataPatch, "assigneeDiscordId") ? [new TextInputBuilder().setCustomId("assignee").setLabel("New assignee (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(assignee?.displayName ?? "")] : []),
+		...(metadataPending && Object.hasOwn(metadataPatch, "startDate") ? [new TextInputBuilder().setCustomId("start_date").setLabel("New start date (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(metadataPatch.startDate ?? "")] : []),
+		...(metadataPending && Object.hasOwn(metadataPatch, "dueDate") ? [new TextInputBuilder().setCustomId("due_date").setLabel("New due date (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(metadataPatch.dueDate ?? "")] : []),
+		...(metadataPending && Object.hasOwn(metadataPatch, "estimatedHours") ? [new TextInputBuilder().setCustomId("estimated_hours").setLabel("New estimate in hours (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(metadataPatch.estimatedHours?.toString() ?? "")] : []),
+	].slice(0, 5);
+	if (!fields.length) fields.push(new TextInputBuilder().setCustomId("confirm").setLabel("Confirm the changes shown in the card").setStyle(TextInputStyle.Short).setRequired(false).setValue("Apply"));
 	modal.addComponents(...fields.map(field => new ActionRowBuilder<TextInputBuilder>().addComponents(field)));
 	if (!await services.db.startProposalReview(id, interaction.user.id)) {
 		throw new Error("This proposal was already handled by another reviewer.");
@@ -1552,18 +1607,24 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 	}
 	const draft = interaction.customId.startsWith("op-task2:") ? await contextDraft(entityId, interaction.user.id, services) : null;
 	const proposal = interaction.customId.startsWith("op-ai:") ? await services.db.proposal(entityId) : null;
-	if (proposal && (proposal.status !== "pending_review" || new Date(proposal.expires_at).getTime() <= Date.now() || !await canReviewProposal(interaction, proposal, services))) throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
+	if (proposal && (!proposalIsReviewable(proposal) || !await canReviewProposal(interaction, proposal, services))) throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
+	if (proposal && proposal.action !== "create" && (!proposal.operation_schema_version || !proposal.content_operation)) {
+		await services.db.supersedeLegacyProposal(proposal.id);
+		throw new Error("This older update proposal was invalidated. Extract the discussion again.");
+	}
 	if (proposal) {
 		const project = proposal.project_id ? (await services.openProject.projects()).find(item => item.id === proposal.project_id) : undefined;
-		const reviewedAssigneeId = await resolveAssigneeInput(interaction.fields.getTextInputValue("assignee"), interaction.guild!);
-		const reviewedDueDate = validIsoDate(interaction.fields.getTextInputValue("due_date"));
+		const hasField = (name: string) => interaction.fields.fields.has(name);
+		const fieldValue = (name: string) => hasField(name) ? interaction.fields.getTextInputValue(name) : undefined;
+		const reviewedAssigneeId = hasField("assignee") ? await resolveAssigneeInput(fieldValue("assignee") ?? "", interaction.guild!) : proposal.assignee_discord_id ?? undefined;
+		const reviewedDueDate = hasField("due_date") ? validIsoDate(fieldValue("due_date") || undefined) : databaseDate(proposal.due_date) ?? undefined;
 		const args = {
 			interaction,
 			services,
 			correlationId: proposal.id,
-			title: interaction.fields.getTextInputValue("title"),
-			description: interaction.fields.getTextInputValue("description"),
-			projectText: interaction.fields.getTextInputValue("project"),
+			title: fieldValue("title") ?? proposal.title,
+			description: fieldValue("description") ?? proposal.description,
+			projectText: fieldValue("project") ?? project?.name ?? null,
 			assigneeId: reviewedAssigneeId,
 			accountableId: proposal.accountable_discord_id ?? undefined,
 			priorityId: proposal.priority_id ?? undefined,
@@ -1576,50 +1637,86 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 		if (!await services.db.claimProposal(proposal.id, interaction.user.id)) throw new Error("This proposal is already being handled.");
 		try {
 			if (proposal.action !== "create" && proposal.target_work_package_id) {
-				const assigneeOpenProjectId = args.assigneeId ? await services.db.openProjectUserId(args.assigneeId) : undefined;
-				const accountableOpenProjectId = args.accountableId ? await services.db.openProjectUserId(args.accountableId) : undefined;
-				if (args.assigneeId && !assigneeOpenProjectId) throw new Error("The assignee is not mapped to OpenProject.");
-				if (args.accountableId && !accountableOpenProjectId) throw new Error("The accountable user is not mapped to OpenProject.");
-				const assigneeMember = args.assigneeId ? await interaction.guild!.members.fetch(args.assigneeId).catch(() => null) : null;
-				const reviewedProjectId = await resolveProject(args.projectText, interaction.channelId!, interaction.guild!, assigneeMember, services);
-				if (!reviewedProjectId) throw new Error("Select an OpenProject project.");
-				await requireProjectAccess(interaction, reviewedProjectId, services);
-				const statuses = proposal.action === "complete" || proposal.action === "reopen" ? await services.openProject.statuses() : [];
-				const status = proposal.action === "complete"
-					? statuses.find(item => item.isClosed)
-					: proposal.action === "reopen" ? statuses.find(item => !item.isClosed && item.isDefault) ?? statuses.find(item => !item.isClosed) : undefined;
-				if ((proposal.action === "complete" || proposal.action === "reopen") && !status) throw new Error(`OpenProject has no status available for ${proposal.action}.`);
-				const updated = await services.openProject.updateWorkPackage(proposal.target_work_package_id, {
-					subject: args.title,
-					description: { format: "markdown", raw: args.description },
-					_links: {
-						project: { href: `/api/v3/projects/${reviewedProjectId}` },
-						...(assigneeOpenProjectId ? { assignee: { href: `/api/v3/users/${assigneeOpenProjectId}` } } : {}),
-						...(accountableOpenProjectId ? { responsible: { href: `/api/v3/users/${accountableOpenProjectId}` } } : {}),
-						...(args.priorityId ? { priority: { href: `/api/v3/priorities/${args.priorityId}` } } : {}),
-						...(status ? { status: { href: `/api/v3/statuses/${status.id}` } } : {}),
-					},
-					...(args.startDate !== undefined ? { startDate: args.startDate } : {}),
-					...(args.dueDate !== undefined ? { dueDate: args.dueDate } : {}),
-					...(args.estimatedHours !== undefined ? { estimatedTime: `PT${args.estimatedHours}H` } : {}),
-					...(args.sizeHref ? { [services.config.OPENPROJECT_SIZE_CUSTOM_FIELD]: { href: args.sizeHref } } : {}),
-				}, proposal.target_lock_version ?? undefined);
-				await services.db.markProposalUpdated(proposal.id, interaction.user.id, updated.id, proposalCorrections({
+				if (!proposal.operation_schema_version || !proposal.content_operation) throw new Error("This older update proposal was invalidated. Extract the discussion again.");
+				if (!proposal.project_id) throw new Error("The matched task has no resolved OpenProject project.");
+				await requireProjectAccess(interaction, proposal.project_id, services);
+				const metadataPatch: ProposalMetadataPatch = { ...(proposal.metadata_patch ?? {}) };
+				if (hasField("title")) metadataPatch.subject = args.title;
+				if (hasField("assignee")) metadataPatch.assigneeDiscordId = reviewedAssigneeId ?? null;
+				if (hasField("start_date")) metadataPatch.startDate = validIsoDate(fieldValue("start_date") || undefined) ?? null;
+				if (hasField("due_date")) metadataPatch.dueDate = reviewedDueDate ?? null;
+				if (hasField("estimated_hours")) {
+					const raw = fieldValue("estimated_hours")?.trim();
+					const estimate = raw ? Number(raw) : null;
+					if (estimate !== null && (!Number.isFinite(estimate) || estimate < 0)) throw new Error("Estimate must be a non-negative number.");
+					metadataPatch.estimatedHours = estimate;
+				}
+				const changes: Record<string, unknown> = {};
+				const links: Record<string, { href: string | null }> = {};
+				if (metadataPatch.subject !== undefined) changes.subject = metadataPatch.subject;
+				if (Object.hasOwn(metadataPatch, "assigneeDiscordId")) {
+					const openProjectId = metadataPatch.assigneeDiscordId ? await services.db.openProjectUserId(metadataPatch.assigneeDiscordId) : undefined;
+					if (metadataPatch.assigneeDiscordId && !openProjectId) throw new Error("The assignee is not mapped to OpenProject.");
+					links.assignee = { href: openProjectId ? `/api/v3/users/${openProjectId}` : null };
+				}
+				if (Object.hasOwn(metadataPatch, "priorityId")) links.priority = { href: metadataPatch.priorityId ? `/api/v3/priorities/${metadataPatch.priorityId}` : null };
+				if (metadataPatch.status) {
+					const statuses = await services.openProject.statuses();
+					const status = metadataPatch.status === "complete"
+						? statuses.find(item => item.isClosed)
+						: statuses.find(item => !item.isClosed && item.isDefault) ?? statuses.find(item => !item.isClosed);
+					if (!status) throw new Error(`OpenProject has no status available for ${metadataPatch.status}.`);
+					links.status = { href: `/api/v3/statuses/${status.id}` };
+				}
+				if (Object.keys(links).length) changes._links = links;
+				if (Object.hasOwn(metadataPatch, "startDate")) changes.startDate = metadataPatch.startDate;
+				if (Object.hasOwn(metadataPatch, "dueDate")) changes.dueDate = metadataPatch.dueDate;
+				if (Object.hasOwn(metadataPatch, "estimatedHours")) changes.estimatedTime = metadataPatch.estimatedHours == null ? null : `PT${metadataPatch.estimatedHours}H`;
+				if (Object.hasOwn(metadataPatch, "sizeHref")) changes[services.config.OPENPROJECT_SIZE_CUSTOM_FIELD] = metadataPatch.sizeHref ? { href: metadataPatch.sizeHref } : null;
+				if (proposal.content_operation === "descriptionReplacement") {
+					changes.description = { format: "markdown", raw: composeOpenProjectMarkdown(args.description, args.sourceLinks, `track-the-hack-proposal:${proposal.id}:description`) };
+				}
+
+				let updated = await services.openProject.workPackage(proposal.target_work_package_id);
+				if (!proposal.patch_applied_at && Object.keys(changes).length) {
+					if (proposal.target_lock_version !== null && updated.lockVersion !== proposal.target_lock_version) {
+						if (!workPackageChangesApplied(updated, changes)) throw new Error(`OpenProject task ${proposal.target_work_package_id} changed since this proposal was created. Review it again before applying the update.`);
+					} else {
+						updated = await services.openProject.updateWorkPackage(proposal.target_work_package_id, changes, proposal.target_lock_version ?? undefined);
+					}
+					await services.db.markProposalPatchApplied(proposal.id, updated.lockVersion);
+				} else if (!proposal.patch_applied_at && proposal.target_lock_version !== null && updated.lockVersion !== proposal.target_lock_version) {
+					throw new Error(`OpenProject task ${proposal.target_work_package_id} changed since this proposal was created. Review it again before applying the update.`);
+				}
+				if (proposal.content_operation === "postComment" && !proposal.comment_activity_id) {
+					const activity = await services.openProject.commentWorkPackage(proposal.target_work_package_id, args.description, args.sourceLinks, proposal.id);
+					await services.db.markProposalCommentApplied(proposal.id, activity.id);
+				}
+				const corrections = proposalCorrections({
 					original: { title: proposal.title, description: proposal.description, assigneeId: proposal.assignee_discord_id, accountableId: proposal.accountable_discord_id, priorityId: proposal.priority_id, sizeHref: proposal.size_href, startDate: proposal.start_date, dueDate: proposal.due_date, estimatedHours: proposal.estimated_hours },
-					reviewed: { title: args.title, description: args.description, assigneeId: args.assigneeId, accountableId: args.accountableId, priorityId: args.priorityId, sizeHref: args.sizeHref, startDate: args.startDate, dueDate: args.dueDate, estimatedHours: args.estimatedHours },
-				}), proposal.action);
-				await services.db.recordFinalProposalRevision(proposal.id, proposalSnapshot({
-					title: args.title, description: args.description, projectId: reviewedProjectId, assigneeId: args.assigneeId,
-					accountableId: args.accountableId, priorityId: args.priorityId, sizeHref: args.sizeHref,
-					startDate: args.startDate, dueDate: args.dueDate, estimatedHours: args.estimatedHours,
+					reviewed: { title: metadataPatch.subject ?? proposal.title, description: args.description, assigneeId: metadataPatch.assigneeDiscordId ?? undefined, priorityId: metadataPatch.priorityId ?? undefined, sizeHref: metadataPatch.sizeHref ?? undefined, startDate: metadataPatch.startDate ?? undefined, dueDate: metadataPatch.dueDate ?? undefined, estimatedHours: metadataPatch.estimatedHours ?? undefined },
+				});
+				const finalSnapshot = proposalSnapshot({
+					title: metadataPatch.subject ?? updated.subject, description: args.description, projectId: proposal.project_id,
+					assigneeId: metadataPatch.assigneeDiscordId, priorityId: metadataPatch.priorityId, sizeHref: metadataPatch.sizeHref,
+					startDate: metadataPatch.startDate, dueDate: metadataPatch.dueDate, estimatedHours: metadataPatch.estimatedHours,
 					action: proposal.action, targetWorkPackageId: updated.id, sourceLinks: args.sourceLinks,
-				}));
-				const owners = [args.assigneeId, args.accountableId].filter((id): id is string => Boolean(id));
-				if (interaction.channel?.isSendable()) await interaction.channel.send({
+				});
+				await services.db.finalizeProposalUpdate({
+					id: proposal.id, reviewerId: interaction.user.id, workPackageId: updated.id,
+					corrections, action: proposal.action, finalSnapshot,
+				});
+				const owners = [metadataPatch.assigneeDiscordId].filter((id): id is string => Boolean(id));
+				if (interaction.channel?.isSendable()) void interaction.channel.send({
 					content: `${owners.map(id => `<@${id}>`).join(" ")}${owners.length ? " " : ""}OpenProject task updated: **${updated.subject}**\n${services.openProject.workPackageUrl(updated.id)}`,
 					allowedMentions: owners.length ? { users: owners } : { parse: [] },
-				});
-				await interaction.editReply(`${proposal.action === "complete" ? "Completed" : proposal.action === "reopen" ? "Reopened" : "Updated"} ${services.openProject.workPackageUrl(updated.id)}.`);
+				}).catch(error => console.error("OpenProject update announcement failed", { proposalId: proposal.id, error: (error as Error).message }));
+				const outcome = proposal.content_operation === "postComment" && Object.keys(metadataPatch).length > 0
+					? "Updated metadata and added a comment to"
+					: proposal.content_operation === "postComment" ? "Added a comment to"
+						: proposal.content_operation === "descriptionReplacement" ? "Replaced the description for" : "Updated";
+				await interaction.editReply(`${outcome} ${services.openProject.workPackageUrl(updated.id)}.`)
+					.catch(error => console.error("OpenProject update response failed", { proposalId: proposal.id, error: (error as Error).message }));
 				return;
 			}
 			const created = await createAndAnnounce(args);
@@ -1706,7 +1803,8 @@ export function registerTaskInteractions(client: Client, services: Services) {
 			else if (interaction.isModalSubmit()) await handleModal(interaction, services);
 		} catch (error) {
 			console.error("Task interaction failed", error);
-			const content = `Could not create task: ${(error as Error).message}`;
+			const applyingProposal = (interaction.isButton() || interaction.isModalSubmit()) && /^(?:op-review|op-ai):/.test(interaction.customId);
+			const content = `${applyingProposal ? "Could not apply task proposal" : "Could not create task"}: ${(error as Error).message}`;
 			if (interaction.isRepliable()) {
 				if (interaction.deferred || interaction.replied) await interaction.editReply({ content });
 				else await interaction.reply({ content, ephemeral: true });

@@ -58,6 +58,10 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 		assert.match(request.body.messages[0].content, /timestamps/);
 		assert.match(request.body.messages[0].content, /priority_name must exactly match one of: High/);
 		assert.match(request.body.messages[0].content, /size_name must exactly match one of: Small/);
+		assert.match(request.body.messages[0].content, /content_intent=update_note/);
+		assert.match(request.body.messages[0].content, /only explicitly requested existing-task metadata changes/);
+		assert.match(request.body.messages[0].content, /do not invent missing objectives/);
+		assert.ok(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("content_intent"));
 		assert.deepEqual(JSON.parse(request.body.messages[1].content[0].text)[0], {
 			id: "m1", authorAlias: "USER_1", text: "Ship it",
 			timestamp: "2026-07-13T00:00:00Z", contextRole: "primary",
