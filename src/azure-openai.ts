@@ -118,7 +118,6 @@ const invitePattern = /https?:\/\/(?:www\.)?(?:discord\.gg|discord(?:app)?\.com\
 
 const sensitiveChecks = [
 	{ label: "Credential or secret pattern", pattern: /\[REDACTED_CREDENTIAL\]|\b(?:password|api[_ -]?key|access token|credential|private key|seed phrase|recovery phrase)\b/i },
-	{ label: "Email address", pattern: /\[REDACTED_EMAIL\]/i },
 	{ label: "Phone number", pattern: /\[REDACTED_PHONE\]/i },
 	{ label: "Discord invite", pattern: /\[REDACTED_INVITE\]/i },
 	{ label: "Financial, payroll, or payment information", pattern: /\b(?:salary|payroll|bank account|routing number|payment authorization|credit card|financial account)\b/i },

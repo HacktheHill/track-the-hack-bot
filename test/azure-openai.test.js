@@ -179,8 +179,13 @@ test("sensitive content is rejected before an Azure request", async () => {
 test("sensitive-content decisions expose safe categories without matched values", () => {
 	assert.deepEqual(sensitiveContentReasons([
 		{ id: "m1", authorAlias: "USER_1", text: "Please send the payroll spreadsheet", timestamp: "2026-07-13T00:00:00Z" },
-		{ id: "m2", authorAlias: "USER_2", text: "Contact [REDACTED_EMAIL]", timestamp: "2026-07-13T00:01:00Z" },
-	]), ["Financial, payroll, or payment information", "Email address"]);
+	]), ["Financial, payroll, or payment information"]);
+});
+
+test("email addresses are redacted without blocking AI review", () => {
+	const text = minimizeText("Contact organizer@example.com for the venue quote.");
+	assert.match(text, /\[REDACTED_EMAIL\]/);
+	assert.equal(containsSensitiveContent([{ id: "m1", authorAlias: "USER_1", text, timestamp: "2026-07-13T00:00:00Z" }]), false);
 });
 
 test("ordinary organizer agreements and board work are not treated as sensitive", () => {
