@@ -69,18 +69,42 @@ jobs:
         with:
           inlineScript: |
             set -euo pipefail
+            image="${{ vars.AZURE_ACR_LOGIN_SERVER }}/track-the-hack-bot:${{ github.sha }}"
+            if ! az containerapp job show --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" --name track-the-hack-bot-migrate >/dev/null 2>&1; then
+              echo "Required migration job track-the-hack-bot-migrate does not exist." >&2
+              exit 1
+            fi
+            az containerapp job update \
+              --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+              --name track-the-hack-bot-migrate \
+              --image "$image"
+            execution="$(az containerapp job start \
+              --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+              --name track-the-hack-bot-migrate \
+              --query name --output tsv)"
+            for attempt in $(seq 1 40); do
+              status="$(az containerapp job execution show \
+                --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+                --name track-the-hack-bot-migrate \
+                --job-execution-name "$execution" \
+                --query properties.status --output tsv)"
+              if [ "$status" = Succeeded ]; then break; fi
+              if [ "$status" = Failed ] || [ "$attempt" -eq 40 ]; then
+                echo "Migration execution $execution ended with status $status." >&2
+                exit 1
+              fi
+              sleep 15
+            done
             az containerapp update \
               --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
               --name track-the-hack-bot \
-              --image "${{ vars.AZURE_ACR_LOGIN_SERVER }}/track-the-hack-bot:${{ github.sha }}"
-            for job in track-the-hack-bot-migrate track-the-hack-bot-embeddings; do
-              if az containerapp job show --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" --name "$job" >/dev/null 2>&1; then
-                az containerapp job update \
-                  --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-                  --name "$job" \
-                  --image "${{ vars.AZURE_ACR_LOGIN_SERVER }}/track-the-hack-bot:${{ github.sha }}"
-              fi
-            done
+              --image "$image"
+            if az containerapp job show --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" --name track-the-hack-bot-embeddings >/dev/null 2>&1; then
+              az containerapp job update \
+                --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+                --name track-the-hack-bot-embeddings \
+                --image "$image"
+            fi
             for attempt in $(seq 1 20); do
               revision="$(az containerapp show \
                 --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
