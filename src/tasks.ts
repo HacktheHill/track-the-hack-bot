@@ -30,7 +30,7 @@ import { randomUUID } from "node:crypto";
 import { isOrganizerGuild, type IntegrationConfig, type TeamMapping } from "./config.js";
 import { correctionFields, Database, type CorrectionFlags, type ProposalMetrics } from "./database.js";
 import { OpenProjectClient, OpenProjectRequestError, workPackageChangesApplied } from "./openproject.js";
-import { attachExtractionDiagnostics, automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, StructuredOutputError, type ExtractedTasks, type ExtractionResult, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
+import { attachExtractionDiagnostics, automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, StructuredOutputError, type ExtractedTasks, type ExtractionResult, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
 import { composeOpenProjectMarkdown, describeProposalOperations, formatGeneratedTaskDescription, planExistingTaskOperations, taskReferencesAreValid, type ProposalMetadataPatch } from "./task-proposals.js";
 
@@ -1436,11 +1436,13 @@ async function completeAiContext(
 	const { result, deployment } = extraction;
 	const inputSnapshot = extraction.inputMessages.map(({ containedSensitiveData: _, ...message }) => message);
 	const validAttachmentIds = new Set([...context.sourceRecords.values()].flatMap(record => record.attachments.map(attachment => attachment.id)));
-	const candidates = result.tasks.filter(task => taskReferencesAreValid(task, context.validIds, context.focusIds, validAttachmentIds));
+	const individuallyGroundedCandidates = result.tasks.filter(task => taskReferencesAreValid(task, context.validIds, context.focusIds, validAttachmentIds));
+	const candidates = mergeRelatedTaskCandidates(individuallyGroundedCandidates);
 	const decisionTelemetry = {
 		taskCount: result.tasks.length,
 		automaticEligibleCount: candidates.filter(automaticCandidateEligible).length,
-		invalidGroundingCount: result.tasks.length - candidates.length,
+		invalidGroundingCount: result.tasks.length - individuallyGroundedCandidates.length,
+		groupedCount: candidates.length,
 		extractionMetadata: extraction.metadata,
 		extractionOptions: extraction.replayOptions,
 		primaryMessageIds: [...context.focusIds],
@@ -1456,7 +1458,7 @@ async function completeAiContext(
 		await services.db.recordExtraction({
 			source: "manual", outcome: "no_task", modelDeployment: deployment, triggerId: context.primaryId,
 			 taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
-			inputSnapshot, decision: { ...decisionTelemetry, outcome: "no_task", invalidGroundingCount: result.tasks.length - candidates.length },
+			inputSnapshot, decision: { ...decisionTelemetry, outcome: "no_task" },
 		});
 		const detail = result.tasks.length ? "The returned candidates did not cite the selected message or used unknown source IDs." : "AI returned no actionable candidates.";
 		await interaction.editReply(`No task proposal was found in the selected context. ${detail}`);
@@ -1490,6 +1492,7 @@ async function completeAiCandidate(
 		taskCount: number;
 		automaticEligibleCount: number;
 		invalidGroundingCount: number;
+		groupedCount: number;
 		extractionMetadata?: ExtractionResult["metadata"];
 		extractionOptions: ExtractionResult["replayOptions"];
 		primaryMessageIds: string[];

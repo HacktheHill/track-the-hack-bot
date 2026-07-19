@@ -213,7 +213,11 @@ test("RAG combines semantic candidates with lexical title matches", async () => 
 });
 
 test("AI evaluator uses production grounding and target semantics for every action", () => {
-	const candidate = { proposed_action: "update", automatic_eligibility: "eligible", source_message_ids: ["m1"], relevant_attachment_ids: [] };
+	const candidate = {
+		work_item_key: "task", proposed_action: "update", automatic_eligibility: "eligible", content_intent: "update_note",
+		metadata_change_fields: [], assignee_alias: null, start_date: null, due_date: null, priority_name: null,
+		size_name: null, estimated_hours: null, source_message_ids: ["m1"], relevant_attachment_ids: [],
+	};
 	const messages = [{ id: "m1", authorAlias: "USER_1", text: "Update it", timestamp: "2026-07-16T00:00:00Z", priority: true }];
 	assert.deepEqual(runtimeProposalCandidates([candidate], messages), []);
 	assert.deepEqual(runtimeProposalCandidates([candidate], messages, { availableTargetSourceMessageIds: [["m1"]] }), [candidate]);

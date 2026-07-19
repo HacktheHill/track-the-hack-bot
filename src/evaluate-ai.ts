@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { config as loadDotEnv } from "dotenv";
 import { z } from "zod";
-import { automaticCandidateEligible, AzureTaskExtractor, StructuredOutputError, type ExtractedTasks, type MinimizedMessage } from "./azure-openai.js";
+import { automaticCandidateEligible, AzureTaskExtractor, mergeRelatedTaskCandidates, StructuredOutputError, type ExtractedTasks, type MinimizedMessage } from "./azure-openai.js";
 import type { IntegrationConfig } from "./config.js";
 import { resolveProposedAction } from "./rag.js";
 import { taskReferencesAreValid } from "./task-proposals.js";
@@ -71,10 +71,12 @@ export function runtimeProposalCandidates(
 		.filter(message => message.contextRole === "primary" || message.priority)
 		.map(message => message.id));
 	const validAttachmentIds = new Set(messages.flatMap(message => (message.attachments ?? []).map(attachment => attachment.id)));
-	return tasks.filter(task => {
+	const grounded = tasks.filter(task => {
 		if (mode === "automatic" && !automaticCandidateEligible(task)) return false;
-		if (!taskReferencesAreValid(task, validMessageIds, focalMessageIds, validAttachmentIds)) return false;
-		const targetAvailable = routing.availableTargetSourceMessageIds?.some(ids => sameSet(ids, task.source_message_ids)) ?? false;
+		return taskReferencesAreValid(task, validMessageIds, focalMessageIds, validAttachmentIds);
+	});
+	return mergeRelatedTaskCandidates(grounded).filter(task => {
+		const targetAvailable = routing.availableTargetSourceMessageIds?.some(ids => ids.every(id => task.source_message_ids.includes(id))) ?? false;
 		return resolveProposedAction(task.proposed_action, targetAvailable) !== "no_action";
 	});
 }

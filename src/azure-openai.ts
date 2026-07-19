@@ -25,6 +25,7 @@ export function normalizeExtractedDate(value?: string | null) {
 const taskSchema = z.object({
 	tasks: z.array(z.object({
 		title: z.string().min(1).max(255),
+		work_item_key: z.string().trim().min(1).max(100),
 		description: z.string().min(1).max(4000),
 		assignee_alias: z.string().nullable(),
 		start_date: z.string().nullable().transform(normalizeExtractedDate),
@@ -51,9 +52,9 @@ const taskJsonSchema = {
 	properties: {
 			ambiguities: { type: "array", items: { type: "string", maxLength: 300 } },
 		tasks: { type: "array", maxItems: 5, items: { type: "object", additionalProperties: false,
-			required: ["title", "description", "assignee_alias", "start_date", "due_date", "priority_name", "size_name", "estimated_hours", "source_message_ids", "relevant_attachment_ids", "evidence", "proposed_action", "automatic_eligibility", "trigger_kind", "lifecycle", "content_intent", "metadata_change_fields"],
+			required: ["title", "work_item_key", "description", "assignee_alias", "start_date", "due_date", "priority_name", "size_name", "estimated_hours", "source_message_ids", "relevant_attachment_ids", "evidence", "proposed_action", "automatic_eligibility", "trigger_kind", "lifecycle", "content_intent", "metadata_change_fields"],
 			properties: {
-				title: { type: "string", maxLength: 255 }, description: { type: "string", maxLength: 4000 },
+				title: { type: "string", maxLength: 255 }, work_item_key: { type: "string", minLength: 1, maxLength: 100 }, description: { type: "string", maxLength: 4000 },
 				assignee_alias: { type: ["string", "null"] },
 				start_date: { type: ["string", "null"] }, due_date: { type: ["string", "null"] },
 				priority_name: { type: ["string", "null"] }, size_name: { type: ["string", "null"] },
@@ -77,6 +78,55 @@ export type ExtractedTask = ExtractedTasks["tasks"][number];
 
 export function automaticCandidateEligible(task: Pick<ExtractedTask, "automatic_eligibility">) {
 	return task.automatic_eligibility === "eligible";
+}
+
+export function mergeRelatedTaskCandidates(tasks: ExtractedTask[]) {
+	const grouped: ExtractedTask[] = [];
+	const compatibleValue = (left: unknown, right: unknown) => left == null || right == null || left === right;
+	for (const task of tasks) {
+		const existingIndex = grouped.findIndex(existing => {
+			const metadataFields = new Set([...existing.metadata_change_fields, ...task.metadata_change_fields]);
+			return existing.work_item_key.trim().toLocaleLowerCase() === task.work_item_key.trim().toLocaleLowerCase()
+				&& existing.proposed_action === task.proposed_action
+				&& existing.automatic_eligibility === task.automatic_eligibility
+				&& existing.content_intent === task.content_intent
+				&& existing.content_intent !== "replace_description"
+				&& !metadataFields.has("subject")
+				&& metadataFields.size <= 4
+				&& compatibleValue(existing.assignee_alias, task.assignee_alias)
+				&& compatibleValue(existing.start_date, task.start_date)
+				&& compatibleValue(existing.due_date, task.due_date)
+				&& compatibleValue(existing.priority_name, task.priority_name)
+				&& compatibleValue(existing.size_name, task.size_name)
+				&& compatibleValue(existing.estimated_hours, task.estimated_hours);
+		});
+		const existing = grouped[existingIndex];
+		if (!existing) {
+			grouped.push(task);
+			continue;
+		}
+		const metadataFields = new Set([...existing.metadata_change_fields, ...task.metadata_change_fields]);
+		const latestSource = (candidate: ExtractedTask) => [...candidate.source_message_ids].sort().at(-1) ?? "";
+		const latest = latestSource(task) > latestSource(existing) ? task : existing;
+		grouped[existingIndex] = {
+			...existing,
+			title: [...new Set([existing.title, task.title])].join("; ").slice(0, 255),
+			description: [...new Set([existing.description, task.description])].join("\n\n").slice(0, 4000),
+			start_date: existing.start_date ?? task.start_date,
+			due_date: existing.due_date ?? task.due_date,
+			priority_name: existing.priority_name ?? task.priority_name,
+			size_name: existing.size_name ?? task.size_name,
+			estimated_hours: existing.estimated_hours ?? task.estimated_hours,
+			source_message_ids: [...new Set([...existing.source_message_ids, ...task.source_message_ids])],
+			relevant_attachment_ids: [...new Set([...existing.relevant_attachment_ids, ...task.relevant_attachment_ids])],
+			evidence: [...new Set([existing.evidence, task.evidence])].join("; ").slice(0, 500),
+			assignee_alias: existing.assignee_alias ?? task.assignee_alias,
+			trigger_kind: latest.trigger_kind,
+			lifecycle: latest.lifecycle,
+			metadata_change_fields: [...metadataFields],
+		};
+	}
+	return grouped;
 }
 export type MinimizedMessage = {
 	id: string;
@@ -205,9 +255,10 @@ export function sanitizeGeneratedDescription(value: string) {
 function normalizeExtraction(result: ExtractedTasks): ExtractedTasks {
 	return {
 		...result,
-		tasks: result.tasks.map(task => ({
+		tasks: result.tasks.map((task, index) => ({
 			...task,
 			title: sanitizeGeneratedDescription(task.title).slice(0, 255),
+			work_item_key: sanitizeGeneratedDescription(task.work_item_key).slice(0, 100) || `candidate-${index + 1}`,
 			description: sanitizeGeneratedDescription(task.description),
 			evidence: sanitizeGeneratedDescription(task.evidence),
 		})),
@@ -326,6 +377,7 @@ async function invokeCompatible(options: {
 						"Group requirements and feedback about the same artifact or deliverable into one candidate. Feedback following a submitted artifact is an update to that work, not a separate new task. Do not combine unrelated topics merely because they appear in one context window.",
 						"Use proposed_action=update for requests to review or revise a submitted document, design, page, package, draft, or other existing artifact, and for concrete defects or remaining corrections in that artifact, even when the discussion does not include a task ID.",
 						"Within one conversation window, merge related corrections to the same artifact. If any cited context establishes that a document, page, design, package, or draft already exists, do not split another defect in that artifact into a separate create candidate.",
+						"Set work_item_key to a short normalized identity for the artifact or deliverable, not for an individual correction. All corrections to the same page, design, package, draft, or other work item must use exactly the same work_item_key so the application can merge them deterministically.",
 						"Return no candidate for ordinary social conversation or content from which no meaningful work can be formulated. Candidates marked ineligible are retained only for manual extraction and automatic decision telemetry.",
 						"Use proposed_action=create for new work, update for changes or progress on existing work, complete for confirmed completion, and reopen when existing work must resume. Similarity to other work never changes this choice.",
 						"For create candidates, make a best-effort choice for priority_name, size_name, and estimated_hours from urgency, scope, dependencies, and deliverables. Prefer Normal, Small, and 2 hours when evidence is sparse. Human review can correct these planning estimates. For existing-work actions, infer values only when the discussion explicitly changes them.",

@@ -1,5 +1,5 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, Client, Message } from "discord.js";
-import { automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, minimizeText, SensitiveContentError, StructuredOutputError, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
+import { automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, SensitiveContentError, StructuredOutputError, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 import { isOrganizerGuild, type IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient, titlesLikelyDuplicate } from "./openproject.js";
@@ -166,7 +166,8 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			const validMessageIds = new Set(source.map(message => message.id));
 			const focalMessageIds = new Set(primary ? [primary.id] : []);
 			const validAttachmentIds = new Set(source.flatMap(message => [...message.attachments.keys()]));
-			const groundedTasks = result.tasks.filter(task => taskReferencesAreValid(task, validMessageIds, focalMessageIds, validAttachmentIds));
+			const individuallyGroundedTasks = result.tasks.filter(task => taskReferencesAreValid(task, validMessageIds, focalMessageIds, validAttachmentIds));
+			const groundedTasks = mergeRelatedTaskCandidates(individuallyGroundedTasks);
 			const eligibleTasks = groundedTasks.filter(automaticCandidateEligible);
 			const candidateAssessments = groundedTasks.map(task => ({
 				automaticEligibility: task.automatic_eligibility,
@@ -362,10 +363,11 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				messageAssessments: candidateAssessments,
 				decision: {
 					taskCount: result.tasks.length,
-					groundedCount: groundedTasks.length,
+					groundedCount: individuallyGroundedTasks.length,
+					groupedCount: groundedTasks.length,
 					eligibleCount: eligibleTasks.length,
 					rejectedCount: groundedTasks.length - eligibleTasks.length,
-					invalidGroundingCount: result.tasks.length - groundedTasks.length,
+					invalidGroundingCount: result.tasks.length - individuallyGroundedTasks.length,
 					extractionMetadata: extraction.metadata,
 					extractionOptions: extraction.replayOptions,
 					proposalCount: createdProposals,

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { automaticCandidateEligible, AzureTaskExtractor, containsSensitiveContent, extractionDiagnostics, minimizeText, normalizeExtractedDate, sensitiveContentReasons, SensitiveContentError } from "../dist/azure-openai.js";
+import { automaticCandidateEligible, AzureTaskExtractor, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, normalizeExtractedDate, sensitiveContentReasons, SensitiveContentError } from "../dist/azure-openai.js";
 
 test("minimizeText removes common credentials and personal contact data", () => {
 	const value = minimizeText(
@@ -61,6 +61,7 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 		assert.match(request.body.messages[0].content, /Group requirements and feedback/);
 		assert.match(request.body.messages[0].content, /proposed_action=update for requests to review or revise/);
 		assert.match(request.body.messages[0].content, /do not split another defect/);
+		assert.match(request.body.messages[0].content, /same work_item_key/);
 		assert.match(request.body.messages[0].content, /timestamps/);
 		assert.match(request.body.messages[0].content, /priority_name must exactly match one of: High/);
 		assert.match(request.body.messages[0].content, /size_name must exactly match one of: Small/);
@@ -72,6 +73,8 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 		assert.match(request.body.messages[0].content, /Human review decides whether to accept it/);
 		assert.ok(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("content_intent"));
 		assert.ok(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("automatic_eligibility"));
+		assert.ok(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("work_item_key"));
+		assert.equal(request.body.response_format.json_schema.schema.properties.tasks.items.properties.work_item_key.minLength, 1);
 		assert.ok(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("trigger_kind"));
 		assert.ok(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("lifecycle"));
 		assert.equal("message_assessments" in request.body.response_format.json_schema.schema.properties, false);
@@ -95,6 +98,35 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 test("automatic eligibility is an explicit runtime gate", () => {
 	assert.equal(automaticCandidateEligible({ automatic_eligibility: "eligible" }), true);
 	assert.equal(automaticCandidateEligible({ automatic_eligibility: "ineligible" }), false);
+});
+
+test("related corrections with one work item key are merged", () => {
+	const base = {
+		work_item_key: "sponsorship-page", description: "Fix grouping", assignee_alias: null,
+		start_date: null, due_date: null, priority_name: null, size_name: null, estimated_hours: null,
+		source_message_ids: ["m1"], relevant_attachment_ids: [], evidence: "Grouping is wrong",
+		proposed_action: "update", automatic_eligibility: "eligible", trigger_kind: "concrete_request",
+		lifecycle: "changed", content_intent: "update_note", metadata_change_fields: [],
+	};
+	const merged = mergeRelatedTaskCandidates([
+		{ ...base, title: "Fix page grouping" },
+		{ ...base, title: "Align left-column labels", description: "Fix label alignment", source_message_ids: ["m2"] },
+	]);
+	assert.equal(merged.length, 1);
+	assert.match(merged[0].title, /Align left-column labels/);
+	assert.deepEqual(merged[0].source_message_ids, ["m1", "m2"]);
+	assert.equal(mergeRelatedTaskCandidates([
+		{ ...base, title: "Eligible", automatic_eligibility: "eligible" },
+		{ ...base, title: "Ineligible", automatic_eligibility: "ineligible" },
+	]).length, 2);
+	assert.equal(mergeRelatedTaskCandidates([
+		{ ...base, title: "Comment", content_intent: "update_note" },
+		{ ...base, title: "Replacement", content_intent: "replace_description" },
+	]).length, 2);
+	assert.equal(mergeRelatedTaskCandidates([
+		{ ...base, title: "Old subject", metadata_change_fields: ["subject"] },
+		{ ...base, title: "New subject", metadata_change_fields: ["subject"] },
+	]).length, 2);
 });
 
 test("Azure extractor sends image attachments as multimodal inputs", async () => {
