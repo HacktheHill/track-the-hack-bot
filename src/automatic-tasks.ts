@@ -44,6 +44,10 @@ export function automaticFocalWindows<T>(messages: readonly T[], limit = 30, gap
 	});
 }
 
+export function uniqueMentionIds(...ids: Array<string | undefined>) {
+	return [...new Set(ids.filter((id): id is string => Boolean(id)))];
+}
+
 async function enrichAutomaticContext(messages: Message[], focal: Message) {
 	const roles = new Map<string, MinimizedMessage["contextRole"]>();
 	const focalIndex = messages.findIndex(message => message.id === focal.id);
@@ -281,7 +285,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 							components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
 								new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and apply").setStyle(ButtonStyle.Primary),
 								new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
-							)], allowedMentions: { users: [assigneeId, accountableId].filter((id): id is string => Boolean(id)) },
+							)], allowedMentions: { users: uniqueMentionIds(assigneeId, accountableId) },
 							});
 						} catch (error) {
 							await services.db.markProposalDeliveryFailed(proposal.id, (error as Error).message);
@@ -342,7 +346,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 								new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
 								new ButtonBuilder().setCustomId(`op-duplicate:${proposal.id}`).setLabel("Already tracked").setStyle(ButtonStyle.Secondary),
 							)],
-							allowedMentions: { users: [assigneeId, accountableId].filter((id): id is string => Boolean(id)) },
+							allowedMentions: { users: uniqueMentionIds(assigneeId, accountableId) },
 						});
 						} catch (error) {
 							await services.db.markProposalDeliveryFailed(proposal.id, (error as Error).message);

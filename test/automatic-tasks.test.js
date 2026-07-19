@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { automaticFocalWindows } from "../dist/automatic-tasks.js";
+import { automaticFocalWindows, uniqueMentionIds } from "../dist/automatic-tasks.js";
 
 test("automatic batches evaluate every message as its own focal window", () => {
 	assert.deepEqual(automaticFocalWindows(["a", "b", "c"]), [
@@ -32,4 +32,10 @@ test("automatic focal windows do not cross conversation gaps", () => {
 		{ messages: ["a", "b"], focal: "b" },
 		{ messages: ["c"], focal: "c" },
 	]);
+});
+
+test("automatic proposal mentions contain each reviewer once", () => {
+	assert.deepEqual(uniqueMentionIds("owner", "owner"), ["owner"]);
+	assert.deepEqual(uniqueMentionIds("assignee", "accountable"), ["assignee", "accountable"]);
+	assert.deepEqual(uniqueMentionIds(undefined, "accountable"), ["accountable"]);
 });
