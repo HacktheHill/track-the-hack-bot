@@ -28,6 +28,21 @@ cases with independently annotated, representative production windows over
 time. AI remains limited to human-reviewed proposals and cannot create an
 OpenProject task without reviewer approval.
 
+Retained minimized production windows can be replayed read-only from a runtime
+with database and Azure managed-identity access:
+
+```bash
+npm run replay:ai -- 2,4,5,6
+```
+
+The command prints candidate titles, actions, automatic eligibility, trigger
+kind, lifecycle, and cited message IDs. It does not print retained message text
+or modify proposal and extraction records. New events replay the exact bounded
+minimized input and planning options selected for Azure, except locally blocked
+sensitive contexts, whose text is intentionally not retained. Older events are marked
+`legacy_text_snapshot` because attachment, reply, and planning metadata may not
+have been retained.
+
 The successful run used an eight-second minimum interval between provider
 requests. Set `AI_EVAL_MIN_INTERVAL_MS` and `AI_EVAL_PROVIDER_RETRIES` for
 future batch runs when the Azure deployment has limited request or token

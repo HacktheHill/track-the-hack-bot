@@ -213,11 +213,15 @@ test("RAG combines semantic candidates with lexical title matches", async () => 
 });
 
 test("AI evaluator uses production grounding and target semantics for every action", () => {
-	const candidate = { proposed_action: "update", source_message_ids: ["m1"], relevant_attachment_ids: [] };
+	const candidate = { proposed_action: "update", automatic_eligibility: "eligible", source_message_ids: ["m1"], relevant_attachment_ids: [] };
 	const messages = [{ id: "m1", authorAlias: "USER_1", text: "Update it", timestamp: "2026-07-16T00:00:00Z", priority: true }];
 	assert.deepEqual(runtimeProposalCandidates([candidate], messages), []);
 	assert.deepEqual(runtimeProposalCandidates([candidate], messages, { availableTargetSourceMessageIds: [["m1"]] }), [candidate]);
 	assert.deepEqual(runtimeProposalCandidates([{ ...candidate, source_message_ids: ["other"] }], messages), []);
+	assert.deepEqual(runtimeProposalCandidates([{ ...candidate, automatic_eligibility: "ineligible" }], messages, { availableTargetSourceMessageIds: [["m1"]] }), []);
+	assert.deepEqual(runtimeProposalCandidates([{ ...candidate, automatic_eligibility: "ineligible" }], messages, { availableTargetSourceMessageIds: [["m1"]] }, "manual"), [
+		{ ...candidate, automatic_eligibility: "ineligible" },
+	]);
 });
 
 test("AI evaluator corpus accepts expected proposal lists", () => {
@@ -229,13 +233,21 @@ test("AI evaluator corpus accepts expected proposal lists", () => {
 	assert.deepEqual(parsed.expected.proposals[0].sourceMessageIds, ["m1"]);
 });
 
-test("automatic evaluation windows mirror one production focal message", () => {
-	assert.throws(() => corpusWindowSchema.parse({
+test("automatic evaluation windows allow subsequent context but require one focal message", () => {
+	assert.doesNotThrow(() => corpusWindowSchema.parse({
 		id: "window", mode: "automatic",
 		messages: [
 			{ id: "m1", authorAlias: "USER_1", text: "First", timestamp: "2026-07-16T00:00:00Z", priority: true },
 			{ id: "m2", authorAlias: "USER_2", text: "Second", timestamp: "2026-07-16T00:01:00Z" },
 		],
 		expected: { proposals: [] },
-	}), /final position/);
+	}));
+	assert.throws(() => corpusWindowSchema.parse({
+		id: "window", mode: "automatic",
+		messages: [
+			{ id: "m1", authorAlias: "USER_1", text: "First", timestamp: "2026-07-16T00:00:00Z", priority: true },
+			{ id: "m2", authorAlias: "USER_2", text: "Second", timestamp: "2026-07-16T00:01:00Z", contextRole: "primary" },
+		],
+		expected: { proposals: [] },
+	}), /exactly one/);
 });

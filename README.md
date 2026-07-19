@@ -164,10 +164,25 @@ Automatic extraction is controlled separately by `OPENPROJECT_AUTOMATION_MODE`:
 
 AI extraction runs in every channel except those listed in the blocked or
 excluded ID lists. Excluded category IDs apply to all descendant channels.
+Automatic extraction evaluates each focal message with topic-bounded preceding
+and subsequent context, plus available reply targets and thread roots. It posts
+only candidates classified as durable work: assignments, commitments, concrete
+requests, required deliverables, remaining work, actionable problem statements,
+tracked completions, or reopen requests. Informational results, status-only
+reports, already resolved work, transient synchronous help, hypotheticals,
+placeholder text, and meta-discussion about the bot are retained as decision
+telemetry but do not become proposals.
+
+Manual extraction is intentionally broader because invoking the command supplies
+human intent. It can return any meaningful work grounded in the selected focal
+context even when the same candidate would not pass the automatic eligibility
+gate. The automatic eligibility assessment is still recorded so manual cases can
+be used to measure automatic false negatives.
 
 Review outcomes store timestamps, status counters, token/latency values,
-per-field edits, minimized inputs, proposal decisions, and revisions for 90
-days. Raw Discord transcripts are never copied into task descriptions.
+per-field edits, minimized inputs, proposal decisions, candidate eligibility and
+lifecycle assessments, and revisions for 90 days. Raw Discord transcripts are
+never copied into task descriptions.
 Production uses `review` mode: AI may post a proposal, but only a permitted
 human reviewer can create or dismiss the task.
 

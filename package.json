@@ -9,6 +9,7 @@
 		"build": "tsc",
 		"test": "npm run build && node --test test/*.test.js",
 		"evaluate:ai": "npm run build && node dist/evaluate-ai.js",
+		"replay:ai": "npm run build && node dist/replay-ai.js",
 		"sync:embeddings": "npm run build && node dist/sync-embeddings.js",
 		"migrate:db": "npm run build && node dist/migrate-db.js",
 		"dev": "npx nodemon --exec npx tsx src/bot.ts",

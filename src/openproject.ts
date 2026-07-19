@@ -50,12 +50,16 @@ export function titlesLikelyDuplicate(left: string, right: string) {
 	const a = normalizeTaskTitle(left);
 	const b = normalizeTaskTitle(right);
 	if (!a || !b) return false;
+	const identifiers = (value: string) => new Set(value.split(" ").filter(word => word.length <= 2 || /\d/.test(word)));
+	const leftIdentifiers = identifiers(a);
+	const rightIdentifiers = identifiers(b);
+	if (leftIdentifiers.size !== rightIdentifiers.size || [...leftIdentifiers].some(word => !rightIdentifiers.has(word))) return false;
 	if (a === b || (Math.min(a.length, b.length) >= 12 && (a.includes(b) || b.includes(a)))) return true;
-	const leftWords = new Set(a.split(" ").filter(word => word.length > 2));
-	const rightWords = new Set(b.split(" ").filter(word => word.length > 2));
+	const stopWords = new Set(["and", "for", "the", "to", "with"]);
+	const leftWords = new Set(a.split(" ").filter(word => word.length > 2 && !stopWords.has(word)));
+	const rightWords = new Set(b.split(" ").filter(word => word.length > 2 && !stopWords.has(word)));
 	const intersection = [...leftWords].filter(word => rightWords.has(word)).length;
-	const union = new Set([...leftWords, ...rightWords]).size;
-	return union > 0 && intersection >= 2 && intersection / union >= 0.6;
+	return intersection >= 2 && intersection / Math.min(leftWords.size, rightWords.size) >= 0.8;
 }
 
 export function workPackageChangesApplied(workPackage: WorkPackage, changes: Record<string, unknown>) {

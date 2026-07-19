@@ -2,6 +2,7 @@ import pg from "pg";
 import type { IntegrationConfig } from "./config.js";
 import { randomUUID } from "node:crypto";
 import { proposalMetadataPatchSchema, type ContentOperation, type ProposalMetadataPatch } from "./task-proposals.js";
+import { titlesLikelyDuplicate } from "./openproject.js";
 
 const { Pool } = pg;
 
@@ -540,9 +541,38 @@ export class Database {
 		}
 		const id = randomUUID();
 		const normalizedTitle = input.title.toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
-		const sourceAnchor = [...input.sourceMessageIds].sort()[0] ?? "no-source";
-		const fingerprint = `${input.channelId}:${sourceAnchor}:${input.action ?? "create"}:${input.targetWorkPackageId ?? "new"}:${normalizedTitle}`;
-		const result = await this.pool.query<{ id: string }>(
+		const sortedSourceIds = [...input.sourceMessageIds].sort();
+		const fingerprint = [
+			input.channelId,
+			input.projectId ?? "no-project",
+			sortedSourceIds.join(",") || "no-source",
+			input.action ?? "create",
+			input.targetWorkPackageId ?? "new",
+			input.assigneeDiscordId ?? "unassigned",
+			normalizedTitle,
+		].join(":");
+		const dedupeLock = [input.channelId, sortedSourceIds.join(","), input.action ?? "create", input.projectId ?? "no-project", input.targetWorkPackageId ?? "new", input.assigneeDiscordId ?? "unassigned"].join(":");
+		const client = await this.pool.connect();
+		let proposalId: string | undefined;
+		let reused = false;
+		try {
+			await client.query("BEGIN");
+			await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [dedupeLock]);
+			const overlapping = await client.query<{ id: string; title: string }>(
+				`SELECT id,title FROM task_proposals
+				 WHERE channel_id=$1 AND source_message_ids @> $2::text[] AND source_message_ids <@ $2::text[]
+				 AND action=$3 AND project_id IS NOT DISTINCT FROM $4
+				 AND target_work_package_id IS NOT DISTINCT FROM $5
+				 AND assignee_discord_id IS NOT DISTINCT FROM $6
+				 AND (status='created' OR (status IN ('pending_review','creating') AND expires_at > now()))`,
+				[input.channelId, sortedSourceIds, input.action ?? "create", input.projectId ?? null, input.targetWorkPackageId ?? null, input.assigneeDiscordId ?? null],
+			);
+			const overlappingDuplicate = overlapping.rows.find(row => titlesLikelyDuplicate(row.title, input.title));
+			if (overlappingDuplicate) {
+				proposalId = overlappingDuplicate.id;
+				reused = true;
+			} else {
+				const result = await client.query<{ id: string }>(
 			`INSERT INTO task_proposals
 			(id, requester_discord_id, channel_id, project_id, title, description,
 			 assignee_discord_id, accountable_discord_id, priority_id, size_href, start_date, due_date, estimated_hours, metadata_inference,
@@ -582,17 +612,35 @@ export class Database {
 			 input.tokenUsage ?? null, input.escalationReason ?? null,
 			 input.action && input.action !== "create" ? 1 : null, jsonParameter(input.metadataPatch ?? {}),
 			 input.contentOperation ?? null, input.contentMarkdown ?? null, input.retentionDays ?? 30],
-		);
-		if (result.rows[0]) {
-			if (input.initialSnapshot) await this.recordProposalRevision(result.rows[0].id, 1, "initial", input.initialSnapshot);
-			return { id: result.rows[0].id, reused: false };
+				);
+				if (result.rows[0]) {
+					proposalId = result.rows[0].id;
+					if (input.initialSnapshot) {
+						await client.query(
+							`INSERT INTO task_proposal_revisions(proposal_id,revision,phase,payload) VALUES($1,1,'initial',$2)
+							 ON CONFLICT(proposal_id,revision) DO UPDATE SET phase=excluded.phase,payload=excluded.payload,created_at=now()`,
+							[proposalId, jsonParameter(input.initialSnapshot)],
+						);
+					}
+				} else {
+					const existing = await client.query<{ id: string }>(
+						"SELECT id FROM task_proposals WHERE source_fingerprint=$1",
+						[fingerprint],
+					);
+					if (!existing.rows[0]) throw new Error("Proposal idempotency conflict could not be reconciled.");
+					proposalId = existing.rows[0].id;
+					reused = true;
+				}
+			}
+			await client.query("COMMIT");
+		} catch (error) {
+			await client.query("ROLLBACK");
+			throw error;
+		} finally {
+			client.release();
 		}
-		const existing = await this.pool.query<{ id: string }>(
-			"SELECT id FROM task_proposals WHERE source_fingerprint=$1",
-			[fingerprint],
-		);
-		if (!existing.rows[0]) throw new Error("Proposal idempotency conflict could not be reconciled.");
-		return { id: existing.rows[0].id, reused: true };
+		if (!proposalId) throw new Error("Proposal creation returned no identifier.");
+		return { id: proposalId, reused };
 	}
 
 	async convertProposalToUpdate(input: {

@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { config as loadDotEnv } from "dotenv";
 import { z } from "zod";
-import { AzureTaskExtractor, StructuredOutputError, type ExtractedTasks, type MinimizedMessage } from "./azure-openai.js";
+import { automaticCandidateEligible, AzureTaskExtractor, StructuredOutputError, type ExtractedTasks, type MinimizedMessage } from "./azure-openai.js";
 import type { IntegrationConfig } from "./config.js";
 import { resolveProposedAction } from "./rag.js";
 import { taskReferencesAreValid } from "./task-proposals.js";
@@ -39,8 +39,8 @@ export const corpusWindowSchema = z.object({
 	expected: z.object({ proposals: z.array(expectedProposalSchema).max(5) }),
 }).superRefine((window, context) => {
 	const focal = window.messages.filter(message => message.contextRole === "primary" || message.priority);
-	if (window.mode === "automatic" && (focal.length !== 1 || !window.messages.at(-1)?.priority)) {
-		context.addIssue({ code: "custom", message: "Automatic evaluation windows require exactly one priority=true focal message in the final position." });
+	if (window.mode === "automatic" && focal.length !== 1) {
+		context.addIssue({ code: "custom", message: "Automatic evaluation windows require exactly one primary or priority focal message." });
 	}
 	if (window.mode === "manual" && !focal.length) {
 		context.addIssue({ code: "custom", message: "Manual evaluation windows require at least one primary or priority focal message." });
@@ -64,6 +64,7 @@ export function runtimeProposalCandidates(
 	tasks: ExtractedTask[],
 	messages: MinimizedMessage[],
 	routing: { availableTargetSourceMessageIds?: string[][] } = {},
+	mode: "manual" | "automatic" = "automatic",
 ) {
 	const validMessageIds = new Set(messages.map(message => message.id));
 	const focalMessageIds = new Set(messages
@@ -71,6 +72,7 @@ export function runtimeProposalCandidates(
 		.map(message => message.id));
 	const validAttachmentIds = new Set(messages.flatMap(message => (message.attachments ?? []).map(attachment => attachment.id)));
 	return tasks.filter(task => {
+		if (mode === "automatic" && !automaticCandidateEligible(task)) return false;
 		if (!taskReferencesAreValid(task, validMessageIds, focalMessageIds, validAttachmentIds)) return false;
 		const targetAvailable = routing.availableTargetSourceMessageIds?.some(ids => sameSet(ids, task.source_message_ids)) ?? false;
 		return resolveProposedAction(task.proposed_action, targetAvailable) !== "no_action";
@@ -145,7 +147,7 @@ async function main() {
 			totalLatencyMs += extraction.latencyMs;
 			latencySamples++;
 			totalTokens += extraction.usage?.totalTokens ?? 0;
-			const predicted = runtimeProposalCandidates(extraction.result.tasks, window.messages as MinimizedMessage[], window.routing);
+			const predicted = runtimeProposalCandidates(extraction.result.tasks, window.messages as MinimizedMessage[], window.routing, window.mode);
 			const unmatched = new Set(predicted.map((_, index) => index));
 			let matched = 0;
 			for (const expected of window.expected.proposals) {

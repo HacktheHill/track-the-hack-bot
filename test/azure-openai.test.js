@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AzureTaskExtractor, containsSensitiveContent, minimizeText, normalizeExtractedDate, sensitiveContentReasons, SensitiveContentError } from "../dist/azure-openai.js";
+import { automaticCandidateEligible, AzureTaskExtractor, containsSensitiveContent, extractionDiagnostics, minimizeText, normalizeExtractedDate, sensitiveContentReasons, SensitiveContentError } from "../dist/azure-openai.js";
 
 test("minimizeText removes common credentials and personal contact data", () => {
 	const value = minimizeText(
@@ -43,7 +43,7 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 	};
 	try {
 		const extractor = new AzureTaskExtractor(config, async () => "managed-identity-token");
-		await extractor.extract(
+		const extraction = await extractor.extract(
 			[{ id: "m1", authorAlias: "USER_1", text: "Ship it", timestamp: "2026-07-13T00:00:00Z", contextRole: "primary" }],
 			{ mode: "manual", metadata: { priorities: ["High"], sizes: ["Small"] } },
 		);
@@ -54,7 +54,10 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 		assert.equal("temperature" in request.body, false);
 		assert.equal(request.headers.Authorization, "Bearer managed-identity-token");
 		assert.match(request.body.messages[0].content, /Manual extraction is intentionally broad/);
-		assert.match(request.body.messages[0].content, /Evaluate each focal message independently/);
+		assert.match(request.body.messages[0].content, /invoking it supplies human intent/);
+		assert.match(request.body.messages[0].content, /automatic_eligibility=eligible/);
+		assert.match(request.body.messages[0].content, /transient synchronous help/);
+		assert.match(request.body.messages[0].content, /Group requirements and feedback/);
 		assert.match(request.body.messages[0].content, /timestamps/);
 		assert.match(request.body.messages[0].content, /priority_name must exactly match one of: High/);
 		assert.match(request.body.messages[0].content, /size_name must exactly match one of: Small/);
@@ -65,6 +68,9 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 		assert.match(request.body.messages[0].content, /application adds verified links separately/);
 		assert.match(request.body.messages[0].content, /Human review decides whether to accept it/);
 		assert.ok(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("content_intent"));
+		assert.ok(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("automatic_eligibility"));
+		assert.ok(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("trigger_kind"));
+		assert.ok(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("lifecycle"));
 		assert.equal("message_assessments" in request.body.response_format.json_schema.schema.properties, false);
 		assert.equal(request.body.response_format.json_schema.schema.properties.tasks.items.properties.significance_score, undefined);
 		assert.deepEqual(request.body.response_format.json_schema.schema.properties.tasks.items.properties.proposed_action.enum, ["create", "update", "complete", "reopen"]);
@@ -73,9 +79,19 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 			id: "m1", authorAlias: "USER_1", text: "Ship it",
 			timestamp: "2026-07-13T00:00:00Z", contextRole: "primary",
 		});
+		assert.deepEqual(extraction.inputMessages, [{
+			id: "m1", authorAlias: "USER_1", text: "Ship it",
+			timestamp: "2026-07-13T00:00:00Z", contextRole: "primary",
+		}]);
+		assert.deepEqual(extraction.metadata, { priorities: ["High"], sizes: ["Small"] });
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
+});
+
+test("automatic eligibility is an explicit runtime gate", () => {
+	assert.equal(automaticCandidateEligible({ automatic_eligibility: "eligible" }), true);
+	assert.equal(automaticCandidateEligible({ automatic_eligibility: "ineligible" }), false);
 });
 
 test("Azure extractor sends image attachments as multimodal inputs", async () => {
@@ -174,10 +190,13 @@ test("sensitive content is rejected before an Azure request", async () => {
 		throw new Error("should not be called");
 	};
 	try {
-		await assert.rejects(
-			new AzureTaskExtractor(config, async () => "managed-identity-token").extract(sensitive),
-			SensitiveContentError,
-		);
+		let rejected;
+		await assert.rejects(new AzureTaskExtractor(config, async () => "managed-identity-token").extract(sensitive), error => {
+			rejected = error;
+			return error instanceof SensitiveContentError;
+		});
+		assert.deepEqual(extractionDiagnostics(rejected)?.inputMessages, sensitive);
+		assert.deepEqual(extractionDiagnostics(rejected)?.replayOptions, { allowSensitiveContent: false });
 		assert.equal(requested, false);
 	} finally {
 		globalThis.fetch = originalFetch;
@@ -214,11 +233,12 @@ test("a manual override permits one explicitly approved sensitive request", asyn
 		}), { status: 200 });
 	};
 	try {
-		await new AzureTaskExtractor(config, async () => "managed-identity-token").extract(
+		const extraction = await new AzureTaskExtractor(config, async () => "managed-identity-token").extract(
 			sensitive,
 			{ allowSensitiveContent: true },
 		);
 		assert.equal(requested, true);
+		assert.deepEqual(extraction.replayOptions, { allowSensitiveContent: true });
 	} finally {
 		globalThis.fetch = originalFetch;
 	}

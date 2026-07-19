@@ -30,7 +30,7 @@ import { randomUUID } from "node:crypto";
 import { isOrganizerGuild, type IntegrationConfig, type TeamMapping } from "./config.js";
 import { correctionFields, Database, type CorrectionFlags, type ProposalMetrics } from "./database.js";
 import { OpenProjectClient, OpenProjectRequestError, workPackageChangesApplied } from "./openproject.js";
-import { containsSensitiveContent, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, StructuredOutputError, type ExtractedTasks, type ExtractionResult, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
+import { attachExtractionDiagnostics, automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, StructuredOutputError, type ExtractedTasks, type ExtractionResult, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
 import { composeOpenProjectMarkdown, describeProposalOperations, formatGeneratedTaskDescription, planExistingTaskOperations, taskReferencesAreValid, type ProposalMetadataPatch } from "./task-proposals.js";
 
@@ -395,6 +395,10 @@ function matchedTeam(member: GuildMember | null, mappings: Record<string, TeamMa
 		.sort(([, a], [, b]) => (a.priority ?? 999) - (b.priority ?? 999))[0];
 }
 
+export function teamProjectId(member: GuildMember | null, mappings: Record<string, TeamMapping>) {
+	return matchedTeam(member, mappings)?.[1].projectId;
+}
+
 async function accountableFor(
 	assignee: GuildMember | null,
 	services: Services,
@@ -558,7 +562,7 @@ async function resolveProject(
 	}
 	const categoryDefault = await categoryProject(channelId, guild, services);
 	if (categoryDefault) return categoryDefault;
-	return matchedTeam(assignee, services.config.teamRoles)?.[1].projectId;
+	return teamProjectId(assignee, services.config.teamRoles);
 }
 
 export function databaseDate(value: unknown) {
@@ -852,14 +856,22 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 		try {
 			await completeAiContext(interaction, services, context);
 		} catch (error) {
+			const diagnostics = extractionDiagnostics(error);
+			const retainSnapshot = !(error instanceof SensitiveContentError) || Boolean(diagnostics?.replayOptions.allowSensitiveContent);
 			if (error instanceof SensitiveContentError) {
-				await services.db.recordExtraction({ source: "manual", outcome: "sensitive_block", decision: { reasons: error.reasons } }).catch(() => undefined);
+				await services.db.recordExtraction({
+					source: "manual", outcome: "sensitive_block", triggerId: context.primaryId,
+					inputSnapshot: retainSnapshot ? diagnostics?.inputMessages.map(({ containedSensitiveData: _, ...message }) => message) : undefined,
+					decision: { reasons: error.reasons, extractionMetadata: diagnostics?.metadata, extractionOptions: diagnostics?.replayOptions },
+				}).catch(() => undefined);
 				await interaction.editReply(sensitiveContentNotice("channel", error));
 				return;
 			}
 			await services.db.recordExtraction({
 				source: "manual", outcome: error instanceof StructuredOutputError ? "invalid_output" : "error",
-				triggerId: context.primaryId, decision: { trigger: "slash", errorType: error instanceof StructuredOutputError ? "invalid_output" : "provider_error" },
+				triggerId: context.primaryId,
+				inputSnapshot: retainSnapshot ? diagnostics?.inputMessages.map(({ containedSensitiveData: _, ...message }) => message) : undefined,
+				decision: { trigger: "slash", errorType: !diagnostics || diagnostics.stage === "processing" ? "processing_error" : error instanceof StructuredOutputError ? "invalid_output" : "provider_error", extractionMetadata: diagnostics?.metadata, extractionOptions: diagnostics?.replayOptions },
 			}).catch(() => undefined);
 			throw error;
 		}
@@ -1377,16 +1389,23 @@ async function handleAiContext(interaction: MessageContextMenuCommandInteraction
 	try {
 		await completeAiContext(interaction, services, context);
 	} catch (error) {
+		const diagnostics = extractionDiagnostics(error);
+		const retainSnapshot = !(error instanceof SensitiveContentError) || Boolean(diagnostics?.replayOptions.allowSensitiveContent);
 		if (!(error instanceof SensitiveContentError)) {
 			await services.db.recordExtraction({
 				source: "manual",
 				outcome: error instanceof StructuredOutputError ? "invalid_output" : "error",
 				triggerId: context.primaryId,
-				decision: { trigger: "context_menu", errorType: error instanceof StructuredOutputError ? "invalid_output" : "provider_error" },
+				inputSnapshot: retainSnapshot ? diagnostics?.inputMessages.map(({ containedSensitiveData: _, ...message }) => message) : undefined,
+				decision: { trigger: "context_menu", errorType: !diagnostics || diagnostics.stage === "processing" ? "processing_error" : error instanceof StructuredOutputError ? "invalid_output" : "provider_error", extractionMetadata: diagnostics?.metadata, extractionOptions: diagnostics?.replayOptions },
 			}).catch(auditError => console.error("AI extraction metrics failed", { error: (auditError as Error).message }));
 			throw error;
 		}
-		await services.db.recordExtraction({ source: "manual", outcome: "sensitive_block", triggerId: context.primaryId, decision: { trigger: "context_menu", reasons: error.reasons } })
+		await services.db.recordExtraction({
+			source: "manual", outcome: "sensitive_block", triggerId: context.primaryId,
+			inputSnapshot: retainSnapshot ? diagnostics?.inputMessages.map(({ containedSensitiveData: _, ...message }) => message) : undefined,
+			decision: { trigger: "context_menu", reasons: error.reasons, extractionMetadata: diagnostics?.metadata, extractionOptions: diagnostics?.replayOptions },
+		})
 			.catch(auditError => console.error("AI extraction metrics failed", { error: (auditError as Error).message }));
 		const id = randomUUID();
 		sensitiveOverrides.set(id, { userId: interaction.user.id, context, expiresAt: Date.now() + 10 * 60_000 });
@@ -1415,15 +1434,29 @@ async function completeAiContext(
 		metadata: { priorities: priorities.map(priority => priority.name), sizes: tentativeSizes.map(size => size.value) },
 	});
 	const { result, deployment } = extraction;
-	const inputSnapshot = context.messages.map(({ id, authorAlias, text, timestamp, contextRole }) => ({ id, authorAlias, text, timestamp, contextRole }));
-	const decisionTelemetry = { taskCount: result.tasks.length, primaryMessageIds: [...context.focusIds] };
+	const inputSnapshot = extraction.inputMessages.map(({ containedSensitiveData: _, ...message }) => message);
 	const validAttachmentIds = new Set([...context.sourceRecords.values()].flatMap(record => record.attachments.map(attachment => attachment.id)));
 	const candidates = result.tasks.filter(task => taskReferencesAreValid(task, context.validIds, context.focusIds, validAttachmentIds));
+	const decisionTelemetry = {
+		taskCount: result.tasks.length,
+		automaticEligibleCount: candidates.filter(automaticCandidateEligible).length,
+		invalidGroundingCount: result.tasks.length - candidates.length,
+		extractionMetadata: extraction.metadata,
+		extractionOptions: extraction.replayOptions,
+		primaryMessageIds: [...context.focusIds],
+		candidateAssessments: candidates.map(task => ({
+			automaticEligibility: task.automatic_eligibility,
+			triggerKind: task.trigger_kind,
+			lifecycle: task.lifecycle,
+			proposedAction: task.proposed_action,
+			sourceMessageIds: task.source_message_ids,
+		})),
+	};
 	if (!candidates.length) {
 		await services.db.recordExtraction({
 			source: "manual", outcome: "no_task", modelDeployment: deployment, triggerId: context.primaryId,
 			 taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
-			inputSnapshot, decision: { ...decisionTelemetry, outcome: "no_task", invalidGroundingCount: result.tasks.length },
+			inputSnapshot, decision: { ...decisionTelemetry, outcome: "no_task", invalidGroundingCount: result.tasks.length - candidates.length },
 		});
 		const detail = result.tasks.length ? "The returned candidates did not cite the selected message or used unknown source IDs." : "AI returned no actionable candidates.";
 		await interaction.editReply(`No task proposal was found in the selected context. ${detail}`);
@@ -1433,6 +1466,12 @@ async function completeAiContext(
 		try {
 			await completeAiCandidate(interaction, services, context, extraction, candidate, priorities, inputSnapshot, decisionTelemetry, index === 0);
 		} catch (error) {
+			attachExtractionDiagnostics(error, {
+				inputMessages: extraction.inputMessages,
+				metadata: extraction.metadata,
+				replayOptions: extraction.replayOptions,
+				stage: "processing",
+			});
 			if (index === 0) throw error;
 			await interaction.followUp({ content: `Another candidate could not be prepared: ${(error as Error).message}`, flags: MessageFlags.Ephemeral });
 		}
@@ -1447,7 +1486,15 @@ async function completeAiCandidate(
 	candidate: ExtractedTasks["tasks"][number],
 	priorities: Awaited<ReturnType<OpenProjectClient["priorities"]>>,
 	inputSnapshot: Array<{ id: string; authorAlias: string; text: string; timestamp: string; contextRole?: MinimizedMessage["contextRole"] }>,
-	decisionTelemetry: { taskCount: number; primaryMessageIds: string[] },
+	decisionTelemetry: {
+		taskCount: number;
+		automaticEligibleCount: number;
+		invalidGroundingCount: number;
+		extractionMetadata?: ExtractionResult["metadata"];
+		extractionOptions: ExtractionResult["replayOptions"];
+		primaryMessageIds: string[];
+		candidateAssessments: Array<Record<string, unknown>>;
+	},
 	replaceReply: boolean,
 ) {
 	const { result, deployment } = extraction;

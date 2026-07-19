@@ -3,6 +3,7 @@ import test from "node:test";
 import { Database } from "../dist/database.js";
 
 function databaseWithPool(pool) {
+	if (!pool.connect) pool.connect = async () => ({ ...pool, release() {} });
 	const db = Object.create(Database.prototype);
 	Object.defineProperty(db, "pool", { value: pool });
 	return db;
@@ -108,8 +109,11 @@ test("AI proposal metadata is persisted for reviewed task creation", async () =>
 	let inserted;
 	const db = databaseWithPool({
 		async query(sql, values) {
-			inserted = { sql, values };
-			return { rowCount: 1, rows: [{ id: "proposal" }] };
+			if (sql.includes("INSERT INTO task_proposals")) {
+				inserted = { sql, values };
+				return { rowCount: 1, rows: [{ id: "proposal" }] };
+			}
+			return { rowCount: 0, rows: [] };
 		},
 	});
 	await db.createProposal({
@@ -123,6 +127,7 @@ test("AI proposal metadata is persisted for reviewed task creation", async () =>
 	assert.match(inserted.sql, /\$18,'pending_review',\$19/);
 	assert.deepEqual(inserted.values.slice(7, 13), ["accountable", 4, "/api/v3/custom_options/5", "2026-07-14", "2026-07-21", 6]);
 	assert.equal(inserted.values[13], '{"priority":false,"size":true,"estimate":true}');
+	assert.match(inserted.values[15], /channel:3:message:create:new:user:prepare outreach/);
 });
 
 test("existing-task proposals persist explicit operations and independent checkpoints", async () => {
@@ -130,7 +135,7 @@ test("existing-task proposals persist explicit operations and independent checkp
 	const db = databaseWithPool({
 		async query(sql, values) {
 			queries.push({ sql, values });
-			return { rowCount: 1, rows: [{ id: "proposal" }] };
+			return sql.includes("INSERT INTO task_proposals") ? { rowCount: 1, rows: [{ id: "proposal" }] } : { rowCount: 0, rows: [] };
 		},
 	});
 	await db.createProposal({
@@ -139,12 +144,51 @@ test("existing-task proposals persist explicit operations and independent checkp
 		action: "update", targetWorkPackageId: 2149, targetLockVersion: 0,
 		metadataPatch: { dueDate: "2026-07-31" }, contentOperation: "postComment", contentMarkdown: "- Change wording",
 	});
-	assert.match(queries[0].sql, /operation_schema_version, metadata_patch, content_operation, content_markdown/);
-	assert.deepEqual(queries[0].values.slice(28, 32), [1, '{"dueDate":"2026-07-31"}', "postComment", "- Change wording"]);
+	const insert = queries.find(query => query.sql.includes("INSERT INTO task_proposals"));
+	assert.match(insert.sql, /operation_schema_version, metadata_patch, content_operation, content_markdown/);
+	assert.deepEqual(insert.values.slice(28, 32), [1, '{"dueDate":"2026-07-31"}', "postComment", "- Change wording"]);
 	await db.markProposalPatchApplied("proposal", 2);
 	await db.markProposalCommentApplied("proposal", 99);
-	assert.match(queries[1].sql, /patch_applied_at/);
-	assert.match(queries[2].sql, /comment_activity_id/);
+	assert.equal(queries.some(query => query.sql.includes("patch_applied_at")), true);
+	assert.equal(queries.some(query => query.sql.includes("comment_activity_id")), true);
+});
+
+test("overlapping active proposals deduplicate similar generated titles", async () => {
+	const queries = [];
+	const db = databaseWithPool({
+		async query(sql) {
+			queries.push(sql);
+			if (sql.includes("SELECT id,title FROM task_proposals")) {
+				return { rowCount: 1, rows: [{ id: "existing", title: "Update sponsorship package wording and layout" }] };
+			}
+			if (sql === "BEGIN" || sql === "COMMIT" || sql.includes("pg_advisory_xact_lock")) return { rowCount: 0, rows: [] };
+			throw new Error(`Unexpected query: ${sql}`);
+		},
+	});
+	assert.deepEqual(await db.createProposal({
+		channelId: "channel", title: "Revise sponsorship package wording and layout", description: "Apply edits",
+		sourceMessageIds: ["message"], modelDeployment: "model",
+	}), { id: "existing", reused: true });
+	assert.equal(queries.some(sql => sql.includes("INSERT INTO task_proposals")), false);
+	assert.equal(queries.some(sql => sql.includes("expires_at > now()")), true);
+});
+
+test("proposal insertion and its initial revision commit atomically", async () => {
+	const queries = [];
+	const db = databaseWithPool({
+		async query(sql) {
+			queries.push(sql);
+			if (sql.includes("INSERT INTO task_proposals")) return { rowCount: 1, rows: [{ id: "proposal" }] };
+			return { rowCount: 0, rows: [] };
+		},
+	});
+	await db.createProposal({
+		channelId: "channel", title: "Prepare outreach", description: "Create tracker",
+		sourceMessageIds: ["message"], modelDeployment: "model", initialSnapshot: { title: "Prepare outreach" },
+	});
+	const revisionIndex = queries.findIndex(sql => sql.includes("INSERT INTO task_proposal_revisions"));
+	const commitIndex = queries.findIndex(sql => sql === "COMMIT");
+	assert.ok(revisionIndex > -1 && commitIndex > revisionIndex);
 });
 
 test("existing-task proposals require a target and lock version", async () => {

@@ -272,6 +272,10 @@ test("AI metrics formatter reports operational quality without content", () => {
 test("duplicate detection normalizes punctuation and compares meaningful words", () => {
 	assert.equal(normalizeTaskTitle("  Ship: Sponsor Portal! "), "ship sponsor portal");
 	assert.equal(titlesLikelyDuplicate("Ship the sponsor portal", "Sponsor portal: ship implementation"), true);
+	assert.equal(titlesLikelyDuplicate("Update sponsor A package", "Update sponsor B package"), false);
+	assert.equal(titlesLikelyDuplicate("Prepare sponsorship package for Acme", "Prepare sponsorship package for Globex"), false);
+	assert.equal(titlesLikelyDuplicate("Prepare task 1 checklist", "Prepare task 2 checklist"), false);
+	assert.equal(titlesLikelyDuplicate("Prepare sponsor package", "Prepare sponsor package 2"), false);
 	assert.equal(titlesLikelyDuplicate("Book venue", "Update Discord roles"), false);
 });
 
