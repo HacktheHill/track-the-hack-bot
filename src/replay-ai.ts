@@ -13,6 +13,7 @@ const replayConfigSchema = z.object({
 	AZURE_OPENAI_MAX_COMPLETION_TOKENS: z.coerce.number().int().min(64).max(4096).default(4096),
 	OPENPROJECT_AI_MAX_CONTEXT_CHARS: z.coerce.number().int().min(2000).max(100000).default(16000),
 	OPENPROJECT_AI_MAX_IMAGE_ATTACHMENTS: z.coerce.number().int().min(0).max(20).default(8),
+	AI_REPLAY_MIN_INTERVAL_MS: z.coerce.number().int().min(0).max(60000).default(8000),
 });
 
 function eventIds(value?: string) {
@@ -88,7 +89,7 @@ async function main() {
 					reproducedError: error instanceof SensitiveContentError ? "sensitive_block" : error instanceof Error ? error.name : "unknown",
 				}));
 			}
-			await new Promise(resolve => setTimeout(resolve, 2_000));
+			await new Promise(resolve => setTimeout(resolve, config.AI_REPLAY_MIN_INTERVAL_MS));
 		}
 	} finally {
 		await pool.end();

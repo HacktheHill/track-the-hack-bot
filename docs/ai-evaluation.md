@@ -41,7 +41,9 @@ or modify proposal and extraction records. New events replay the exact bounded
 minimized input and planning options selected for Azure, except locally blocked
 sensitive contexts, whose text is intentionally not retained. Older events are marked
 `legacy_text_snapshot` because attachment, reply, and planning metadata may not
-have been retained.
+have been retained. Replays wait eight seconds between requests by default;
+`AI_REPLAY_MIN_INTERVAL_MS` can override that pacing for a deployment with a
+different rate limit.
 
 The successful run used an eight-second minimum interval between provider
 requests. Set `AI_EVAL_MIN_INTERVAL_MS` and `AI_EVAL_PROVIDER_RETRIES` for

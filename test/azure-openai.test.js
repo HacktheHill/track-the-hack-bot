@@ -57,7 +57,9 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 		assert.match(request.body.messages[0].content, /invoking it supplies human intent/);
 		assert.match(request.body.messages[0].content, /automatic_eligibility=eligible/);
 		assert.match(request.body.messages[0].content, /transient synchronous help/);
+		assert.match(request.body.messages[0].content, /live access codes, login assistance/);
 		assert.match(request.body.messages[0].content, /Group requirements and feedback/);
+		assert.match(request.body.messages[0].content, /proposed_action=update for requests to review or revise/);
 		assert.match(request.body.messages[0].content, /timestamps/);
 		assert.match(request.body.messages[0].content, /priority_name must exactly match one of: High/);
 		assert.match(request.body.messages[0].content, /size_name must exactly match one of: Small/);
