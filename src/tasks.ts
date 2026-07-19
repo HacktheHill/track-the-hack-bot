@@ -115,13 +115,14 @@ type Services = { config: IntegrationConfig; db: Database; openProject: OpenProj
 type TaskInteraction = ChatInputCommandInteraction | ModalSubmitInteraction | ButtonInteraction;
 type ContextDraft = {
 	userId: string; channelId: string; targetId: string; title: string; description: string;
-	projectId?: number; assigneeId?: string; expiresAt: number;
+	projectId?: number; assigneeId?: string; defaultDueDate?: string; expiresAt: number;
 };
 type CreationDraft = {
 	userId: string; channelId: string; expiresAt: number; proposalId?: string;
 	title: string; description: string; projectText: string | null;
 	assigneeId?: string; accountableId?: string; priorityId?: number; sizeHref?: string;
-	startDate?: string; dueDate?: string; estimatedHours?: number;
+	startDate?: string; dueDate?: string; inferenceDueDate?: string; estimatedHours?: number;
+	priorityInferred?: boolean; sizeInferred?: boolean; estimateInferred?: boolean;
 	sourceLinks: string[]; allowDuplicate?: boolean;
 };
 type CollectedContext = {
@@ -279,6 +280,74 @@ export function defaultTaskDates(now: Date, startToday: boolean, dueDays: number
 		startDate: startToday ? start : undefined,
 		dueDate: addCalendarDays(start, dueDays),
 	};
+}
+
+type CreationPriority = { id: number; name: string; isDefault: boolean };
+type CreationSize = { id: number; value: string };
+
+function metadataLabel(value: string) {
+	return value.normalize("NFKD").replace(/\p{M}/gu, "").toLocaleLowerCase()
+		.replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+}
+
+function sizeKind(value?: string) {
+	const normalized = metadataLabel(value ?? "");
+	if (normalized.includes("x large") || normalized.includes("extra large")) return "xlarge" as const;
+	if (normalized.includes("large")) return "large" as const;
+	if (normalized.includes("medium")) return "medium" as const;
+	return "small" as const;
+}
+
+export function inferCreationMetadata(input: {
+	title: string;
+	description?: string;
+	dueDate?: string | null;
+	priorities: CreationPriority[];
+	sizes: CreationSize[];
+	priority?: CreationPriority;
+	size?: CreationSize;
+	estimatedHours?: number | null;
+	now?: Date;
+	timeZone?: string;
+}) {
+	const text = metadataLabel(`${input.title}\n${input.description ?? ""}`);
+	let desiredPriority: "immediate" | "high" | "low" | "normal" = "normal";
+	if (/\b(?:immediate|today|tomorrow|blocking|blocker|critical)\b/.test(text)) desiredPriority = "immediate";
+	else if (/\b(?:urgent|asap|this week|high priority)\b/.test(text)) desiredPriority = "high";
+	else if (/\b(?:low priority|nice to have|backlog|no rush|when possible)\b/.test(text)) desiredPriority = "low";
+	else if (input.dueDate) {
+		const today = calendarDate(input.now ?? new Date(), input.timeZone ?? "America/Toronto");
+		const days = Math.round((Date.parse(`${input.dueDate}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000);
+		if (days <= 2) desiredPriority = "immediate";
+		else if (days <= 7) desiredPriority = "high";
+	}
+	const inferredPriority = input.priority ?? input.priorities.find(priority => metadataLabel(priority.name).split(" ").includes(desiredPriority))
+		?? input.priorities.find(priority => priority.isDefault)
+		?? input.priorities.find(priority => metadataLabel(priority.name).split(" ").includes("normal"))
+		?? input.priorities[0];
+
+	let desiredSize: ReturnType<typeof sizeKind> = "small";
+	if (input.estimatedHours !== undefined && input.estimatedHours !== null) {
+		desiredSize = input.estimatedHours <= 2 ? "small" : input.estimatedHours <= 8 ? "medium" : input.estimatedHours <= 20 ? "large" : "xlarge";
+	} else {
+		const bulletCount = (input.description?.match(/^\s*(?:[-*]|\d+\.)\s+/gm) ?? []).length;
+		if (/\b(?:multi week|organization wide|full migration|full redesign)\b/.test(text)) desiredSize = "xlarge";
+		else if (/\b(?:cross team|multiple teams|multiple stakeholders|multiple deliverables|end to end)\b/.test(text)) desiredSize = "large";
+		else if (bulletCount >= 3 || /\b(?:coordinate|research and|design and|plan and)\b/.test(text)) desiredSize = "medium";
+	}
+	const inferredSize = input.size ?? input.sizes.find(size => sizeKind(size.value) === desiredSize)
+		?? input.sizes.find(size => sizeKind(size.value) === "small")
+		?? input.sizes[0];
+	const hoursBySize = { small: 2, medium: 6, large: 16, xlarge: 32 } as const;
+	return {
+		priority: inferredPriority,
+		size: inferredSize,
+		estimatedHours: input.estimatedHours ?? hoursBySize[sizeKind(inferredSize?.value)],
+	};
+}
+
+export function taskOwnerIds(assigneeId?: string, accountableId?: string, derivedAccountableId?: string) {
+	return [...new Set([assigneeId, accountableId ?? derivedAccountableId].filter((id): id is string => Boolean(id)))];
 }
 
 export function defaultAiDueDate(now: Date, priorityName?: string, sizeName?: string, timeZone = "America/Toronto") {
@@ -528,6 +597,10 @@ async function createAndAnnounce(args: {
 	startDate?: string;
 	dueDate?: string;
 	estimatedHours?: number;
+	inferenceDueDate?: string;
+	priorityInferred?: boolean;
+	sizeInferred?: boolean;
+	estimateInferred?: boolean;
 	sourceLinks: string[];
 	allowDuplicate?: boolean;
 }) {
@@ -545,6 +618,24 @@ async function createAndAnnounce(args: {
 	const projects = await services.openProject.projects();
 	const project = projects.find(item => item.id === projectId);
 	if (!project) throw new Error("The selected OpenProject project is inactive or inaccessible.");
+	const priorities = await services.openProject.priorities();
+	const sizes = await services.openProject.sizeOptions(projectId);
+	const explicitPriority = args.priorityId && !args.priorityInferred ? priorities.find(item => item.id === args.priorityId) : undefined;
+	if (args.priorityId && !args.priorityInferred && !explicitPriority) throw new Error("The selected priority is no longer available.");
+	const sizeId = args.sizeHref ? Number(args.sizeHref.split("/").at(-1)) : undefined;
+	const explicitSize = sizeId && !args.sizeInferred ? sizes.find(item => item.id === sizeId) : undefined;
+	if (args.sizeHref && !args.sizeInferred && !explicitSize) throw new Error("The selected size is not available for this project.");
+	const metadata = inferCreationMetadata({
+		title: args.title,
+		description: args.description,
+		dueDate: args.inferenceDueDate,
+		priorities,
+		sizes,
+		priority: explicitPriority,
+		size: explicitSize,
+		estimatedHours: args.estimateInferred ? undefined : args.estimatedHours,
+		timeZone: services.config.BOT_TIME_ZONE,
+	});
 	const accountable = await accountableFor(assignee, services);
 	const accountableOpenProjectId = accountableOverride ?? accountable?.openProjectId;
 	validateDateOrder(args.startDate, args.dueDate);
@@ -560,11 +651,11 @@ async function createAndAnnounce(args: {
 		description: args.description,
 		assigneeId: assigneeOpenProjectId,
 		accountableId: accountableOpenProjectId,
-		priorityId: args.priorityId,
-		sizeHref: args.sizeHref,
+		priorityId: metadata.priority?.id,
+		sizeHref: metadata.size ? `/api/v3/custom_options/${metadata.size.id}` : undefined,
 		startDate: validIsoDate(args.startDate),
 		dueDate: validIsoDate(args.dueDate),
-		estimatedHours: args.estimatedHours,
+		estimatedHours: metadata.estimatedHours,
 		sourceLinks: args.sourceLinks,
 		typeId: type?.id,
 		correlationId: args.correlationId ?? args.draftId,
@@ -582,7 +673,7 @@ async function createAndAnnounce(args: {
 	await services.db.logTaskEvent(workPackage.id, "created", interaction.user.id, { projectId, sourceLinks: args.sourceLinks })
 		.catch(error => console.error("Task creation audit log failed", { workPackageId: workPackage.id, error: (error as Error).message }));
 	const url = services.openProject.workPackageUrl(workPackage.id);
-	const ownerIds = [assignee?.id, accountable?.discordId].filter((id): id is string => Boolean(id));
+	const ownerIds = taskOwnerIds(assignee?.id, args.accountableId, accountable?.discordId);
 	const ping = ownerIds.map(id => `<@${id}>`).join(" ");
 	const due = args.dueDate ? ` · due ${args.dueDate}` : "";
 	const content = `${ping ? `${ping} ` : ""}OpenProject task created: **${workPackage.subject}** in **${project.name}**${due}\n${url}`;
@@ -597,7 +688,7 @@ async function createAndAnnounce(args: {
 			});
 			confirmationMessageId = confirmation.id;
 		} catch (error) {
-			await services.db.queueConfirmation(workPackage.id, interaction.channelId!, assignee?.id, (error as Error).message)
+			await services.db.queueConfirmation(workPackage.id, interaction.channelId!, ownerIds, (error as Error).message)
 				.catch(queueError => console.error("Task confirmation queue failed", { workPackageId: workPackage.id, error: (queueError as Error).message }));
 			await services.db.logTaskEvent(workPackage.id, "confirmation_failed", interaction.user.id, { error: (error as Error).message })
 				.catch(auditError => console.error("Task confirmation audit log failed", { workPackageId: workPackage.id, error: (auditError as Error).message }));
@@ -605,7 +696,7 @@ async function createAndAnnounce(args: {
 				.catch(responseError => console.error("Task confirmation response failed", { workPackageId: workPackage.id, error: (responseError as Error).message }));
 		}
 	}
-	return { workPackage, confirmationMessageId };
+	return { workPackage, confirmationMessageId, metadata, projectId };
 }
 
 async function showCreationPreview(
@@ -613,30 +704,59 @@ async function showCreationPreview(
 	services: Services,
 	draft: Omit<CreationDraft, "userId" | "channelId" | "expiresAt">,
 ) {
+	const assignee = draft.assigneeId ? await interaction.guild!.members.fetch(draft.assigneeId).catch(() => null) : null;
+	const explicitProjectId = draft.projectText && /^\d+$/.test(draft.projectText) ? Number(draft.projectText) : undefined;
+	const projectId = explicitProjectId ?? await resolveProject(draft.projectText, interaction.channelId!, interaction.guild!, assignee, services);
+	const priorities = await services.openProject.priorities();
+	const sizes = projectId ? await services.openProject.sizeOptions(projectId) : [];
+	const sizeId = draft.sizeHref ? Number(draft.sizeHref.split("/").at(-1)) : undefined;
+	const explicitPriority = draft.priorityId && !draft.priorityInferred ? priorities.find(item => item.id === draft.priorityId) : undefined;
+	if (draft.priorityId && !draft.priorityInferred && !explicitPriority) throw new Error("The selected priority is no longer available.");
+	const explicitSize = sizeId && !draft.sizeInferred ? sizes.find(item => item.id === sizeId) : undefined;
+	if (draft.sizeHref && !draft.sizeInferred && !explicitSize) throw new Error("The selected size is not available for this project.");
+	const inferredMetadata = inferCreationMetadata({
+		title: draft.title,
+		description: draft.description,
+		dueDate: draft.inferenceDueDate,
+		priorities,
+		sizes,
+		priority: explicitPriority,
+		size: explicitSize,
+		estimatedHours: draft.estimateInferred ? undefined : draft.estimatedHours,
+		timeZone: services.config.BOT_TIME_ZONE,
+	});
+	const enrichedDraft = {
+		...draft,
+		projectText: projectId ? String(projectId) : draft.projectText,
+		priorityId: inferredMetadata.priority?.id,
+		sizeHref: inferredMetadata.size ? `/api/v3/custom_options/${inferredMetadata.size.id}` : undefined,
+		estimatedHours: inferredMetadata.estimatedHours,
+		priorityInferred: draft.priorityInferred || draft.priorityId === undefined,
+		sizeInferred: draft.sizeInferred || draft.sizeHref === undefined,
+		estimateInferred: draft.estimateInferred || draft.estimatedHours === undefined,
+	};
 	const id = await services.db.createDraft(
 		"creation",
 		interaction.user.id,
 		interaction.channelId!,
-		draft,
+		enrichedDraft,
 		services.config.OPENPROJECT_DRAFT_TTL_MINUTES,
 	);
-	const projectId = draft.projectText && /^\d+$/.test(draft.projectText) ? Number(draft.projectText) : undefined;
 	const project = projectId ? (await services.openProject.projects()).find(item => item.id === projectId) : undefined;
-	const priority = draft.priorityId ? (await services.openProject.priorities()).find(item => item.id === draft.priorityId) : undefined;
-	const sizeId = draft.sizeHref ? Number(draft.sizeHref.split("/").at(-1)) : undefined;
-	const size = projectId && sizeId ? (await services.openProject.sizeOptions(projectId)).find(item => item.id === sizeId) : undefined;
-	const dates = draft.startDate || draft.dueDate ? `\nDates: ${draft.startDate ?? "—"} → ${draft.dueDate ?? "—"}` : "";
-	const metadata = [
-		draft.assigneeId ? `Assignee: <@${draft.assigneeId}>` : null,
-		draft.accountableId ? `Accountable: <@${draft.accountableId}>` : null,
+	const priority = inferredMetadata.priority;
+	const size = inferredMetadata.size;
+	const dates = enrichedDraft.startDate || enrichedDraft.dueDate ? `\nDates: ${enrichedDraft.startDate ?? "—"} → ${enrichedDraft.dueDate ?? "—"}` : "";
+	const metadataSummary = [
+		enrichedDraft.assigneeId ? `Assignee: <@${enrichedDraft.assigneeId}>` : null,
+		enrichedDraft.accountableId ? `Accountable: <@${enrichedDraft.accountableId}>` : null,
 		priority ? `Priority: ${priority.name}` : null,
 		size ? `Size: ${size.value}` : null,
-		draft.estimatedHours !== undefined ? `Estimate: ${draft.estimatedHours}h` : null,
+		enrichedDraft.estimatedHours !== undefined ? `Estimate: ${enrichedDraft.estimatedHours}h` : null,
 	]
 		.filter(Boolean).join(" · ");
-	const description = draft.description.trim() ? `\n\n${draft.description.slice(0, 1200)}` : "";
+	const description = enrichedDraft.description.trim() ? `\n\n${enrichedDraft.description.slice(0, 1200)}` : "";
 	await interaction.editReply({
-		content: `Review before creating:\n**${draft.title}**\nProject: ${project?.name ?? "resolved from category/team"}${metadata ? `\n${metadata}` : ""}${dates}${description}`,
+		content: `Review before creating:\n**${enrichedDraft.title}**\nProject: ${project?.name ?? "resolved from category/team"}${metadataSummary ? `\n${metadataSummary}` : ""}${dates}${description}`,
 		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
 			new ButtonBuilder().setCustomId(`op-create-final:${id}`).setLabel("Create").setStyle(ButtonStyle.Success),
 			new ButtonBuilder().setCustomId(`op-edit-final:${id}`).setLabel("Edit").setStyle(ButtonStyle.Primary),
@@ -751,13 +871,13 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 		await requireProjectAccess(interaction, projectIdFromWorkPackage(existingTask), services);
 		if (subcommand === "announce") {
 			const pending = await services.db.pendingConfirmation(id);
-			const assignee = interaction.options.getUser("assignee")
-				?? (pending?.assignee_discord_id ? await interaction.guild!.members.fetch(pending.assignee_discord_id).then(member => member.user).catch(() => null) : null);
-			const content = `${assignee ? `<@${assignee.id}> ` : ""}OpenProject task: **${existingTask.subject}**\n${services.openProject.workPackageUrl(id)}`;
+			const ownerIds = [...new Set([interaction.options.getUser("assignee")?.id, ...(pending?.owner_discord_ids ?? [])].filter((ownerId): ownerId is string => Boolean(ownerId)))];
+			const pings = ownerIds.map(ownerId => `<@${ownerId}>`).join(" ");
+			const content = `${pings ? `${pings} ` : ""}OpenProject task: **${existingTask.subject}**\n${services.openProject.workPackageUrl(id)}`;
 			if (!interaction.channel?.isSendable()) throw new Error("This channel cannot receive announcements.");
-			await interaction.channel.send({ content, allowedMentions: assignee ? { users: [assignee.id] } : { parse: [] } });
+			await interaction.channel.send({ content, allowedMentions: ownerIds.length ? { users: ownerIds } : { parse: [] } });
 			await services.db.clearConfirmation(id);
-			await services.db.logTaskEvent(id, "announcement_retried", interaction.user.id, { assigneeDiscordId: assignee?.id });
+			await services.db.logTaskEvent(id, "announcement_retried", interaction.user.id, { ownerDiscordIds: ownerIds });
 			await interaction.editReply(`Announcement posted for ${services.openProject.workPackageUrl(id)}.`);
 			return;
 		}
@@ -802,9 +922,8 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 		return;
 	}
 	const defaults = defaultTaskDates(new Date(), services.config.OPENPROJECT_DEFAULT_START_TODAY, services.config.OPENPROJECT_DEFAULT_DUE_DAYS, services.config.BOT_TIME_ZONE);
-	const priority = interaction.options.getString("priority")
-		? Number(interaction.options.getString("priority"))
-		: (await services.openProject.priorities()).find(item => item.isDefault)?.id;
+	const priority = interaction.options.getString("priority") ? Number(interaction.options.getString("priority")) : undefined;
+	const explicitDueDate = interaction.options.getString("due_date") ?? undefined;
 	await showCreationPreview(interaction, services, {
 		title: interaction.options.getString("title", true),
 		description: interaction.options.getString("description") ?? "",
@@ -814,7 +933,8 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 		priorityId: priority,
 		sizeHref: interaction.options.getString("size") ?? undefined,
 		startDate: interaction.options.getString("start_date") ?? defaults.startDate,
-		dueDate: interaction.options.getString("due_date") ?? defaults.dueDate,
+		dueDate: explicitDueDate ?? defaults.dueDate,
+		inferenceDueDate: explicitDueDate,
 		estimatedHours: interaction.options.getNumber("estimated_hours") ?? undefined,
 		sourceLinks: await validatedSourceLink(interaction.options.getString("source_message"), interaction),
 		allowDuplicate: interaction.options.getBoolean("allow_duplicate") ?? false,
@@ -866,6 +986,8 @@ async function handleContextContinue(interaction: ButtonInteraction, services: S
 	const draft = await contextDraft(id, interaction.user.id, services);
 	if (!draft.projectId) throw new Error("Choose a project before continuing.");
 	const defaults = defaultTaskDates(new Date(), services.config.OPENPROJECT_DEFAULT_START_TODAY, services.config.OPENPROJECT_DEFAULT_DUE_DAYS, services.config.BOT_TIME_ZONE);
+	draft.defaultDueDate = defaults.dueDate;
+	await services.db.updateDraft(id, interaction.user.id, "context", draft);
 	const modal = new ModalBuilder().setCustomId(`op-task2:${id}`).setTitle("Create OpenProject task");
 	const fields = [
 		new TextInputBuilder().setCustomId("title").setLabel("Title").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(255).setValue(draft.title),
@@ -1335,13 +1457,14 @@ async function completeAiCandidate(
 	const initialProjectId = await resolveProject(null, interaction.channelId, interaction.guild!, assigneeMember, services);
 	let projectId = initialProjectId;
 	const project = projectId ? (await services.openProject.projects()).find(item => item.id === projectId) : undefined;
-	const priority = candidate.priority_name
+	let priority = candidate.priority_name
 		? priorities.find(item => item.name.toLocaleLowerCase() === candidate.priority_name!.toLocaleLowerCase())
 		: undefined;
 	const sizes = projectId ? await services.openProject.sizeOptions(projectId) : [];
 	let size = candidate.size_name
 		? sizes.find(item => item.value.toLocaleLowerCase() === candidate.size_name!.toLocaleLowerCase())
 		: undefined;
+	let estimatedHours = candidate.estimated_hours ?? undefined;
 	const inferredDate = (value: string | null) => {
 		try { return validIsoDate(value); } catch { return undefined; }
 	};
@@ -1376,6 +1499,24 @@ async function completeAiCandidate(
 		dueDate = inferredDate(candidate.due_date) ?? defaultAiDueDate(new Date(), priority?.name, size?.value, services.config.BOT_TIME_ZONE);
 	}
 	const { action, match, target } = targetResolution;
+	const metadataInference = { priority: priority === undefined, size: size === undefined, estimate: estimatedHours === undefined };
+	if (action === "create") {
+		const inferredMetadata = inferCreationMetadata({
+			title: candidate.title,
+			description: candidate.description,
+			dueDate: inferredDate(candidate.due_date),
+			priorities,
+			sizes,
+			priority,
+			size,
+			estimatedHours,
+			timeZone: services.config.BOT_TIME_ZONE,
+		});
+		priority = inferredMetadata.priority;
+		size = inferredMetadata.size;
+		estimatedHours = inferredMetadata.estimatedHours;
+		dueDate = inferredDate(candidate.due_date) ?? defaultAiDueDate(new Date(), priority?.name, size?.value, services.config.BOT_TIME_ZONE);
+	}
 	if (action === "no_action") {
 		await services.db.recordExtraction({
 			source: "manual", outcome: "no_task", modelDeployment: deployment, triggerId: context.primaryId,
@@ -1396,7 +1537,7 @@ async function completeAiCandidate(
 			values: {
 				title: candidate.title, assigneeDiscordId: assigneeId, priorityId: priority?.id,
 				sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined,
-				startDate, dueDate: inferredDate(candidate.due_date), estimatedHours: candidate.estimated_hours ?? undefined,
+				startDate, dueDate: inferredDate(candidate.due_date), estimatedHours,
 			},
 		});
 		if (operations.contentOperation === "none" && Object.keys(operations.metadataPatch).length === 0) {
@@ -1407,7 +1548,7 @@ async function completeAiCandidate(
 			requesterId: interaction.user.id, channelId: interaction.channelId, projectId,
 			title: candidate.title, description, assigneeDiscordId: assigneeId, accountableDiscordId: accountableId,
 			priorityId: priority?.id, sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate, dueDate,
-			estimatedHours: candidate.estimated_hours ?? undefined, sourceMessageIds: candidate.source_message_ids,
+			estimatedHours, metadataInference, sourceMessageIds: candidate.source_message_ids,
 			sourceLinks,
 			modelDeployment: deployment, evidence: candidate.evidence,
 			ambiguities: [...result.ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: extraction.latencyMs,
@@ -1419,7 +1560,7 @@ async function completeAiCandidate(
 			initialSnapshot: proposalSnapshot({
 				title: candidate.title, description, projectId, assigneeId, accountableId, priorityId: priority?.id,
 				sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate, dueDate,
-				estimatedHours: candidate.estimated_hours, action, targetWorkPackageId: match.workPackageId,
+				estimatedHours: estimatedHours ?? null, action, targetWorkPackageId: match.workPackageId,
 				sourceMessageIds: candidate.source_message_ids, sourceLinks,
 			}),
 		});
@@ -1474,7 +1615,8 @@ async function completeAiCandidate(
 		title: candidate.title, description,
 		assigneeDiscordId: assigneeId, accountableDiscordId: accountableId, priorityId: priority?.id,
 		sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined,
-		startDate, dueDate, estimatedHours: candidate.estimated_hours ?? undefined,
+		startDate, dueDate, estimatedHours,
+		metadataInference,
 		sourceMessageIds: candidate.source_message_ids,
 		modelDeployment: deployment,
 		evidence: candidate.evidence, ambiguities: [...result.ambiguities, ...(advisory ? [advisory] : [])],
@@ -1485,7 +1627,7 @@ async function completeAiCandidate(
 			initialSnapshot: proposalSnapshot({
 				title: candidate.title, description, projectId, assigneeId, accountableId, priorityId: priority?.id,
 				sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate, dueDate,
-				estimatedHours: candidate.estimated_hours, action: "create", sourceMessageIds: candidate.source_message_ids, sourceLinks,
+				estimatedHours: estimatedHours ?? null, action: "create", sourceMessageIds: candidate.source_message_ids, sourceLinks,
 			}),
 	});
 	let redisplayed: Awaited<ReturnType<Database["proposal"]>>;
@@ -1521,7 +1663,7 @@ async function completeAiCandidate(
 		`Priority: ${priority?.name ?? "Not inferred"}`,
 		`Size: ${size?.value ?? "Not inferred"}`,
 		`Dates: ${startDate ?? "Not set"} → ${dueDate}`,
-		`Estimate: ${candidate.estimated_hours !== null ? `${candidate.estimated_hours}h` : "Not inferred"}`,
+		`Estimate: ${estimatedHours !== undefined ? `${estimatedHours}h` : "Not inferred"}`,
 	].join("\n");
 	const displayedAction = redisplayed?.action ?? "create";
 	const displayedTarget = displayedAction !== "create" && redisplayed?.target_work_package_id
@@ -1711,6 +1853,7 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 			description: interaction.fields.getTextInputValue("description"),
 			startDate,
 			dueDate,
+			inferenceDueDate: dueDate !== current.dueDate ? dueDate : current.inferenceDueDate,
 		});
 		return;
 	}
@@ -1740,7 +1883,11 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 			sizeHref: proposal.size_href ?? undefined,
 			startDate: databaseDate(proposal.start_date) ?? undefined,
 			dueDate: reviewedDueDate,
+			inferenceDueDate: reviewedDueDate,
 			estimatedHours: proposal.estimated_hours == null ? undefined : Number(proposal.estimated_hours),
+			priorityInferred: proposal.metadata_inference.priority,
+			sizeInferred: proposal.metadata_inference.size,
+			estimateInferred: proposal.metadata_inference.estimate,
 			sourceLinks: proposal.source_links,
 		};
 		if (!await services.db.claimProposal(proposal.id, interaction.user.id)) throw new Error("This proposal is already being handled.");
@@ -1851,16 +1998,17 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 						reviewed: {
 							title: args.title, description: args.description,
 							projectName: args.projectText ?? undefined, assigneeId: args.assigneeId,
-							accountableId: args.accountableId, priorityId: args.priorityId,
-							sizeHref: args.sizeHref, startDate: args.startDate,
-							dueDate: args.dueDate, estimatedHours: args.estimatedHours,
+							accountableId: args.accountableId, priorityId: created.metadata.priority?.id,
+							sizeHref: created.metadata.size ? `/api/v3/custom_options/${created.metadata.size.id}` : undefined, startDate: args.startDate,
+							dueDate: args.dueDate, estimatedHours: created.metadata.estimatedHours,
 						},
 					}),
 				);
 				await services.db.recordFinalProposalRevision(proposal.id, proposalSnapshot({
-					title: args.title, description: args.description, projectId: proposal.project_id, assigneeId: args.assigneeId,
-					accountableId: args.accountableId, priorityId: args.priorityId, sizeHref: args.sizeHref,
-					startDate: args.startDate, dueDate: args.dueDate, estimatedHours: args.estimatedHours,
+					title: args.title, description: args.description, projectId: created.projectId, assigneeId: args.assigneeId,
+					accountableId: args.accountableId, priorityId: created.metadata.priority?.id,
+					sizeHref: created.metadata.size ? `/api/v3/custom_options/${created.metadata.size.id}` : undefined,
+					startDate: args.startDate, dueDate: args.dueDate, estimatedHours: created.metadata.estimatedHours,
 					action: "create", targetWorkPackageId: created.workPackage.id, sourceLinks: args.sourceLinks,
 				}));
 			} catch (error) {
@@ -1886,6 +2034,7 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 		assigneeId: draft.assigneeId,
 		startDate,
 		dueDate,
+		inferenceDueDate: dueDate !== draft.defaultDueDate ? dueDate : undefined,
 		sourceLinks: [messageUrl(interaction.guildId!, interaction.channelId!, draft.targetId)],
 	});
 	await services.db.failDraft(entityId, "context-complete");

@@ -3,7 +3,7 @@ import { containsSensitiveContent, minimizeText, StructuredOutputError, type Min
 import { isOrganizerGuild, type IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient } from "./openproject.js";
-import { boundedDiscordContent, defaultAiDueDate, formatAiTaskDescription } from "./tasks.js";
+import { boundedDiscordContent, defaultAiDueDate, formatAiTaskDescription, inferCreationMetadata } from "./tasks.js";
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
 import { describeProposalOperations, planExistingTaskOperations, taskReferencesAreValid } from "./task-proposals.js";
 
@@ -111,7 +111,8 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				let projectId = channelProjectId;
 				const assigneeId = task.assignee_alias ? reverse.get(task.assignee_alias) : undefined;
 				const accountableId = source.find(message => task.source_message_ids.includes(message.id))?.author.id;
-				const priority = task.priority_name ? priorities.find(item => item.name.toLocaleLowerCase() === task.priority_name!.toLocaleLowerCase()) : undefined;
+				let priority = task.priority_name ? priorities.find(item => item.name.toLocaleLowerCase() === task.priority_name!.toLocaleLowerCase()) : undefined;
+				let estimatedHours = task.estimated_hours ?? undefined;
 				const sourceLinks = task.source_message_ids.map(id => `https://discord.com/channels/${source[0]?.guildId ?? ""}/${source.find(item => item.id === id)?.channelId ?? channelId}/${id}`);
 				const description = formatAiTaskDescription(task.description, minimized, sourceRecords, task.source_message_ids, task.relevant_attachment_ids);
 				const similar = projectId && services.rag ? await services.rag.findSimilar(projectId, task.title, description) : [];
@@ -134,7 +135,24 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				if (action === "no_action") continue;
 				if (action !== "create" && !match) continue;
 				const candidateSizes = projectId === channelProjectId ? sizes : projectId ? await services.openProject.sizeOptions(projectId) : [];
-				const size = task.size_name ? candidateSizes.find(item => item.value.toLocaleLowerCase() === task.size_name!.toLocaleLowerCase()) : undefined;
+				let size = task.size_name ? candidateSizes.find(item => item.value.toLocaleLowerCase() === task.size_name!.toLocaleLowerCase()) : undefined;
+				const metadataInference = { priority: priority === undefined, size: size === undefined, estimate: estimatedHours === undefined };
+				if (action === "create") {
+					const inferredMetadata = inferCreationMetadata({
+						title: task.title,
+						description: task.description,
+						dueDate: task.due_date,
+						priorities,
+						sizes: candidateSizes,
+						priority,
+						size,
+						estimatedHours,
+						timeZone: services.config.BOT_TIME_ZONE,
+					});
+					priority = inferredMetadata.priority;
+					size = inferredMetadata.size;
+					estimatedHours = inferredMetadata.estimatedHours;
+				}
 				const dueDate = task.due_date ?? defaultAiDueDate(new Date(), priority?.name, size?.value, services.config.BOT_TIME_ZONE);
 				if (match && action !== "create") {
 					const operations = planExistingTaskOperations({
@@ -147,7 +165,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 							title: task.title, assigneeDiscordId: assigneeId, priorityId: priority?.id,
 							sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined,
 							startDate: task.start_date ?? undefined, dueDate: task.due_date ?? undefined,
-							estimatedHours: task.estimated_hours ?? undefined,
+							estimatedHours,
 						},
 					});
 					if (operations.contentOperation === "none" && Object.keys(operations.metadataPatch).length === 0) continue;
@@ -158,7 +176,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					const proposal = await services.db.createProposal({
 						channelId, projectId, title: task.title, description, assigneeDiscordId: assigneeId, accountableDiscordId: accountableId,
 						priorityId: priority?.id, sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined,
-						startDate: task.start_date ?? undefined, dueDate, estimatedHours: task.estimated_hours ?? undefined,
+						startDate: task.start_date ?? undefined, dueDate, estimatedHours, metadataInference,
 						sourceMessageIds: task.source_message_ids, sourceLinks,
 						modelDeployment: deployment, permittedReviewerIds: [...reviewers], evidence: task.evidence,
 						ambiguities: [...result.ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
@@ -168,7 +186,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						initialSnapshot: {
 							title: task.title, description, projectId, assigneeId, accountableId, priorityId: priority?.id,
 							sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate: task.start_date,
-							dueDate, estimatedHours: task.estimated_hours, action, targetWorkPackageId: match.workPackageId,
+							dueDate, estimatedHours: estimatedHours ?? null, action, targetWorkPackageId: match.workPackageId,
 							sourceMessageIds: task.source_message_ids, sourceLinks,
 						},
 						retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS,
@@ -205,7 +223,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					channelId, projectId, title: task.title,
 						description, assigneeDiscordId: assigneeId, accountableDiscordId: accountableId,
 						priorityId: priority?.id, sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined,
-						startDate: task.start_date ?? undefined, dueDate, estimatedHours: task.estimated_hours ?? undefined,
+						startDate: task.start_date ?? undefined, dueDate, estimatedHours, metadataInference,
 						sourceMessageIds: task.source_message_ids, sourceLinks,
 					modelDeployment: deployment,
 					permittedReviewerIds: [...reviewers],
@@ -215,7 +233,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						initialSnapshot: {
 							title: task.title, description, projectId, assigneeId, accountableId, priorityId: priority?.id,
 							sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate: task.start_date,
-							dueDate, estimatedHours: task.estimated_hours, action: "create",
+							dueDate, estimatedHours: estimatedHours ?? null, action: "create",
 							sourceMessageIds: task.source_message_ids, sourceLinks,
 						},
 						retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS,

@@ -88,6 +88,7 @@ export class Database {
 				start_date DATE,
 				due_date DATE,
 				estimated_hours NUMERIC,
+				metadata_inference JSONB NOT NULL DEFAULT '{}',
 				source_message_ids TEXT[] NOT NULL DEFAULT '{}',
 				source_links TEXT[] NOT NULL DEFAULT '{}',
 				source_fingerprint TEXT UNIQUE,
@@ -183,6 +184,7 @@ export class Database {
 				work_package_id INTEGER PRIMARY KEY,
 				channel_id TEXT NOT NULL,
 				assignee_discord_id TEXT,
+				owner_discord_ids TEXT[] NOT NULL DEFAULT '{}',
 				attempts INTEGER NOT NULL DEFAULT 0,
 				last_error TEXT,
 				created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -210,6 +212,9 @@ export class Database {
 		`);
 		await this.pool.query("DROP TABLE IF EXISTS discord_channel_projects");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS permitted_reviewer_ids TEXT[] NOT NULL DEFAULT '{}'");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS metadata_inference JSONB NOT NULL DEFAULT '{}'");
+		await this.pool.query("ALTER TABLE task_confirmation_queue ADD COLUMN IF NOT EXISTS owner_discord_ids TEXT[] NOT NULL DEFAULT '{}'");
+		await this.pool.query("UPDATE task_confirmation_queue SET owner_discord_ids=ARRAY[assignee_discord_id] WHERE cardinality(owner_discord_ids)=0 AND assignee_discord_id IS NOT NULL");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS source_links TEXT[] NOT NULL DEFAULT '{}'");
 		await this.pool.query("ALTER TABLE task_audit_log ADD COLUMN IF NOT EXISTS openproject_work_package_id INTEGER");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS evidence TEXT");
@@ -510,6 +515,7 @@ export class Database {
 		startDate?: string;
 		dueDate?: string;
 		estimatedHours?: number;
+		metadataInference?: { priority?: boolean; size?: boolean; estimate?: boolean };
 		sourceMessageIds: string[];
 		sourceLinks?: string[];
 		classification?: string;
@@ -539,20 +545,20 @@ export class Database {
 		const result = await this.pool.query<{ id: string }>(
 			`INSERT INTO task_proposals
 			(id, requester_discord_id, channel_id, project_id, title, description,
-			 assignee_discord_id, accountable_discord_id, priority_id, size_href, start_date, due_date, estimated_hours,
+			 assignee_discord_id, accountable_discord_id, priority_id, size_href, start_date, due_date, estimated_hours, metadata_inference,
 			 source_message_ids, source_fingerprint, source_links,
 			 classification, status, model_deployment, permitted_reviewer_ids, action, target_work_package_id, target_lock_version,
 			 evidence, ambiguities, latency_ms, token_usage, escalation_reason,
 			 operation_schema_version, metadata_patch, content_operation, content_markdown, expires_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'pending_review',$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,
-			 $28,$29,$30,$31,now() + ($32::text || ' days')::interval)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'pending_review',$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,
+			 $29,$30,$31,$32,now() + ($33::text || ' days')::interval)
 			ON CONFLICT(source_fingerprint) DO UPDATE SET
 			 requester_discord_id=excluded.requester_discord_id, channel_id=excluded.channel_id,
 			 project_id=excluded.project_id, title=excluded.title, description=excluded.description,
 			 assignee_discord_id=excluded.assignee_discord_id, accountable_discord_id=excluded.accountable_discord_id,
 			 priority_id=excluded.priority_id,
 			 size_href=excluded.size_href, start_date=excluded.start_date, due_date=excluded.due_date,
-			 estimated_hours=excluded.estimated_hours,
+			 estimated_hours=excluded.estimated_hours, metadata_inference=excluded.metadata_inference,
 				 source_message_ids=excluded.source_message_ids, source_links=excluded.source_links, classification=excluded.classification,
 				action=excluded.action, target_work_package_id=excluded.target_work_package_id, target_lock_version=excluded.target_lock_version,
 			 status='pending_review', model_deployment=excluded.model_deployment,
@@ -569,7 +575,7 @@ export class Database {
 			[id, input.requesterId, input.channelId, input.projectId ?? null, input.title,
 			 input.description, input.assigneeDiscordId ?? null, input.accountableDiscordId ?? null,
 			 input.priorityId ?? null, input.sizeHref ?? null,
-			 input.startDate ?? null, input.dueDate ?? null, input.estimatedHours ?? null,
+			 input.startDate ?? null, input.dueDate ?? null, input.estimatedHours ?? null, jsonParameter(input.metadataInference ?? {}),
 			 input.sourceMessageIds, fingerprint, input.sourceLinks ?? [], input.classification ?? null, input.modelDeployment,
 			 input.permittedReviewerIds ?? (input.requesterId ? [input.requesterId] : []), input.action ?? "create", input.targetWorkPackageId ?? null, input.targetLockVersion ?? null,
 			 input.evidence ?? null, input.ambiguities ?? [], input.latencyMs ?? null,
@@ -615,6 +621,7 @@ export class Database {
 			assignee_discord_id: string | null; accountable_discord_id: string | null;
 			priority_id: number | null; size_href: string | null;
 			start_date: string | null; due_date: string | null; estimated_hours: number | null;
+			 metadata_inference: { priority?: boolean; size?: boolean; estimate?: boolean };
 			 source_message_ids: string[]; source_links: string[]; status: string; permitted_reviewer_ids: string[];
 			 expires_at: string; openproject_work_package_id: number | null;
 			 action: "create" | "update" | "complete" | "reopen"; target_work_package_id: number | null; target_lock_version: number | null;
@@ -624,7 +631,7 @@ export class Database {
 			 claim_expires_at: string | null;
 		}>("SELECT * FROM task_proposals WHERE id=$1", [id]);
 		const row = result.rows[0];
-		return row ? { ...row, metadata_patch: proposalMetadataPatchSchema.parse(row.metadata_patch ?? {}) } : undefined;
+		return row ? { ...row, metadata_patch: proposalMetadataPatchSchema.parse(row.metadata_patch ?? {}), metadata_inference: row.metadata_inference ?? {} } : undefined;
 	}
 
 	async setProposalStatus(id: string, status: string, reviewerId: string) {
@@ -1026,20 +1033,20 @@ export class Database {
 		);
 	}
 
-	async queueConfirmation(workPackageId: number, channelId: string, assigneeDiscordId: string | undefined, error: string) {
+	async queueConfirmation(workPackageId: number, channelId: string, ownerDiscordIds: string[], error: string) {
 		await this.pool.query(
-			`INSERT INTO task_confirmation_queue(work_package_id,channel_id,assignee_discord_id,attempts,last_error)
+			`INSERT INTO task_confirmation_queue(work_package_id,channel_id,owner_discord_ids,attempts,last_error)
 			 VALUES($1,$2,$3,1,$4)
 			 ON CONFLICT(work_package_id) DO UPDATE SET channel_id=excluded.channel_id,
-			 assignee_discord_id=excluded.assignee_discord_id, attempts=task_confirmation_queue.attempts + 1,
+			 owner_discord_ids=excluded.owner_discord_ids, attempts=task_confirmation_queue.attempts + 1,
 			 last_error=excluded.last_error, updated_at=now()`,
-			[workPackageId, channelId, assigneeDiscordId ?? null, error.slice(0, 1000)],
+			[workPackageId, channelId, ownerDiscordIds, error.slice(0, 1000)],
 		);
 	}
 
 	async pendingConfirmation(workPackageId: number) {
-		const result = await this.pool.query<{ assignee_discord_id: string | null }>(
-			"SELECT assignee_discord_id FROM task_confirmation_queue WHERE work_package_id=$1",
+		const result = await this.pool.query<{ owner_discord_ids: string[] }>(
+			"SELECT owner_discord_ids FROM task_confirmation_queue WHERE work_package_id=$1",
 			[workPackageId],
 		);
 		return result.rows[0];

@@ -8,6 +8,25 @@ function databaseWithPool(pool) {
 	return db;
 }
 
+test("failed task confirmations retain every owner for retry", async () => {
+	let queuedOwners;
+	const db = databaseWithPool({
+		async query(sql, params) {
+			if (sql.includes("INSERT INTO task_confirmation_queue")) {
+				queuedOwners = params[2];
+				return { rowCount: 1, rows: [] };
+			}
+			if (sql.includes("SELECT owner_discord_ids")) {
+				return { rowCount: 1, rows: [{ owner_discord_ids: queuedOwners }] };
+			}
+			throw new Error(`Unexpected query: ${sql}`);
+		},
+	});
+
+	await db.queueConfirmation(42, "channel", ["assignee", "accountable"], "Discord unavailable");
+	assert.deepEqual(await db.pendingConfirmation(42), { owner_discord_ids: ["assignee", "accountable"] });
+});
+
 test("only one concurrent interaction can claim a creation draft", async () => {
 	let status = "pending";
 	const db = databaseWithPool({
@@ -97,10 +116,13 @@ test("AI proposal metadata is persisted for reviewed task creation", async () =>
 		channelId: "channel", projectId: 3, title: "Prepare outreach", description: "Create the tracker",
 		assigneeDiscordId: "user", accountableDiscordId: "accountable", priorityId: 4, sizeHref: "/api/v3/custom_options/5",
 		startDate: "2026-07-14", dueDate: "2026-07-21", estimatedHours: 6,
+		metadataInference: { priority: false, size: true, estimate: true },
 		sourceMessageIds: ["message"], classification: "direct_assignment", modelDeployment: "model",
 	});
 	assert.match(inserted.sql, /priority_id, size_href, start_date, due_date, estimated_hours/);
+	assert.match(inserted.sql, /\$18,'pending_review',\$19/);
 	assert.deepEqual(inserted.values.slice(7, 13), ["accountable", 4, "/api/v3/custom_options/5", "2026-07-14", "2026-07-21", 6]);
+	assert.equal(inserted.values[13], '{"priority":false,"size":true,"estimate":true}');
 });
 
 test("existing-task proposals persist explicit operations and independent checkpoints", async () => {
@@ -118,7 +140,7 @@ test("existing-task proposals persist explicit operations and independent checkp
 		metadataPatch: { dueDate: "2026-07-31" }, contentOperation: "postComment", contentMarkdown: "- Change wording",
 	});
 	assert.match(queries[0].sql, /operation_schema_version, metadata_patch, content_operation, content_markdown/);
-	assert.deepEqual(queries[0].values.slice(27, 31), [1, '{"dueDate":"2026-07-31"}', "postComment", "- Change wording"]);
+	assert.deepEqual(queries[0].values.slice(28, 32), [1, '{"dueDate":"2026-07-31"}', "postComment", "- Change wording"]);
 	await db.markProposalPatchApplied("proposal", 2);
 	await db.markProposalCommentApplied("proposal", 99);
 	assert.match(queries[1].sql, /patch_applied_at/);

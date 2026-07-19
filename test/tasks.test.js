@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, isExcludedChannel, manualProposalButtons, precedingUntilGap, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, taskCommand, validIsoDate } from "../dist/tasks.js";
+import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, taskCommand, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
 import { normalizeTaskTitle, OpenProjectClient, titlesLikelyDuplicate } from "../dist/openproject.js";
 
 test("task defaults start today and use the configured due offset", () => {
@@ -46,6 +46,59 @@ test("AI deadlines scale with priority and size", () => {
 	assert.equal(defaultAiDueDate(now, "High", "🦑 Large"), "2026-08-04");
 	assert.equal(defaultAiDueDate(now, "Immediate", "🐇 Small"), "2026-07-17");
 	assert.equal(defaultAiDueDate(now, "Low", "🐋 X-Large"), "2026-09-01");
+});
+
+const planningOptions = {
+	priorities: [
+		{ id: 1, name: "Immediate", isDefault: false },
+		{ id: 2, name: "High", isDefault: false },
+		{ id: 3, name: "Normal", isDefault: true },
+		{ id: 4, name: "Low", isDefault: false },
+	],
+	sizes: [
+		{ id: 10, value: "🐇 Small" },
+		{ id: 11, value: "🐬 Medium" },
+		{ id: 12, value: "🦑 Large" },
+		{ id: 13, value: "🐋 X-Large" },
+	],
+};
+
+test("creation metadata uses Normal, Small, and two hours when evidence is sparse", () => {
+	const inferred = inferCreationMetadata({ title: "Contact the venue", priorities: planningOptions.priorities, sizes: planningOptions.sizes });
+	assert.deepEqual({ priority: inferred.priority?.name, size: inferred.size?.value, hours: inferred.estimatedHours }, {
+		priority: "Normal", size: "🐇 Small", hours: 2,
+	});
+});
+
+test("creation metadata escalates urgency and scope without overriding explicit values", () => {
+	const urgent = inferCreationMetadata({
+		title: "Urgent sponsor response", description: "Coordinate details across multiple teams",
+		priorities: planningOptions.priorities, sizes: planningOptions.sizes,
+	});
+	assert.equal(urgent.priority?.name, "High");
+	assert.equal(urgent.size?.value, "🦑 Large");
+	assert.equal(urgent.estimatedHours, 16);
+	const explicit = inferCreationMetadata({
+		title: "Critical follow-up", priorities: planningOptions.priorities, sizes: planningOptions.sizes,
+		priority: planningOptions.priorities[3], size: planningOptions.sizes[1], estimatedHours: 4,
+	});
+	assert.equal(explicit.priority?.name, "Low");
+	assert.equal(explicit.size?.value, "🐬 Medium");
+	assert.equal(explicit.estimatedHours, 4);
+});
+
+test("creation metadata uses explicit deadline horizons", () => {
+	const inferred = inferCreationMetadata({
+		title: "Submit permit", dueDate: "2026-07-20", now: new Date("2026-07-14T12:00:00Z"),
+		priorities: planningOptions.priorities, sizes: planningOptions.sizes,
+	});
+	assert.equal(inferred.priority?.name, "High");
+});
+
+test("task creation pings explicit owners once", () => {
+	assert.deepEqual(taskOwnerIds("assignee", "accountable", "derived"), ["assignee", "accountable"]);
+	assert.deepEqual(taskOwnerIds("same", "same", "derived"), ["same"]);
+	assert.deepEqual(taskOwnerIds(undefined, undefined, "derived"), ["derived"]);
 });
 
 test("assignment labels identify responsible people", () => {

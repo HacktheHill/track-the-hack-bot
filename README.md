@@ -132,8 +132,12 @@ Existing mappings are never overwritten; ambiguous matches require
 
 For new-task AI proposals, the selected message's author is Accountable and an
 explicit Discord mention or uniquely resolved Organizer nickname is the
-Assignee. When no deadline is stated for a new task, the bot derives one from
-the validated priority and size:
+Assignee. All new task paths preserve explicit planning metadata and otherwise
+infer priority from urgency or a stated deadline, infer size from scope or a
+provided estimate, and derive estimates from size. Sparse work defaults to
+OpenProject's Normal/default priority, Small, and 2 hours; Medium, Large, and
+X-Large default to 6, 16, and 32 hours. When no deadline is stated for a new
+task, the bot derives one from the validated priority and size:
 Normal starts at 14 days, with shorter windows for High/Immediate work and
 additional time for Medium, Large, and X-Large work.
 
