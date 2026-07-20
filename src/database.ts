@@ -16,6 +16,16 @@ export const correctionFields = [
 ] as const;
 export type CorrectionField = typeof correctionFields[number];
 export type CorrectionFlags = Record<CorrectionField, boolean>;
+export const proposalDismissalReasons = [
+	"not_actionable",
+	"question_or_announcement",
+	"already_completed",
+	"incorrect_proposal",
+	"not_worth_tracking",
+	"sensitive_or_private",
+	"other",
+] as const;
+export type ProposalDismissalReason = typeof proposalDismissalReasons[number];
 
 export type ProposalMetrics = {
 	days: number;
@@ -92,6 +102,8 @@ export class Database {
 				metadata_inference JSONB NOT NULL DEFAULT '{}',
 				source_message_ids TEXT[] NOT NULL DEFAULT '{}',
 				source_links TEXT[] NOT NULL DEFAULT '{}',
+				work_item_key TEXT,
+				source_content_hash TEXT,
 				source_fingerprint TEXT UNIQUE,
 				classification TEXT,
 				status TEXT NOT NULL DEFAULT 'draft',
@@ -106,11 +118,13 @@ export class Database {
 				token_usage JSONB,
 				escalation_reason TEXT,
 				confirmation_message_id TEXT,
+				review_message_id TEXT,
 				error TEXT,
 				review_started_at TIMESTAMPTZ,
 				reviewed_at TIMESTAMPTZ,
 				review_duration_ms INTEGER,
 				review_outcome TEXT,
+				dismissal_reason TEXT,
 				correction_flags JSONB NOT NULL DEFAULT '{}',
 				review_failure_count INTEGER NOT NULL DEFAULT 0,
 				operation_schema_version INTEGER,
@@ -167,11 +181,18 @@ export class Database {
 				input_snapshot JSONB,
 				message_assessments JSONB,
 				decision JSONB,
-				schema_version TEXT NOT NULL DEFAULT 'v2',
+				schema_version TEXT NOT NULL DEFAULT 'v3',
 				created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 			);
 			CREATE INDEX IF NOT EXISTS ai_extraction_events_created_idx ON ai_extraction_events(created_at)
 		;
+			CREATE TABLE IF NOT EXISTS task_proposal_extractions (
+				proposal_id UUID NOT NULL REFERENCES task_proposals(id) ON DELETE CASCADE,
+				extraction_event_id BIGINT NOT NULL REFERENCES ai_extraction_events(id) ON DELETE CASCADE,
+				created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+				PRIMARY KEY(proposal_id, extraction_event_id)
+			);
+			CREATE INDEX IF NOT EXISTS task_proposal_extractions_event_idx ON task_proposal_extractions(extraction_event_id);
 			CREATE TABLE IF NOT EXISTS task_proposal_revisions (
 				id BIGSERIAL PRIMARY KEY,
 				proposal_id UUID NOT NULL REFERENCES task_proposals(id) ON DELETE CASCADE,
@@ -217,6 +238,10 @@ export class Database {
 		await this.pool.query("ALTER TABLE task_confirmation_queue ADD COLUMN IF NOT EXISTS owner_discord_ids TEXT[] NOT NULL DEFAULT '{}'");
 		await this.pool.query("UPDATE task_confirmation_queue SET owner_discord_ids=ARRAY[assignee_discord_id] WHERE cardinality(owner_discord_ids)=0 AND assignee_discord_id IS NOT NULL");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS source_links TEXT[] NOT NULL DEFAULT '{}'");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS work_item_key TEXT");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS source_content_hash TEXT");
+		await this.pool.query("CREATE INDEX IF NOT EXISTS task_proposals_source_messages_idx ON task_proposals USING GIN(source_message_ids)");
+		await this.pool.query("CREATE INDEX IF NOT EXISTS task_proposals_work_item_idx ON task_proposals(channel_id,work_item_key)");
 		await this.pool.query("ALTER TABLE task_audit_log ADD COLUMN IF NOT EXISTS openproject_work_package_id INTEGER");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS evidence TEXT");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS ambiguities TEXT[] NOT NULL DEFAULT '{}'");
@@ -224,6 +249,7 @@ export class Database {
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS token_usage JSONB");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS escalation_reason TEXT");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS confirmation_message_id TEXT");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS review_message_id TEXT");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS error TEXT");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '30 days')");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS priority_id INTEGER");
@@ -234,6 +260,7 @@ export class Database {
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS review_duration_ms INTEGER");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS review_outcome TEXT");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS dismissal_reason TEXT");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS correction_flags JSONB NOT NULL DEFAULT '{}'");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS review_failure_count INTEGER NOT NULL DEFAULT 0");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS action TEXT NOT NULL DEFAULT 'create'");
@@ -258,6 +285,14 @@ export class Database {
 		await this.pool.query("ALTER TABLE ai_extraction_events ADD COLUMN IF NOT EXISTS message_assessments JSONB");
 		await this.pool.query("ALTER TABLE ai_extraction_events ADD COLUMN IF NOT EXISTS decision JSONB");
 		await this.pool.query("ALTER TABLE ai_extraction_events ADD COLUMN IF NOT EXISTS schema_version TEXT NOT NULL DEFAULT 'v2'");
+		await this.pool.query("ALTER TABLE ai_extraction_events ALTER COLUMN schema_version SET DEFAULT 'v3'");
+		await this.pool.query(`CREATE TABLE IF NOT EXISTS task_proposal_extractions (
+			proposal_id UUID NOT NULL REFERENCES task_proposals(id) ON DELETE CASCADE,
+			extraction_event_id BIGINT NOT NULL REFERENCES ai_extraction_events(id) ON DELETE CASCADE,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			PRIMARY KEY(proposal_id, extraction_event_id)
+		)`);
+		await this.pool.query("CREATE INDEX IF NOT EXISTS task_proposal_extractions_event_idx ON task_proposal_extractions(extraction_event_id)");
 		if (config.OPENPROJECT_RAG_MODE !== "off") {
 			if (!config.AZURE_OPENAI_EMBEDDING_DIMENSIONS) throw new Error("AZURE_OPENAI_EMBEDDING_DIMENSIONS is required when OPENPROJECT_RAG_MODE is enabled.");
 			await this.pool.query("CREATE EXTENSION IF NOT EXISTS vector");
@@ -519,6 +554,8 @@ export class Database {
 		metadataInference?: { priority?: boolean; size?: boolean; estimate?: boolean };
 		sourceMessageIds: string[];
 		sourceLinks?: string[];
+		workItemKey?: string;
+		sourceContentHash?: string;
 		classification?: string;
 		modelDeployment: string;
 		permittedReviewerIds?: string[];
@@ -550,27 +587,67 @@ export class Database {
 			input.targetWorkPackageId ?? "new",
 			input.assigneeDiscordId ?? "unassigned",
 			normalizedTitle,
+			input.sourceContentHash ?? "no-content-hash",
 		].join(":");
-		const dedupeLock = [input.channelId, sortedSourceIds.join(","), input.action ?? "create", input.projectId ?? "no-project", input.targetWorkPackageId ?? "new", input.assigneeDiscordId ?? "unassigned"].join(":");
+		const dedupeLocks = new Set([
+			...(input.workItemKey ? [`${input.channelId}:work-item:${input.workItemKey.trim().toLocaleLowerCase()}`] : []),
+			...sortedSourceIds.map(sourceId => `${input.channelId}:source:${sourceId}`),
+		]);
+		if (!dedupeLocks.size) dedupeLocks.add(`${input.channelId}:title:${normalizedTitle}`);
 		const client = await this.pool.connect();
 		let proposalId: string | undefined;
 		let reused = false;
+		let revised = false;
 		try {
 			await client.query("BEGIN");
-			await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [dedupeLock]);
-			const overlapping = await client.query<{ id: string; title: string }>(
-				`SELECT id,title FROM task_proposals
-				 WHERE channel_id=$1 AND source_message_ids @> $2::text[] AND source_message_ids <@ $2::text[]
-				 AND action=$3 AND project_id IS NOT DISTINCT FROM $4
-				 AND target_work_package_id IS NOT DISTINCT FROM $5
-				 AND assignee_discord_id IS NOT DISTINCT FROM $6
-				 AND (status='created' OR (status IN ('pending_review','creating') AND expires_at > now()))`,
-				[input.channelId, sortedSourceIds, input.action ?? "create", input.projectId ?? null, input.targetWorkPackageId ?? null, input.assigneeDiscordId ?? null],
+			for (const lock of [...dedupeLocks].sort()) await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [lock]);
+			const overlapping = await client.query<{ id: string; title: string; status: string; work_item_key: string | null; source_content_hash: string | null; revision: number }>(
+				`SELECT id,title,status,work_item_key,source_content_hash,revision FROM task_proposals
+				 WHERE channel_id=$1 AND (source_message_ids && $2::text[] OR (
+					status='pending_review' AND $7::text IS NOT NULL AND lower(work_item_key)=lower($7)
+				 ))
+				 AND ((status='created' AND action=$3 AND project_id IS NOT DISTINCT FROM $4
+					AND target_work_package_id IS NOT DISTINCT FROM $5 AND assignee_discord_id IS NOT DISTINCT FROM $6)
+					OR (status IN ('pending_review','creating') AND expires_at > now()))`,
+				[input.channelId, sortedSourceIds, input.action ?? "create", input.projectId ?? null, input.targetWorkPackageId ?? null, input.assigneeDiscordId ?? null, input.workItemKey ?? null],
 			);
-			const overlappingDuplicate = overlapping.rows.find(row => titlesLikelyDuplicate(row.title, input.title));
+			const normalizedWorkItemKey = input.workItemKey?.trim().toLocaleLowerCase();
+			const overlappingDuplicate = overlapping.rows.find(row => (
+				titlesLikelyDuplicate(row.title, input.title)
+				|| Boolean(normalizedWorkItemKey && row.work_item_key?.trim().toLocaleLowerCase() === normalizedWorkItemKey)
+			) && (row.status !== "created" || !input.sourceContentHash || row.source_content_hash === input.sourceContentHash));
 			if (overlappingDuplicate) {
 				proposalId = overlappingDuplicate.id;
 				reused = true;
+				if (overlappingDuplicate.status === "pending_review" && input.sourceContentHash && input.sourceContentHash !== overlappingDuplicate.source_content_hash) {
+					const updated = await client.query<{ revision: number }>(
+						`UPDATE task_proposals SET title=$2,description=$3,source_message_ids=ARRAY(SELECT DISTINCT value FROM unnest(task_proposals.source_message_ids || $4::text[]) value),
+						 source_links=ARRAY(SELECT DISTINCT value FROM unnest(task_proposals.source_links || $5::text[]) value),evidence=$6,ambiguities=$7,
+						 work_item_key=COALESCE($8,work_item_key),source_content_hash=$9,project_id=$10,
+						 assignee_discord_id=$11,accountable_discord_id=$12,priority_id=$13,size_href=$14,start_date=$15,due_date=$16,
+						 estimated_hours=$17,metadata_inference=$18,classification=$19,model_deployment=$20,permitted_reviewer_ids=$21,
+						 latency_ms=$22,token_usage=$23,escalation_reason=$24,action=$25,target_work_package_id=$26,target_lock_version=$27,
+						 operation_schema_version=$28,metadata_patch=$29,content_operation=$30,content_markdown=$31,
+						 revision=revision + 1,updated_at=now()
+						 WHERE id=$1 AND status='pending_review' RETURNING revision`,
+						[proposalId, input.title, input.description, sortedSourceIds, input.sourceLinks ?? [], input.evidence ?? null,
+							input.ambiguities ?? [], input.workItemKey ?? null, input.sourceContentHash, input.projectId ?? null,
+							input.assigneeDiscordId ?? null, input.accountableDiscordId ?? null, input.priorityId ?? null, input.sizeHref ?? null,
+							input.startDate ?? null, input.dueDate ?? null, input.estimatedHours ?? null, jsonParameter(input.metadataInference ?? {}),
+							input.classification ?? null, input.modelDeployment, input.permittedReviewerIds ?? (input.requesterId ? [input.requesterId] : []),
+							input.latencyMs ?? null, input.tokenUsage ?? null, input.escalationReason ?? null, input.action ?? "create",
+							input.targetWorkPackageId ?? null, input.targetLockVersion ?? null, input.action && input.action !== "create" ? 1 : null,
+							jsonParameter(input.metadataPatch ?? {}), input.contentOperation ?? null, input.contentMarkdown ?? null],
+					);
+					if (updated.rows[0]) {
+						revised = true;
+						if (input.initialSnapshot) await client.query(
+							`INSERT INTO task_proposal_revisions(proposal_id,revision,phase,payload) VALUES($1,$2,'edit',$3)
+							 ON CONFLICT(proposal_id,revision) DO NOTHING`,
+							[proposalId, updated.rows[0].revision, jsonParameter(input.initialSnapshot)],
+						);
+					}
+				}
 			} else {
 				const result = await client.query<{ id: string }>(
 			`INSERT INTO task_proposals
@@ -579,9 +656,9 @@ export class Database {
 			 source_message_ids, source_fingerprint, source_links,
 			 classification, status, model_deployment, permitted_reviewer_ids, action, target_work_package_id, target_lock_version,
 			 evidence, ambiguities, latency_ms, token_usage, escalation_reason,
-			 operation_schema_version, metadata_patch, content_operation, content_markdown, expires_at)
+			 operation_schema_version, metadata_patch, content_operation, content_markdown, work_item_key, source_content_hash, expires_at)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'pending_review',$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,
-			 $29,$30,$31,$32,now() + ($33::text || ' days')::interval)
+			 $29,$30,$31,$32,$33,$34,now() + ($35::text || ' days')::interval)
 			ON CONFLICT(source_fingerprint) DO UPDATE SET
 			 requester_discord_id=excluded.requester_discord_id, channel_id=excluded.channel_id,
 			 project_id=excluded.project_id, title=excluded.title, description=excluded.description,
@@ -597,8 +674,10 @@ export class Database {
 				 token_usage=excluded.token_usage, escalation_reason=excluded.escalation_reason,
 				 operation_schema_version=excluded.operation_schema_version, metadata_patch=excluded.metadata_patch,
 				 content_operation=excluded.content_operation, content_markdown=excluded.content_markdown,
+				 work_item_key=excluded.work_item_key, source_content_hash=excluded.source_content_hash,
 				 patch_applied_at=NULL, applied_lock_version=NULL, comment_activity_id=NULL,
-				 reviewer_discord_id=NULL, openproject_work_package_id=NULL,
+				 reviewer_discord_id=NULL, openproject_work_package_id=NULL, reviewed_at=NULL,
+				 review_outcome=NULL, dismissal_reason=NULL, correction_flags='{}'::jsonb,
 				 confirmation_message_id=NULL, error=NULL, expires_at=excluded.expires_at, updated_at=now()
 			WHERE task_proposals.status IN ('dismissed','duplicate','failed','superseded')
 			RETURNING id`,
@@ -611,7 +690,8 @@ export class Database {
 			 input.evidence ?? null, input.ambiguities ?? [], input.latencyMs ?? null,
 			 input.tokenUsage ?? null, input.escalationReason ?? null,
 			 input.action && input.action !== "create" ? 1 : null, jsonParameter(input.metadataPatch ?? {}),
-			 input.contentOperation ?? null, input.contentMarkdown ?? null, input.retentionDays ?? 30],
+			 input.contentOperation ?? null, input.contentMarkdown ?? null, input.workItemKey ?? null,
+			 input.sourceContentHash ?? null, input.retentionDays ?? 30],
 				);
 				if (result.rows[0]) {
 					proposalId = result.rows[0].id;
@@ -640,7 +720,7 @@ export class Database {
 			client.release();
 		}
 		if (!proposalId) throw new Error("Proposal creation returned no identifier.");
-		return { id: proposalId, reused };
+		return { id: proposalId, reused, revised };
 	}
 
 	async convertProposalToUpdate(input: {
@@ -676,19 +756,60 @@ export class Database {
 			 operation_schema_version: number | null; metadata_patch: ProposalMetadataPatch;
 			 content_operation: ContentOperation | null; content_markdown: string | null;
 			 patch_applied_at: string | null; applied_lock_version: number | null; comment_activity_id: number | null;
+			 review_message_id: string | null;
 			 claim_expires_at: string | null;
 		}>("SELECT * FROM task_proposals WHERE id=$1", [id]);
 		const row = result.rows[0];
 		return row ? { ...row, metadata_patch: proposalMetadataPatchSchema.parse(row.metadata_patch ?? {}), metadata_inference: row.metadata_inference ?? {} } : undefined;
 	}
 
-	async setProposalStatus(id: string, status: string, reviewerId: string) {
+	async setProposalReviewMessage(id: string, messageId: string) {
+		const result = await this.pool.query(
+			`UPDATE task_proposals SET review_message_id=$2, updated_at=now()
+			 WHERE id=$1 AND status IN ('pending_review','creating')`,
+			[id, messageId],
+		);
+		return result.rowCount === 1;
+	}
+
+	async clearProposalReviewMessage(id: string, messageId: string) {
+		const result = await this.pool.query(
+			"UPDATE task_proposals SET review_message_id=NULL, updated_at=now() WHERE id=$1 AND review_message_id=$2",
+			[id, messageId],
+		);
+		return result.rowCount === 1;
+	}
+
+	async terminalProposalReviewMessages(limit = 100) {
+		const result = await this.pool.query<{ id: string; channel_id: string; review_message_id: string }>(
+			`SELECT id,channel_id,review_message_id FROM task_proposals
+			 WHERE review_message_id IS NOT NULL
+			 AND status IN ('created','dismissed','duplicate','failed','superseded','needs_reconciliation')
+			 ORDER BY updated_at ASC LIMIT $1`,
+			[limit],
+		);
+		return result.rows;
+	}
+
+	async trackedWorkPackagesForSourceMessages(sourceMessageIds: string[]) {
+		if (!sourceMessageIds.length) return [];
+		const result = await this.pool.query<{ work_package_id: number; project_id: number | null }>(
+			`SELECT DISTINCT openproject_work_package_id AS work_package_id,project_id FROM task_proposals
+			 WHERE status='created' AND openproject_work_package_id IS NOT NULL
+			 AND source_message_ids && $1::text[]`,
+			[sourceMessageIds],
+		);
+		return result.rows;
+	}
+
+	async setProposalStatus(id: string, status: string, reviewerId: string, dismissalReason?: ProposalDismissalReason) {
+		if (status === "dismissed" && !dismissalReason) throw new Error("A dismissal reason is required.");
 		const result = await this.pool.query(
 			`UPDATE task_proposals SET status=$2, reviewer_discord_id=$3,
-			 review_outcome=$2, reviewed_at=now(),
+			 review_outcome=$2, dismissal_reason=$4, reviewed_at=now(),
 			 review_duration_ms=GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(review_started_at, created_at))) * 1000)::integer,
 			 updated_at=now() WHERE id=$1 AND status='pending_review' AND expires_at > now()`,
-			[id, status, reviewerId],
+			[id, status, reviewerId, dismissalReason ?? null],
 		);
 		return result.rowCount === 1;
 	}
@@ -773,20 +894,42 @@ export class Database {
 		);
 	}
 
-	async markProposalCreated(id: string, reviewerId: string, workPackageId: number, confirmationMessageId?: string, corrections?: CorrectionFlags) {
-		await this.pool.query(
-			`UPDATE task_proposals SET status='created', reviewer_discord_id=$2,
+	async finalizeProposalCreation(input: {
+		id: string;
+		reviewerId: string;
+		workPackageId: number;
+		confirmationMessageId?: string;
+		corrections: CorrectionFlags;
+		finalSnapshot: Record<string, unknown>;
+	}) {
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			const result = await client.query<{ revision: number }>(
+				`UPDATE task_proposals SET status='created', reviewer_discord_id=$2,
 				 openproject_work_package_id=$3, confirmation_message_id=$4, error=NULL,
 				 review_outcome='approved', reviewed_at=now(), correction_flags=$5,
-				 claim_expires_at=NULL,
+				 claim_expires_at=NULL, revision=revision + 1,
 				 review_duration_ms=GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(review_started_at, created_at))) * 1000)::integer,
-				 updated_at=now() WHERE id=$1 AND status='creating'`,
-			[id, reviewerId, workPackageId, confirmationMessageId ?? null, corrections ?? {}],
-		);
-		await this.pool.query(
-			"INSERT INTO task_audit_log(proposal_id,event,actor_discord_id,metadata) VALUES($1,'created',$2,$3)",
-			[id, reviewerId, { workPackageId }],
-		);
+				 updated_at=now() WHERE id=$1 AND status='creating' RETURNING revision`,
+				[input.id, input.reviewerId, input.workPackageId, input.confirmationMessageId ?? null, input.corrections],
+			);
+			if (result.rowCount !== 1) throw new Error("This proposal is no longer being applied.");
+			await client.query(
+				"INSERT INTO task_audit_log(proposal_id,event,actor_discord_id,metadata) VALUES($1,'created',$2,$3)",
+				[input.id, input.reviewerId, { workPackageId: input.workPackageId }],
+			);
+			await client.query(
+				"INSERT INTO task_proposal_revisions(proposal_id,revision,phase,payload) VALUES($1,$2,'final',$3)",
+				[input.id, result.rows[0].revision, jsonParameter(input.finalSnapshot)],
+			);
+			await client.query("COMMIT");
+		} catch (error) {
+			await client.query("ROLLBACK");
+			throw error;
+		} finally {
+			client.release();
+		}
 	}
 
 	async markProposalUpdated(id: string, reviewerId: string, workPackageId: number, corrections?: CorrectionFlags, action = "update") {
@@ -898,13 +1041,19 @@ export class Database {
 		inputSnapshot?: unknown;
 		messageAssessments?: unknown;
 		decision?: Record<string, unknown>;
+		proposalIds?: string[];
 	}) {
 		await this.pool.query(
-			`INSERT INTO ai_extraction_events(source,outcome,model_deployment,task_count,latency_ms,token_usage,trigger_id,input_snapshot,message_assessments,decision)
-			 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+			`WITH event AS (
+				INSERT INTO ai_extraction_events(source,outcome,model_deployment,task_count,latency_ms,token_usage,trigger_id,input_snapshot,message_assessments,decision,schema_version)
+				VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'v3') RETURNING id
+			)
+			INSERT INTO task_proposal_extractions(proposal_id,extraction_event_id)
+			SELECT proposal_id,event.id FROM event CROSS JOIN unnest($11::uuid[]) AS proposal_id
+			ON CONFLICT DO NOTHING`,
 			[input.source, input.outcome, input.modelDeployment ?? null, input.taskCount ?? 0,
 				input.latencyMs ?? null, jsonParameter(input.tokenUsage), input.triggerId ?? null, jsonParameter(input.inputSnapshot),
-				jsonParameter(input.messageAssessments), jsonParameter(input.decision)],
+				jsonParameter(input.messageAssessments), jsonParameter(input.decision), input.proposalIds ?? []],
 		);
 	}
 
@@ -914,15 +1063,6 @@ export class Database {
 			 ON CONFLICT(proposal_id,revision) DO UPDATE SET phase=excluded.phase,payload=excluded.payload,created_at=now()`,
 			[proposalId, revision, phase, jsonParameter(payload)],
 		);
-	}
-
-	async recordFinalProposalRevision(proposalId: string, payload: Record<string, unknown>) {
-		const result = await this.pool.query<{ revision: number }>(
-			"UPDATE task_proposals SET revision=revision + 1 WHERE id=$1 AND status='created' RETURNING revision",
-			[proposalId],
-		);
-		if (result.rowCount !== 1) throw new Error("Could not finalize proposal revision telemetry.");
-		await this.recordProposalRevision(proposalId, result.rows[0].revision, "final", payload);
 	}
 
 	async upsertEmbedding(input: {

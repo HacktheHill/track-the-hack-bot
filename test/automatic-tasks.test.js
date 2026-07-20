@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { automaticFocalWindows, uniqueMentionIds } from "../dist/automatic-tasks.js";
+import { automaticFocalWindows, messageRevisionChanged, proposalOwnerText } from "../dist/automatic-tasks.js";
 
 test("automatic batches evaluate every message as its own focal window", () => {
 	assert.deepEqual(automaticFocalWindows(["a", "b", "c"]), [
@@ -34,8 +34,16 @@ test("automatic focal windows do not cross conversation gaps", () => {
 	]);
 });
 
-test("automatic proposal mentions contain each reviewer once", () => {
-	assert.deepEqual(uniqueMentionIds("owner", "owner"), ["owner"]);
-	assert.deepEqual(uniqueMentionIds("assignee", "accountable"), ["assignee", "accountable"]);
-	assert.deepEqual(uniqueMentionIds(undefined, "accountable"), ["accountable"]);
+test("automatic proposal cards show plain owner labels without mention syntax", () => {
+	assert.equal(proposalOwnerText("Alex", "Alex"), "Assignee: Alex | Accountable: Alex\n");
+	assert.equal(proposalOwnerText("Alex", "Morgan"), "Assignee: Alex | Accountable: Morgan\n");
+	assert.equal(proposalOwnerText(undefined, "Morgan"), "Accountable: Morgan\n");
+	assert.equal(proposalOwnerText().includes("<@"), false);
+});
+
+test("message edits enqueue only content or attachment changes and partials fail open", () => {
+	assert.equal(messageRevisionChanged("same", "same", "a:url", "a:url"), false);
+	assert.equal(messageRevisionChanged("old", "new", "a:url", "a:url"), true);
+	assert.equal(messageRevisionChanged("same", "same", "a:url", "b:url"), true);
+	assert.equal(messageRevisionChanged(undefined, "current", "", ""), true);
 });

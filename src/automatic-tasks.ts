@@ -1,14 +1,25 @@
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, Client, Message } from "discord.js";
+import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, Client, Message, type MessageCreateOptions } from "discord.js";
 import { automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, SensitiveContentError, StructuredOutputError, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 import { isOrganizerGuild, type IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient, titlesLikelyDuplicate } from "./openproject.js";
 import { AI_CONTEXT_GAP_MS, boundedDiscordContent, defaultAiDueDate, formatAiTaskDescription, inferCreationMetadata, teamProjectId } from "./tasks.js";
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
-import { describeProposalOperations, planExistingTaskOperations, taskReferencesAreValid } from "./task-proposals.js";
+import { describeProposalOperations, planExistingTaskOperations, sourceContentHash, taskReferencesAreValid } from "./task-proposals.js";
 
 type AutomaticServices = { config: IntegrationConfig; db: Database; extractor: TaskExtractor; openProject: OpenProjectClient; rag?: OpenProjectRag };
 type Batch = { messages: Message[]; timer: NodeJS.Timeout };
+type ReviewCardPayload = Pick<MessageCreateOptions, "content" | "components" | "allowedMentions">;
+
+function combinedUsage(...usages: Array<{ promptTokens?: number; completionTokens?: number; totalTokens?: number } | undefined>) {
+	const values = usages.filter((usage): usage is NonNullable<typeof usage> => Boolean(usage));
+	if (!values.length) return undefined;
+	return {
+		promptTokens: values.reduce((total, usage) => total + (usage.promptTokens ?? 0), 0),
+		completionTokens: values.reduce((total, usage) => total + (usage.completionTokens ?? 0), 0),
+		totalTokens: values.reduce((total, usage) => total + (usage.totalTokens ?? 0), 0),
+	};
+}
 
 function messageTimestamp(value: unknown) {
 	if (!value || typeof value !== "object") return undefined;
@@ -44,8 +55,27 @@ export function automaticFocalWindows<T>(messages: readonly T[], limit = 30, gap
 	});
 }
 
-export function uniqueMentionIds(...ids: Array<string | undefined>) {
-	return [...new Set(ids.filter((id): id is string => Boolean(id)))];
+export function proposalOwnerText(assigneeName?: string, accountableName?: string) {
+	const owners = [...new Set([
+		assigneeName ? `Assignee: ${assigneeName}` : undefined,
+		accountableName ? `Accountable: ${accountableName}` : undefined,
+	].filter((value): value is string => Boolean(value)))];
+	return owners.length ? `${owners.join(" | ")}\n` : "";
+}
+
+export function messageRevisionChanged(previousContent: string | undefined, currentContent: string, previousAttachments: string, currentAttachments: string) {
+	return previousContent === undefined || previousContent !== currentContent || previousAttachments !== currentAttachments;
+}
+
+async function updateStoredReviewCard(primary: Message, services: AutomaticServices, proposalId: string, payload: ReviewCardPayload) {
+	const proposal = await services.db.proposal(proposalId);
+	if (!proposal?.review_message_id) return false;
+	const channel = await primary.client.channels.fetch(proposal.channel_id).catch(() => null);
+	if (!channel?.isTextBased() || !("messages" in channel)) return false;
+	const message = await channel.messages.fetch(proposal.review_message_id).catch(() => null);
+	if (!message) return false;
+	await message.edit(payload);
+	return true;
 }
 
 async function enrichAutomaticContext(messages: Message[], focal: Message) {
@@ -144,6 +174,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			};
 		});
 		let completedExtraction: Awaited<ReturnType<TaskExtractor["extract"]>> | undefined;
+		let completedGate: Awaited<ReturnType<TaskExtractor["assessAutomaticCandidates"]>> | undefined;
 		try {
 			const channelProjectId = await categoryProject(primary, services);
 			const priorities = await services.openProject.priorities();
@@ -155,6 +186,8 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			const { result, deployment } = extraction;
 			let createdProposals = 0;
 			let duplicates = 0;
+			let revisedProposals = 0;
+			const proposalIds = new Set<string>();
 			const ragEvaluations: Array<{ title: string; proposedAction: string; workPackageId?: number; similarity?: number }> = [];
 			const sourceRecords = new Map(source.map(message => [message.id, {
 				author: message.member?.displayName ?? message.author.username,
@@ -172,22 +205,25 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			const validAttachmentIds = new Set(source.flatMap(message => [...message.attachments.keys()]));
 			const individuallyGroundedTasks = result.tasks.filter(task => taskReferencesAreValid(task, validMessageIds, focalMessageIds, validAttachmentIds));
 			const groundedTasks = mergeRelatedTaskCandidates(individuallyGroundedTasks);
-			const eligibleTasks = groundedTasks.filter(automaticCandidateEligible);
-			const candidateAssessments = groundedTasks.map(task => ({
-				automaticEligibility: task.automatic_eligibility,
-				triggerKind: task.trigger_kind,
-				lifecycle: task.lifecycle,
+			const gate = completedGate = await services.extractor.assessAutomaticCandidates(extraction.inputMessages, groundedTasks);
+			const eligibleTasks = groundedTasks.filter((_, index) => automaticCandidateEligible(gate.assessments[index]));
+			const candidateAssessments = groundedTasks.map((task, index) => ({
+				...gate.assessments[index],
+				automaticEligibility: automaticCandidateEligible(gate.assessments[index]) ? "eligible" : "ineligible",
 				proposedAction: task.proposed_action,
 				sourceMessageIds: task.source_message_ids,
 			}));
+			const pipelineLatencyMs = extraction.latencyMs + gate.latencyMs;
+			const pipelineUsage = combinedUsage(extraction.usage, gate.usage);
 			for (const task of eligibleTasks) {
 				let projectId = channelProjectId;
 				const assigneeId = task.assignee_alias ? reverse.get(task.assignee_alias) : undefined;
-				if (!projectId && assigneeId) {
-					const assignee = await primary.guild!.members.fetch(assigneeId).catch(() => null);
-					projectId = teamProjectId(assignee, services.config.teamRoles);
-				}
+				const assignee = assigneeId ? await primary.guild!.members.fetch(assigneeId).catch(() => null) : null;
+				if (!projectId && assignee) projectId = teamProjectId(assignee, services.config.teamRoles);
 				const accountableId = source.find(message => task.source_message_ids.includes(message.id))?.author.id;
+				const accountableName = source.find(message => message.author.id === accountableId)?.member?.displayName
+					?? source.find(message => message.author.id === accountableId)?.author.username;
+				const ownerText = proposalOwnerText(assignee?.displayName ?? assignee?.user.username, accountableName);
 				let priority = task.priority_name ? priorities.find(item => item.name.toLocaleLowerCase() === task.priority_name!.toLocaleLowerCase()) : undefined;
 				let estimatedHours = task.estimated_hours ?? undefined;
 				const sourceLinks = task.source_message_ids.map(id => `https://discord.com/channels/${primary.guildId}/${source.find(item => item.id === id)?.channelId ?? channelId}/${id}`);
@@ -198,6 +234,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					workPackageId: similar[0]?.workPackageId, similarity: similar[0]?.similarity,
 				});
 				const suggestedMatch = services.config.OPENPROJECT_RAG_MODE === "review" && similar[0]?.similarity >= services.config.OPENPROJECT_RAG_SIMILARITY_THRESHOLD ? similar[0] : undefined;
+				const sourceLinkedTargets = await services.db.trackedWorkPackagesForSourceMessages(task.source_message_ids);
 				const targetResolution = await resolveProposalTarget({
 					action: task.proposed_action,
 					sourceTexts: task.source_message_ids.map(id => sourceRecords.get(id)?.text ?? ""),
@@ -205,6 +242,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					projectId,
 					ragMode: services.config.OPENPROJECT_RAG_MODE,
 					suggestedMatch,
+					sourceLinkedTargetId: sourceLinkedTargets.length === 1 ? sourceLinkedTargets[0].work_package_id : undefined,
 					workPackage: id => services.openProject.workPackage(id),
 				});
 				projectId = targetResolution.projectId;
@@ -234,8 +272,8 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				if (match && action !== "create") {
 					const operations = planExistingTaskOperations({
 						workPackage: target!,
-						requestedAction: task.proposed_action,
-						contentIntent: task.content_intent,
+						requestedAction: action,
+						contentIntent: sourceLinkedTargets.length === 1 && task.proposed_action === "create" && task.content_intent === "none" ? "update_note" : task.content_intent,
 						description,
 						metadataFields: task.metadata_change_fields,
 						values: {
@@ -246,8 +284,13 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						},
 					});
 					if (operations.contentOperation === "none" && Object.keys(operations.metadataPatch).length === 0) continue;
-					if (seenCandidates.some(seen => seen.action === action && seen.projectId === projectId && seen.targetWorkPackageId === match.workPackageId && seen.assigneeId === assigneeId && titlesLikelyDuplicate(seen.title, task.title))) {
+					if (services.config.OPENPROJECT_AUTOMATION_MODE === "shadow" && seenCandidates.some(seen => seen.action === action && seen.projectId === projectId && seen.targetWorkPackageId === match.workPackageId && seen.assigneeId === assigneeId && titlesLikelyDuplicate(seen.title, task.title))) {
 						duplicates++;
+						continue;
+					}
+					if (services.config.OPENPROJECT_AUTOMATION_MODE === "shadow") {
+						seenCandidates.push({ title: task.title, action, projectId, targetWorkPackageId: match.workPackageId, assigneeId });
+						createdProposals++;
 						continue;
 					}
 					const reviewers = new Set<string>(source.filter(message => task.source_message_ids.includes(message.id)).map(message => message.author.id));
@@ -260,10 +303,14 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						startDate: task.start_date ?? undefined, dueDate, estimatedHours, metadataInference,
 						sourceMessageIds: task.source_message_ids, sourceLinks,
 						modelDeployment: deployment, permittedReviewerIds: [...reviewers], evidence: task.evidence,
-						ambiguities: [...result.ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+						ambiguities: [...result.ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: pipelineLatencyMs, tokenUsage: pipelineUsage,
 						action, targetWorkPackageId: match.workPackageId, targetLockVersion: target!.lockVersion,
 						metadataPatch: operations.metadataPatch, contentOperation: operations.contentOperation,
 						contentMarkdown: operations.contentMarkdown,
+						workItemKey: task.work_item_key,
+						sourceContentHash: sourceContentHash(task.source_message_ids.map(id => ({
+							id, text: sourceRecords.get(id)?.text ?? "", attachments: sourceRecords.get(id)?.attachments,
+						}))),
 						initialSnapshot: {
 							title: task.title, description, projectId, assigneeId, accountableId, priorityId: priority?.id,
 							sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate: task.start_date,
@@ -272,21 +319,29 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						},
 						retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS,
 					});
+					const reviewPayload: ReviewCardPayload = {
+						content: boundedDiscordContent(`${ownerText}Proposed ${action} for OpenProject task #${match.workPackageId}: **${task.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch).map(item => `- ${item}`).join("\n")}${operations.contentOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : ""}`),
+						components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
+							new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and apply").setStyle(ButtonStyle.Primary),
+							new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
+						)],
+						allowedMentions: { parse: [] },
+					};
+					proposalIds.add(proposal.id);
 					if (proposal.reused) {
-						duplicates++;
+						if (proposal.revised && await updateStoredReviewCard(primary, services, proposal.id, reviewPayload)) revisedProposals++;
+						else duplicates++;
 						continue;
 					}
 					seenCandidates.push({ title: task.title, action, projectId, targetWorkPackageId: match.workPackageId, assigneeId });
 					if (services.config.OPENPROJECT_AUTOMATION_MODE === "review") {
 						const channel = primary.channel;
 						if (channel?.isSendable()) try {
-							await channel.send({
-							content: boundedDiscordContent(`${assigneeId ? `<@${assigneeId}> ` : ""}${accountableId && accountableId !== assigneeId ? `<@${accountableId}> ` : ""}Proposed ${action} for OpenProject task #${match.workPackageId}: **${task.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch).map(item => `- ${item}`).join("\n")}${operations.contentOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : ""}`),
-							components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
-								new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and apply").setStyle(ButtonStyle.Primary),
-								new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
-							)], allowedMentions: { users: uniqueMentionIds(assigneeId, accountableId) },
-							});
+							const reviewMessage = await channel.send(reviewPayload);
+							if (!await services.db.setProposalReviewMessage(proposal.id, reviewMessage.id)) {
+								await reviewMessage.delete().catch(() => undefined);
+								throw new Error("The proposal was handled before its review card could be attached.");
+							}
 						} catch (error) {
 							await services.db.markProposalDeliveryFailed(proposal.id, (error as Error).message);
 							throw error;
@@ -305,8 +360,13 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				for (const reviewer of [...reviewers]) {
 					if (!await services.db.openProjectUserId(reviewer)) reviewers.delete(reviewer);
 				}
-				if (seenCandidates.some(seen => seen.action === action && seen.projectId === projectId && seen.targetWorkPackageId === undefined && seen.assigneeId === assigneeId && titlesLikelyDuplicate(seen.title, task.title))) {
+				if (services.config.OPENPROJECT_AUTOMATION_MODE === "shadow" && seenCandidates.some(seen => seen.action === action && seen.projectId === projectId && seen.targetWorkPackageId === undefined && seen.assigneeId === assigneeId && titlesLikelyDuplicate(seen.title, task.title))) {
 					duplicates++;
+					continue;
+				}
+				if (services.config.OPENPROJECT_AUTOMATION_MODE === "shadow") {
+					seenCandidates.push({ title: task.title, action, projectId, assigneeId });
+					createdProposals++;
 					continue;
 				}
 				const proposal = await services.db.createProposal({
@@ -318,8 +378,12 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					modelDeployment: deployment,
 					permittedReviewerIds: [...reviewers],
 					evidence: task.evidence, ambiguities: [...result.ambiguities, ...(advisory ? [advisory] : [])],
-					latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+					latencyMs: pipelineLatencyMs, tokenUsage: pipelineUsage,
 						escalationReason: extraction.escalationReason,
+						workItemKey: task.work_item_key,
+						sourceContentHash: sourceContentHash(task.source_message_ids.map(id => ({
+							id, text: sourceRecords.get(id)?.text ?? "", attachments: sourceRecords.get(id)?.attachments,
+						}))),
 						initialSnapshot: {
 							title: task.title, description, projectId, assigneeId, accountableId, priorityId: priority?.id,
 							sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate: task.start_date,
@@ -328,8 +392,20 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						},
 						retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS,
 				});
+				const reviewPayload: ReviewCardPayload = {
+					content: boundedDiscordContent(`${ownerText}Proposed OpenProject task: **${task.title}**\n${description}${advisory ? `\n\n${advisory}` : ""}`),
+					components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
+						new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and edit").setStyle(ButtonStyle.Primary),
+						...(suggestedMatch ? [new ButtonBuilder().setCustomId(`op-use-existing:${proposal.id}:${suggestedMatch.workPackageId}`).setLabel(`Use existing #${suggestedMatch.workPackageId}`).setStyle(ButtonStyle.Secondary)] : []),
+						new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
+						new ButtonBuilder().setCustomId(`op-duplicate:${proposal.id}`).setLabel("Already tracked").setStyle(ButtonStyle.Secondary),
+					)],
+					allowedMentions: { parse: [] },
+				};
+				proposalIds.add(proposal.id);
 				if (proposal.reused) {
-					duplicates++;
+					if (proposal.revised && await updateStoredReviewCard(primary, services, proposal.id, reviewPayload)) revisedProposals++;
+					else duplicates++;
 					continue;
 				}
 				seenCandidates.push({ title: task.title, action, projectId, assigneeId });
@@ -338,16 +414,11 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					const channel = primary.channel;
 					if (channel?.isSendable()) {
 						try {
-						await channel.send({
-							content: boundedDiscordContent(`${assigneeId ? `<@${assigneeId}> ` : ""}${accountableId && accountableId !== assigneeId ? `<@${accountableId}> ` : ""}Proposed OpenProject task: **${task.title}**\n${description}${advisory ? `\n\n${advisory}` : ""}`),
-							components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
-								new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and edit").setStyle(ButtonStyle.Primary),
-								...(suggestedMatch ? [new ButtonBuilder().setCustomId(`op-use-existing:${proposal.id}:${suggestedMatch.workPackageId}`).setLabel(`Use existing #${suggestedMatch.workPackageId}`).setStyle(ButtonStyle.Secondary)] : []),
-								new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
-								new ButtonBuilder().setCustomId(`op-duplicate:${proposal.id}`).setLabel("Already tracked").setStyle(ButtonStyle.Secondary),
-							)],
-							allowedMentions: { users: uniqueMentionIds(assigneeId, accountableId) },
-						});
+						const reviewMessage = await channel.send(reviewPayload);
+						if (!await services.db.setProposalReviewMessage(proposal.id, reviewMessage.id)) {
+							await reviewMessage.delete().catch(() => undefined);
+							throw new Error("The proposal was handled before its review card could be attached.");
+						}
 						} catch (error) {
 							await services.db.markProposalDeliveryFailed(proposal.id, (error as Error).message);
 							throw error;
@@ -357,14 +428,15 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			}
 			await services.db.recordExtraction({
 				source: "automatic",
-				outcome: createdProposals ? "proposal" : duplicates ? "duplicate" : "no_task",
+				outcome: createdProposals || revisedProposals ? "proposal" : duplicates ? "duplicate" : "no_task",
 				modelDeployment: deployment,
 				 taskCount: result.tasks.length,
-				latencyMs: extraction.latencyMs,
-				tokenUsage: extraction.usage,
+				latencyMs: pipelineLatencyMs,
+				tokenUsage: pipelineUsage,
 				triggerId: primary.id,
 				inputSnapshot: extraction.inputMessages.map(({ containedSensitiveData: _, ...message }) => message),
 				messageAssessments: candidateAssessments,
+				proposalIds: [...proposalIds],
 				decision: {
 					taskCount: result.tasks.length,
 					groundedCount: individuallyGroundedTasks.length,
@@ -374,8 +446,16 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					invalidGroundingCount: result.tasks.length - individuallyGroundedTasks.length,
 					extractionMetadata: extraction.metadata,
 					extractionOptions: extraction.replayOptions,
+					pipelineVersion: "v3",
+					extractionPromptVersion: "candidate-v3",
+					gatePromptVersion: "automatic-precision-v1",
+					stages: {
+						extraction: { deployment: extraction.deployment, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage },
+						precisionGate: { deployment: gate.deployment, latencyMs: gate.latencyMs, tokenUsage: gate.usage },
+					},
 					proposalCount: createdProposals,
 					duplicateCount: duplicates,
+					revisedProposalCount: revisedProposals,
 					ragEvaluations,
 				},
 			});
@@ -394,7 +474,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				inputSnapshot: retainSnapshot ? diagnostics?.inputMessages.map(({ containedSensitiveData: _, ...message }) => message) : undefined,
 				decision: error instanceof SensitiveContentError
 					? { errorType: "sensitive_block", reasons: error.reasons, extractionMetadata: diagnostics?.metadata, extractionOptions: diagnostics?.replayOptions }
-					: { errorType: !diagnostics || diagnostics.stage === "processing" ? "processing_error" : error instanceof StructuredOutputError ? "invalid_output" : "provider_error", extractionMetadata: diagnostics?.metadata, extractionOptions: diagnostics?.replayOptions },
+					: { errorType: !diagnostics || diagnostics.stage === "processing" ? "processing_error" : error instanceof StructuredOutputError ? "invalid_output" : "provider_error", stage: diagnostics?.stage, extractionMetadata: diagnostics?.metadata, extractionOptions: diagnostics?.replayOptions, gateInvoked: Boolean(completedGate) },
 			}).catch(auditError => console.error("Automatic task extraction metrics failed", { channelId, error: (auditError as Error).message }));
 			console.error("Automatic task extraction failed", { channelId, error: (error as Error).message });
 		}
@@ -410,14 +490,29 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 		activeFlushes.set(channelId, next);
 	};
 
-	client.on("messageCreate", async message => {
+	const enqueueMessage = async (message: Message) => {
 		if (!message.inGuild() || !isOrganizerGuild(services.config, message.guildId) || message.author.bot || message.system) return;
 		if (await isExcludedChannel(message, services)) return;
 		const existing = batches.get(message.channelId);
 		if (existing) clearTimeout(existing.timer);
-		const messages = [...(existing?.messages ?? []), message].slice(-30);
+		const messages = [...(existing?.messages ?? []).filter(item => item.id !== message.id), message]
+			.sort((left, right) => left.createdTimestamp - right.createdTimestamp)
+			.slice(-30);
 		const timer = setTimeout(() => enqueueFlush(message.channelId), services.config.OPENPROJECT_BATCH_IDLE_SECONDS * 1000);
 		batches.set(message.channelId, { messages, timer });
+	};
+	client.on("messageCreate", message => {
+		void enqueueMessage(message).catch(error => console.error("Automatic task message enqueue failed", { channelId: message.channelId, error: (error as Error).message }));
+	});
+	client.on("messageUpdate", (previous, updated) => {
+		void (async () => {
+			const message = updated.partial ? await updated.fetch().catch(() => null) : updated;
+			if (!message) return;
+			const previousAttachments = previous.partial ? "" : [...previous.attachments.values()].map(attachment => `${attachment.id}:${attachment.url}`).join("|");
+			const currentAttachments = [...message.attachments.values()].map(attachment => `${attachment.id}:${attachment.url}`).join("|");
+			if (!messageRevisionChanged(previous.partial ? undefined : previous.content, message.content, previousAttachments, currentAttachments)) return;
+			await enqueueMessage(message);
+		})().catch(error => console.error("Automatic task message update enqueue failed", { channelId: updated.channelId, error: (error as Error).message }));
 	});
 	console.log(`Automatic task extraction enabled in ${services.config.OPENPROJECT_AUTOMATION_MODE} mode`);
 }

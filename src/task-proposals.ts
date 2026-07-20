@@ -1,5 +1,6 @@
 import type { WorkPackage } from "./openproject.js";
 import { z } from "zod";
+import { createHash } from "node:crypto";
 
 export const metadataFieldNames = [
 	"subject", "assignee", "priority", "size", "start_date", "due_date", "estimated_hours",
@@ -8,6 +9,18 @@ export const metadataFieldNames = [
 export type MetadataFieldName = typeof metadataFieldNames[number];
 export type ContentIntent = "none" | "update_note" | "replace_description";
 export type ContentOperation = "none" | "descriptionReplacement" | "postComment";
+
+export function sourceContentHash(messages: Array<{ id: string; text: string; attachments?: Array<{ id: string; url: string }> }>) {
+	const content = [...messages].sort((left, right) => left.id.localeCompare(right.id))
+		.map(message => {
+			const attachments = [...(message.attachments ?? [])]
+				.sort((left, right) => left.id.localeCompare(right.id))
+				.map(attachment => `${attachment.id}:${attachment.url}`)
+				.join("|");
+			return `${message.id}:${message.text}:${attachments}`;
+		}).join("\n");
+	return createHash("sha256").update(content).digest("hex");
+}
 
 export function taskReferencesAreValid(
 	task: { source_message_ids: readonly string[]; relevant_attachment_ids: readonly string[] },
@@ -99,37 +112,21 @@ function stripGeneratedReferenceSections(value: string) {
 	return output.join("\n").trim();
 }
 
-function bulletizeDescription(value: string) {
-	if (!value.trim()) return "";
+function compactDescription(value: string) {
 	const output: string[] = [];
-	let prose: string[] = [];
-	let hasHeading = false;
-	const flush = () => {
-		if (!prose.length) return;
-		const sentences = prose.join(" ").split(/(?<=[.!?])\s+(?=[\p{Lu}\p{N}])/u).map(item => item.trim()).filter(Boolean);
-		output.push(...sentences.map(sentence => `- ${sentence}`));
-		prose = [];
-	};
+	const seenStructuredLines = new Set<string>();
 	for (const rawLine of value.split(/\r?\n/)) {
-		const line = rawLine.trim();
-		if (/^#{1,6}\s+\S/.test(line)) {
-			flush();
-			if (output.length && output.at(-1) !== "") output.push("");
-			output.push(line, "");
-			hasHeading = true;
-		} else if (/^(?:[-*+]\s+|\d+[.)]\s+)/.test(line)) {
-			flush();
-			output.push(line);
-		} else if (line) {
-			prose.push(line);
-		} else {
-			flush();
-			if (output.length && output.at(-1) !== "") output.push("");
+		const line = rawLine.trimEnd();
+		const structured = /^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)/.test(line);
+		if (structured) {
+			const normalized = line.replace(/^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)/, "")
+				.replace(/\s+/g, " ").trim().toLocaleLowerCase();
+			if (seenStructuredLines.has(normalized)) continue;
+			seenStructuredLines.add(normalized);
 		}
+		output.push(line);
 	}
-	flush();
-	const body = output.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-	return hasHeading ? body : `## Details\n\n${body}`;
+	return output.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 export function formatGeneratedTaskDescription(value: string, referenceLinks: readonly string[] = []) {
@@ -141,7 +138,7 @@ export function formatGeneratedTaskDescription(value: string, referenceLinks: re
 		.replace(/https?:\/\/[^\s<>()]+/gi, "")
 		.replace(/[ \t]+([.,;:!?])/g, "$1")
 		.replace(/[ \t]+\n/g, "\n");
-	const body = bulletizeDescription(cleaned);
+	const body = compactDescription(cleaned);
 	let references = "";
 	for (const link of links) {
 		const addition = `${references ? "" : "## References\n\n"}- ${link}\n`;

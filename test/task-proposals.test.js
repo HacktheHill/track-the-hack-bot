@@ -5,8 +5,17 @@ import {
 	formatGeneratedTaskDescription,
 	isEffectivelyEmptyDescription,
 	planExistingTaskOperations,
+	sourceContentHash,
 	taskReferencesAreValid,
 } from "../dist/task-proposals.js";
+
+test("source content identity changes when an attachment changes", () => {
+	const textOnly = sourceContentHash([{ id: "message", text: "Revise this" }]);
+	const firstAttachment = sourceContentHash([{ id: "message", text: "Revise this", attachments: [{ id: "one", url: "https://cdn.test/one.png" }] }]);
+	const secondAttachment = sourceContentHash([{ id: "message", text: "Revise this", attachments: [{ id: "two", url: "https://cdn.test/two.png" }] }]);
+	assert.notEqual(textOnly, firstAttachment);
+	assert.notEqual(firstAttachment, secondAttachment);
+});
 
 test("effectively empty descriptions ignore managed provenance but preserve real context", () => {
 	assert.equal(isEffectivelyEmptyDescription(""), true);
@@ -66,13 +75,13 @@ test("task references require valid IDs and at least one focal message", () => {
 	assert.equal(taskReferencesAreValid({ source_message_ids: ["recent"], relevant_attachment_ids: ["missing"] }, validMessages, focalMessages, validAttachments), false);
 });
 
-test("generated descriptions use bullets and one verified references section", () => {
+test("generated descriptions preserve genuine lists and one verified references section", () => {
 	const description = formatGeneratedTaskDescription(
-		"Update the sponsor graphic colors using the [mockup](https://verified.test/mockup). Reorganize the tier layout.\n\n- Preserve the sponsor logos.\n\nAdd mobile spacing. Ignore https://hallucinated.test.\n\nRelated references:\n- https://unverified.test\n\nRelated links:\n- https://duplicate.test",
+		"## Requirements\n\n- Update the sponsor graphic colors using the [mockup](https://verified.test/mockup).\n- Reorganize the tier layout.\n- Preserve the sponsor logos.\n\nAdd mobile spacing. Ignore https://hallucinated.test.\n\nRelated references:\n- https://unverified.test\n\nRelated links:\n- https://duplicate.test",
 		["https://verified.test/mockup", "https://verified.test/mockup"],
 	);
-	assert.match(description, /^## Details\n\n- Update the sponsor graphic colors using the mockup\.\n- Reorganize the tier layout\./);
-	assert.match(description, /- Preserve the sponsor logos\.[\s\S]*- Add mobile spacing\./);
+	assert.match(description, /^## Requirements\n\n- Update the sponsor graphic colors using the mockup\.\n- Reorganize the tier layout\./);
+	assert.match(description, /- Preserve the sponsor logos\.[\s\S]*Add mobile spacing\./);
 	assert.equal((description.match(/## References/g) ?? []).length, 1);
 	assert.equal((description.match(/https:\/\/verified\.test\/mockup/g) ?? []).length, 1);
 	assert.match(description, /https:\/\/verified\.test\/mockup/);
@@ -80,4 +89,18 @@ test("generated descriptions use bullets and one verified references section", (
 	assert.equal(description.includes("hallucinated.test"), false);
 	assert.equal(description.includes("[mockup]()"), false);
 	assert.equal(description.includes("Related links"), false);
+});
+
+test("generated descriptions keep cohesive prose compact without sentence splitting", () => {
+	assert.equal(
+		formatGeneratedTaskDescription("Review the Prisms schema discussion. Capture the agreed account access behavior."),
+		"Review the Prisms schema discussion. Capture the agreed account access behavior.",
+	);
+});
+
+test("generated descriptions deduplicate normalized bullets and headings", () => {
+	assert.equal(
+		formatGeneratedTaskDescription("## Requirements\n\n- Ship the update.\n*  Ship   the update.\n\n## REQUIREMENTS\n\n- Add tests."),
+		"## Requirements\n\n- Ship the update.\n\n- Add tests.",
+	);
 });

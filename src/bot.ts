@@ -1,4 +1,4 @@
-import { Client, GatewayIntentBits } from "discord.js";
+import { Client, GatewayIntentBits, Partials } from "discord.js";
 import { config } from "dotenv";
 import registerHelpCommand from "./help.js";
 import registerSyncCommand, { registerGuildMemberAddHandler } from "./sync.js";
@@ -6,7 +6,7 @@ import registerVerificationCommand from "./verification.js";
 import { loadIntegrationConfig, loadOutreachConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient } from "./openproject.js";
-import { registerTaskInteractions } from "./tasks.js";
+import { cleanupTerminalProposalCards, registerTaskInteractions } from "./tasks.js";
 import { AzureTaskExtractor } from "./azure-openai.js";
 import { registerAutomaticTaskDetection } from "./automatic-tasks.js";
 import { reconcileOpenProjectUsers } from "./identity.js";
@@ -24,6 +24,7 @@ const client = new Client({
 		GatewayIntentBits.GuildMessages,
 		GatewayIntentBits.MessageContent,
 	],
+	partials: [Partials.Message, Partials.Channel],
 });
 
 const {
@@ -89,6 +90,10 @@ client.once("clientReady", async () => {
 		};
 		registerTaskInteractions(client, services);
 		registerAutomaticTaskDetection(client, services);
+		const cleanupReviewCards = () => void cleanupTerminalProposalCards(client, db)
+			.catch(error => console.error("Proposal review card cleanup failed", { error: (error as Error).message }));
+		cleanupReviewCards();
+		setInterval(cleanupReviewCards, 15 * 60 * 1000).unref();
 		const organizerGuild = await client.guilds.fetch(integrationConfig.ORGANIZER_GUILD_ID);
 		const reconcileIdentities = () => void reconcileOpenProjectUsers(organizerGuild, integrationConfig, db, services.openProject)
 			.then(result => console.log("OpenProject identity reconciliation complete", result))

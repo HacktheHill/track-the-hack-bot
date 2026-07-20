@@ -1,20 +1,29 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { corpusWindowSchema, runtimeProposalCandidates } from "../dist/evaluate-ai.js";
+import { corpusWindowSchema, providerFailureCategory, retryableProviderFailure, runtimeProposalCandidates } from "../dist/evaluate-ai.js";
 import { OpenProjectClient, workPackageChangesApplied } from "../dist/openproject.js";
 import { explicitWorkPackageId, lexicalTitleSimilarity, OpenProjectRag, resolveProposalTarget, resolveProposedAction } from "../dist/rag.js";
 
-test("RAG shadow mode never changes proposal actions", () => {
+test("untracked artifact updates fall back to new work while tracked transitions retain their action", () => {
 	assert.equal(resolveProposedAction("create", false), "create");
 	assert.equal(resolveProposedAction("create", true), "create");
-	assert.equal(resolveProposedAction("update", false), "no_action");
+	assert.equal(resolveProposedAction("update", false), "create");
 	assert.equal(resolveProposedAction("complete", true), "complete");
 });
 
-test("RAG never converts actions and requires a target for existing work", () => {
-	assert.equal(resolveProposedAction("update", false), "no_action");
+test("completion and reopen require targets while targetless updates become create proposals", () => {
+	assert.equal(resolveProposedAction("update", false), "create");
 	assert.equal(resolveProposedAction("complete", false), "no_action");
 	assert.equal(resolveProposedAction("reopen", true), "reopen");
+});
+
+test("AI evaluation retries transient provider failures but not deterministic access failures", () => {
+	assert.equal(providerFailureCategory(new Error("azure:task-extractor 403: forbidden")), "http_403");
+	assert.equal(retryableProviderFailure(new Error("azure:task-extractor 403: forbidden")), false);
+	assert.equal(retryableProviderFailure(new Error("azure:task-extractor 429: throttled")), true);
+	assert.equal(retryableProviderFailure(new Error("azure:task-extractor 503: unavailable")), true);
+	assert.equal(providerFailureCategory(new TypeError("fetch failed")), "network_error");
+	assert.equal(retryableProviderFailure(new TypeError("fetch failed")), true);
 });
 
 test("exact OpenProject references are resolved without semantic phrase matching", () => {
@@ -32,11 +41,50 @@ test("an invalid explicit target never falls back to a semantic match", async ()
 		projectId: 7,
 		ragMode: "review",
 		suggestedMatch: { workPackageId: 99, similarity: 0.9 },
-		workPackage: async id => ({ id, subject: "Other", lockVersion: 1, project: { id: 8 }, _links: {} }),
+		workPackage: async () => { throw new Error("not found"); },
 	});
 	assert.equal(result.action, "no_action");
 	assert.equal(result.match, undefined);
 	assert.equal(result.target, undefined);
+});
+
+test("an explicit target may replace the channel default project", async () => {
+	const result = await resolveProposalTarget({
+		action: "update", sourceTexts: ["Update task #42"], openProjectBaseUrl: "https://projects.example.org",
+		projectId: 7, ragMode: "off", workPackage: async id => ({ id, subject: "Other project", lockVersion: 1, project: { id: 8 }, _links: {} }),
+	});
+	assert.equal(result.action, "update");
+	assert.equal(result.projectId, 8);
+});
+
+test("source lineage turns a clarification into a tracked update", async () => {
+	const result = await resolveProposalTarget({
+		action: "create",
+		sourceTexts: ["Clarify the schema requirements"],
+		openProjectBaseUrl: "https://projects.example.org",
+		projectId: 7,
+		ragMode: "off",
+		sourceLinkedTargetId: 42,
+		workPackage: async id => ({ id, subject: "Implement schema", lockVersion: 3, project: { id: 9 }, _links: {} }),
+	});
+	assert.equal(result.action, "update");
+	assert.equal(result.projectId, 9);
+	assert.equal(result.match.workPackageId, 42);
+});
+
+test("an explicit reference overrides source lineage and a generated create action", async () => {
+	const result = await resolveProposalTarget({
+		action: "create",
+		sourceTexts: ["Apply this correction to task #99"],
+		openProjectBaseUrl: "https://projects.example.org",
+		projectId: 7,
+		ragMode: "off",
+		sourceLinkedTargetId: 42,
+		workPackage: async id => ({ id, subject: "Explicit target", lockVersion: 3, project: { id: 10 }, _links: {} }),
+	});
+	assert.equal(result.action, "update");
+	assert.equal(result.projectId, 10);
+	assert.equal(result.match.workPackageId, 99);
 });
 
 test("OpenProject work packages follow HAL pagination beyond the first page", async () => {
@@ -181,11 +229,11 @@ test("RAG sync includes category projects configured in the database and records
 	const rag = new OpenProjectRag(
 		{ OPENPROJECT_RAG_MODE: "shadow", categoryProjects: { a: 10 }, teamRoles: { role: { projectId: 20 } } },
 		db,
-		{ workPackages: async projectId => { requestedProjects.push(projectId); return []; } },
+		{ projects: async () => [{ id: 40 }], workPackages: async projectId => { requestedProjects.push(projectId); return []; } },
 		{ enabled: true },
 	);
-	assert.deepEqual(await rag.sync(), { indexed: 0, projects: 3 });
-	assert.deepEqual(requestedProjects.sort((a, b) => a - b), [10, 20, 30]);
+	assert.deepEqual(await rag.sync(), { indexed: 0, projects: 4 });
+	assert.deepEqual(requestedProjects.sort((a, b) => a - b), [10, 20, 30, 40]);
 	assert.deepEqual(syncStates, [null]);
 });
 
@@ -214,18 +262,21 @@ test("RAG combines semantic candidates with lexical title matches", async () => 
 
 test("AI evaluator uses production grounding and target semantics for every action", () => {
 	const candidate = {
-		work_item_key: "task", proposed_action: "update", automatic_eligibility: "eligible", content_intent: "update_note",
+		title: "Update task", description: "Apply the update", evidence: "Update it",
+		work_item_key: "task", proposed_action: "update", content_intent: "update_note",
 		metadata_change_fields: [], assignee_alias: null, start_date: null, due_date: null, priority_name: null,
 		size_name: null, estimated_hours: null, source_message_ids: ["m1"], relevant_attachment_ids: [],
 	};
+	const eligible = {
+		candidate_index: 0, has_activated_specific_work: true, has_remaining_work_or_trackable_transition: true,
+		is_durable: true, is_decision_ready: true, sensitivity: "safe", supporting_source_message_ids: ["m1"],
+	};
 	const messages = [{ id: "m1", authorAlias: "USER_1", text: "Update it", timestamp: "2026-07-16T00:00:00Z", priority: true }];
-	assert.deepEqual(runtimeProposalCandidates([candidate], messages), []);
-	assert.deepEqual(runtimeProposalCandidates([candidate], messages, { availableTargetSourceMessageIds: [["m1"]] }), [candidate]);
-	assert.deepEqual(runtimeProposalCandidates([{ ...candidate, source_message_ids: ["other"] }], messages), []);
-	assert.deepEqual(runtimeProposalCandidates([{ ...candidate, automatic_eligibility: "ineligible" }], messages, { availableTargetSourceMessageIds: [["m1"]] }), []);
-	assert.deepEqual(runtimeProposalCandidates([{ ...candidate, automatic_eligibility: "ineligible" }], messages, { availableTargetSourceMessageIds: [["m1"]] }, "manual"), [
-		{ ...candidate, automatic_eligibility: "ineligible" },
-	]);
+	assert.deepEqual(runtimeProposalCandidates([candidate], messages, {}, "automatic", [eligible]), [candidate]);
+	assert.deepEqual(runtimeProposalCandidates([candidate], messages, { availableTargetSourceMessageIds: [["m1"]] }, "automatic", [eligible]), [candidate]);
+	assert.deepEqual(runtimeProposalCandidates([{ ...candidate, source_message_ids: ["other"] }], messages, {}, "automatic", [eligible]), []);
+	assert.deepEqual(runtimeProposalCandidates([candidate], messages, { availableTargetSourceMessageIds: [["m1"]] }, "automatic", [{ ...eligible, is_durable: false }]), []);
+	assert.deepEqual(runtimeProposalCandidates([candidate], messages, {}, "manual"), [candidate]);
 });
 
 test("AI evaluator corpus accepts expected proposal lists", () => {

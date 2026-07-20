@@ -8,6 +8,7 @@ export function resolveProposedAction(
 	hasTarget: boolean,
 ) {
 	if (action === "create") return "create" as const;
+	if (action === "update" && !hasTarget) return "create" as const;
 	return hasTarget ? action : "no_action" as const;
 }
 
@@ -43,17 +44,19 @@ export async function resolveProposalTarget(options: {
 	projectId?: number;
 	ragMode: IntegrationConfig["OPENPROJECT_RAG_MODE"];
 	suggestedMatch?: TargetMatch;
+	sourceLinkedTargetId?: number;
 	workPackage: (id: number) => Promise<WorkPackage>;
 }) {
-	if (options.action === "create") return { action: "create" as const, projectId: options.projectId };
 	const explicitTargetId = explicitWorkPackageId(options.sourceTexts, options.openProjectBaseUrl);
+	if (options.action === "create" && !options.sourceLinkedTargetId && !explicitTargetId) return { action: "create" as const, projectId: options.projectId };
 	let match: TargetMatch | undefined;
 	let target: WorkPackage | undefined;
 	let projectId = options.projectId;
-	if (explicitTargetId !== undefined) {
-		target = await options.workPackage(explicitTargetId).catch(() => undefined);
+	const authoritativeTargetId = explicitTargetId ?? options.sourceLinkedTargetId;
+	if (authoritativeTargetId !== undefined) {
+		target = await options.workPackage(authoritativeTargetId).catch(() => undefined);
 		const targetProjectId = workPackageProjectId(target);
-		if (target && targetProjectId && (!projectId || targetProjectId === projectId)) {
+		if (target && targetProjectId) {
 			match = { workPackageId: target.id, similarity: 1 };
 			projectId = targetProjectId;
 		} else {
@@ -70,7 +73,11 @@ export async function resolveProposalTarget(options: {
 			projectId = targetProjectId;
 		}
 	}
-	return { action: resolveProposedAction(options.action, Boolean(target)), projectId, match, target };
+	const requestedAction = authoritativeTargetId && options.action === "create" ? "update" : options.action;
+	const action = authoritativeTargetId !== undefined && !target
+		? "no_action" as const
+		: resolveProposedAction(requestedAction, Boolean(target));
+	return { action, projectId, match, target };
 }
 
 function descriptionOf(workPackage: WorkPackage) {
@@ -112,6 +119,7 @@ export class OpenProjectRag {
 		if (!this.enabled) return { indexed: 0 };
 		try {
 			const projectIds = new Set([
+				...(await this.openProject.projects()).map(project => project.id),
 				...Object.values(this.config.categoryProjects),
 				...Object.values(this.config.teamRoles).map(mapping => mapping.projectId),
 				...await this.db.categoryProjectIds(),

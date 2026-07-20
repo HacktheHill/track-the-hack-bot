@@ -158,8 +158,8 @@ test("overlapping active proposals deduplicate similar generated titles", async 
 	const db = databaseWithPool({
 		async query(sql) {
 			queries.push(sql);
-			if (sql.includes("SELECT id,title FROM task_proposals")) {
-				return { rowCount: 1, rows: [{ id: "existing", title: "Update sponsorship package wording and layout" }] };
+			if (sql.includes("SELECT id,title,status,work_item_key")) {
+				return { rowCount: 1, rows: [{ id: "existing", title: "Update sponsorship package wording and layout", status: "pending_review", work_item_key: null, source_content_hash: null, revision: 1 }] };
 			}
 			if (sql === "BEGIN" || sql === "COMMIT" || sql.includes("pg_advisory_xact_lock")) return { rowCount: 0, rows: [] };
 			throw new Error(`Unexpected query: ${sql}`);
@@ -168,9 +168,40 @@ test("overlapping active proposals deduplicate similar generated titles", async 
 	assert.deepEqual(await db.createProposal({
 		channelId: "channel", title: "Revise sponsorship package wording and layout", description: "Apply edits",
 		sourceMessageIds: ["message"], modelDeployment: "model",
-	}), { id: "existing", reused: true });
+	}), { id: "existing", reused: true, revised: false });
 	assert.equal(queries.some(sql => sql.includes("INSERT INTO task_proposals")), false);
 	assert.equal(queries.some(sql => sql.includes("expires_at > now()")), true);
+});
+
+test("a clarification revises the matching pending work item instead of creating another proposal", async () => {
+	const queries = [];
+	const db = databaseWithPool({
+		async query(sql, values) {
+			queries.push({ sql, values });
+			if (sql.includes("SELECT id,title,status,work_item_key")) return {
+				rowCount: 1,
+				rows: [{ id: "existing", title: "Update schema", status: "pending_review", work_item_key: "prisms-schema", source_content_hash: "old", revision: 1 }],
+			};
+			if (sql.includes("UPDATE task_proposals SET title=")) return { rowCount: 1, rows: [{ revision: 2 }] };
+			if (sql === "BEGIN" || sql === "COMMIT" || sql.includes("pg_advisory_xact_lock") || sql.includes("INSERT INTO task_proposal_revisions")) return { rowCount: 1, rows: [] };
+			throw new Error(`Unexpected query: ${sql}`);
+		},
+	});
+	assert.deepEqual(await db.createProposal({
+		channelId: "channel", title: "Update Prisms schema", description: "Use the clarified fields",
+		sourceMessageIds: ["clarification"], sourceLinks: ["https://discord/clarification"], modelDeployment: "model",
+		workItemKey: "prisms-schema", sourceContentHash: "new", initialSnapshot: { title: "Update Prisms schema" },
+		projectId: 8, assigneeDiscordId: "new-owner", accountableDiscordId: "accountable", dueDate: "2026-08-01",
+		action: "update", targetWorkPackageId: 42, targetLockVersion: 5,
+		metadataPatch: { dueDate: "2026-08-01" }, contentOperation: "postComment", contentMarkdown: "Clarified fields",
+	}), { id: "existing", reused: true, revised: true });
+	const revision = queries.find(({ sql }) => sql.includes("source_message_ids=ARRAY"));
+	assert.equal(Boolean(revision), true);
+	assert.match(revision.sql, /assignee_discord_id=\$11/);
+	assert.match(revision.sql, /content_operation=\$30/);
+	assert.deepEqual(revision.values.slice(9, 16), [8, "new-owner", "accountable", null, null, null, "2026-08-01"]);
+	assert.deepEqual(revision.values.slice(24, 31), ["update", 42, 5, 1, '{"dueDate":"2026-08-01"}', "postComment", "Clarified fields"]);
+	assert.equal(queries.some(({ sql }) => sql.includes("'edit'")), true);
 });
 
 test("proposal insertion and its initial revision commit atomically", async () => {
@@ -216,23 +247,32 @@ test("reviewers can safely retarget a create proposal as an update", async () =>
 	assert.deepEqual(updated.values, ["proposal", 42, 3, "{}", "postComment", "## Update\n\n- Revise it.", 7]);
 });
 
-test("proposal submission and completion persist timing and correction metadata", async () => {
+test("proposal creation finalizes status, audit, and reviewed snapshot atomically", async () => {
 	const queries = [];
-	const db = databaseWithPool({
+	const client = {
 		async query(sql, values) {
 			queries.push({ sql, values });
-			return { rowCount: 1, rows: [{ id: "proposal" }] };
+			if (sql.includes("UPDATE task_proposals")) return { rowCount: 1, rows: [{ revision: 2 }] };
+			return { rowCount: null, rows: [] };
 		},
-	});
-	assert.equal(await db.claimProposal("proposal", "reviewer"), true);
+		release() {},
+	};
+	const db = databaseWithPool({ async connect() { return client; } });
 	const corrections = {
 		title: true, description: false, project: false, assignee: false, accountable: false,
 		priority: false, size: false, startDate: false, dueDate: true, estimate: false,
 	};
-	await db.markProposalCreated("proposal", "reviewer", 42, "confirmation", corrections);
-	assert.match(queries[0].sql, /review_started_at=COALESCE/);
+	await db.finalizeProposalCreation({
+		id: "proposal", reviewerId: "reviewer", workPackageId: 42,
+		confirmationMessageId: "confirmation", corrections, finalSnapshot: { title: "Reviewed" },
+	});
+	assert.equal(queries[0].sql, "BEGIN");
 	assert.match(queries[1].sql, /review_outcome='approved'/);
+	assert.match(queries[1].sql, /revision=revision \+ 1/);
 	assert.deepEqual(queries[1].values[4], corrections);
+	assert.match(queries[2].sql, /task_audit_log/);
+	assert.match(queries[3].sql, /task_proposal_revisions/);
+	assert.equal(queries[4].sql, "COMMIT");
 });
 
 test("existing-task proposal finalization commits status, audit, and revision together", async () => {
@@ -275,9 +315,22 @@ test("extraction events retain structured metrics but no message content", async
 		inputSnapshot: [{ id: "message", text: "minimized" }],
 		messageAssessments: [{ message_id: "message", relevance: "relevant" }],
 		decision: { outcome: "proposal" },
+		proposalIds: ["00000000-0000-4000-8000-000000000001"],
 	});
 	assert.match(inserted.sql, /ai_extraction_events/);
-	assert.deepEqual(inserted.values, ["automatic", "proposal", "model", 1, 250, '{"totalTokens":123}', null, '[{"id":"message","text":"minimized"}]', '[{"message_id":"message","relevance":"relevant"}]', '{"outcome":"proposal"}']);
+	assert.match(inserted.sql, /schema_version/);
+	assert.match(inserted.sql, /'v3'/);
+	assert.match(inserted.sql, /task_proposal_extractions/);
+	assert.deepEqual(inserted.values, ["automatic", "proposal", "model", 1, 250, '{"totalTokens":123}', null, '[{"id":"message","text":"minimized"}]', '[{"message_id":"message","relevance":"relevant"}]', '{"outcome":"proposal"}', ["00000000-0000-4000-8000-000000000001"]]);
+});
+
+test("dismissed proposals require and persist a structured reason", async () => {
+	let query;
+	const db = databaseWithPool({ async query(sql, values) { query = { sql, values }; return { rowCount: 1, rows: [] }; } });
+	await assert.rejects(db.setProposalStatus("proposal", "dismissed", "reviewer"), /dismissal reason is required/);
+	assert.equal(await db.setProposalStatus("proposal", "dismissed", "reviewer", "question_or_announcement"), true);
+	assert.match(query.sql, /dismissal_reason=\$4/);
+	assert.deepEqual(query.values, ["proposal", "dismissed", "reviewer", "question_or_announcement"]);
 });
 
 test("proposal delivery failures become retryable failed proposals", async () => {
@@ -287,6 +340,25 @@ test("proposal delivery failures become retryable failed proposals", async () =>
 	assert.match(query.sql, /status='failed'/);
 	assert.match(query.sql, /delivery_failed/);
 	assert.deepEqual(query.values, ["proposal", "Discord rejected the message"]);
+});
+
+test("proposal review cards attach, clear idempotently, and remain discoverable for terminal cleanup", async () => {
+	const queries = [];
+	const db = databaseWithPool({
+		async query(sql, values) {
+			queries.push({ sql, values });
+			if (sql.includes("SELECT id,channel_id,review_message_id")) {
+				return { rowCount: 1, rows: [{ id: "proposal", channel_id: "channel", review_message_id: "message" }] };
+			}
+			return { rowCount: 1, rows: [] };
+		},
+	});
+	assert.equal(await db.setProposalReviewMessage("proposal", "message"), true);
+	assert.equal(await db.clearProposalReviewMessage("proposal", "message"), true);
+	assert.deepEqual(await db.terminalProposalReviewMessages(), [{ id: "proposal", channel_id: "channel", review_message_id: "message" }]);
+	assert.match(queries[0].sql, /status IN \('pending_review','creating'\)/);
+	assert.match(queries[1].sql, /review_message_id=\$2/);
+	assert.match(queries[2].sql, /status IN \('created','dismissed','duplicate','failed','superseded','needs_reconciliation'\)/);
 });
 
 test("proposal claims use an expiring lease", async () => {

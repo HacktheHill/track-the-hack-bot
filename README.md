@@ -116,12 +116,13 @@ synchronization, and help remain available while task interactions are disabled.
 and category mappings from the environment. Runtime migrations are disabled by
 default and can be enabled explicitly for local development with
 `OPENPROJECT_RUN_MIGRATIONS=true`. Organizers can then maintain those
-mappings with `/task link-user` and `/task configure-category`. Members can
-access projects associated with their channel category or configured team
-roles. `OPENPROJECT_BLOCKED_CHANNEL_IDS` remains supported for exact channel
-blocks. `OPENPROJECT_EXCLUDED_CHANNEL_IDS` accepts both channel and category
-IDs; category IDs exclude all descendant channels and are used for the External
-category.
+mappings with `/task link-user` and `/task configure-category`. Internal
+Organizer channels can select any active project visible to the OpenProject
+integration account; category and team mappings provide defaults rather than
+authorization boundaries. `OPENPROJECT_BLOCKED_CHANNEL_IDS` remains supported
+for exact channel blocks. `OPENPROJECT_EXCLUDED_CHANNEL_IDS` accepts both
+channel and category IDs; category IDs exclude all descendant channels and are
+used for the External category.
 
 The bot also reconciles unmapped Organizer members with assignable active or
 invited OpenProject users at startup and daily. It auto-links only unique exact
@@ -159,7 +160,8 @@ Manual AI drafting requires a configured Azure OpenAI endpoint/deployment.
 Automatic extraction is controlled separately by `OPENPROJECT_AUTOMATION_MODE`:
 
 - `off` disables automatic extraction.
-- `shadow` stores proposals without posting review cards.
+- `shadow` records extraction and gate decisions without storing proposals or
+  posting review cards.
 - `review` posts human-review cards after the configured channel idle period.
 
 AI extraction runs in every channel except those listed in the blocked or
@@ -180,9 +182,10 @@ gate. The automatic eligibility assessment is still recorded so manual cases can
 be used to measure automatic false negatives.
 
 Review outcomes store timestamps, status counters, token/latency values,
-per-field edits, minimized inputs, proposal decisions, candidate eligibility and
-lifecycle assessments, and revisions for 90 days. Raw Discord transcripts are
-never copied into task descriptions.
+per-field edits, bounded minimized inputs, proposal decisions, structured
+automatic-gate assessments, and revisions for 90 days. Pending proposals are
+revised when their cited messages or attachments change. Raw Discord transcripts
+are never copied into task descriptions.
 Production uses `review` mode: AI may post a proposal, but only a permitted
 human reviewer can create or dismiss the task.
 
@@ -211,26 +214,42 @@ existing description has no substantive content or the discussion explicitly
 requests a rewrite. Every mutation checks the OpenProject `lockVersion`, and
 correlated comments are deduplicated across retries.
 
-AI-generated descriptions use Markdown headings and bullet lists when the
-discussion contains enough structure. Sparse discussions remain concise rather
-than receiving invented objectives, acceptance criteria, or notes.
+AI-generated descriptions keep cohesive prose compact and use Markdown bullets
+for independently actionable requirements or genuine lists. Sparse discussions
+remain concise rather than receiving invented headings, objectives, acceptance
+criteria, or notes.
 
 Azure OpenAI authentication uses managed identity rather than an API key. The
 bot bounds the context and total image count, aliases Discord identities,
-redacts common credentials and contact details, and rejects matching sensitive
-text before making an Azure request. Image contents cannot be screened before
-they are sent to Azure. For a manually requested draft, the requester can explicitly
-override a false positive for that one minimized request; the approval expires
-after ten minutes and is never available to automatic extraction. This reduces
-exposure but is not a guarantee. Evaluate extraction on representative
-conversations before enabling it in production.
+redacts high-confidence credential values and contact details, and rejects
+unredacted secret values before making an Azure request. A second structured AI
+stage classifies contextual sensitivity after local redaction; sensitive or
+uncertain candidates do not become automatic proposals. Image contents cannot
+be screened before they are sent to Azure. For a manually requested draft, the
+requester can explicitly proceed after a local block or contextual classification
+for that one minimized request; the approval expires after ten minutes and is
+never available to automatic extraction. This reduces exposure but is not a
+guarantee. Evaluate extraction on representative conversations before enabling
+it in production.
 
 Run an offline evaluation against a private pseudonymized JSONL corpus outside
 the repository:
 
 ```bash
-npm run evaluate:ai -- /secure/path/discord-windows.jsonl
+npm run export:ai-corpus -- .private/reviewed-corpus.jsonl
+npm run evaluate:ai -- .private/reviewed-corpus.jsonl
 ```
+
+The exporter builds an initial corpus from normal proposal reviews. Accepted
+manual extractions are evaluated in automatic mode as examples the automatic
+workflow should detect. Accepted automatic proposals, reviewer corrections, and
+clear negative dismissal reasons are also used. Dismissal asks the reviewer to
+choose a reason; sensitive, ambiguous, duplicate-only, and otherwise
+under-specified outcomes are excluded rather than guessed. New extraction events
+are linked directly to their proposals, so only reviews collected after the
+corresponding database migration can be exported reliably. Run the exporter only
+in the private runtime with database access and keep its mode-0600 output outside
+source control.
 
 Each line contains `id`, `mode`, `messages`, and `expected.proposals`. Every
 expected proposal includes `action`, `titleIncludes`, and `sourceMessageIds`,

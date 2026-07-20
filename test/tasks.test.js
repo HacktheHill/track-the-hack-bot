@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, taskCommand, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
+import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, removeProposalReviewCard, taskCommand, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
 import { normalizeTaskTitle, OpenProjectClient, titlesLikelyDuplicate } from "../dist/openproject.js";
 
 test("task defaults start today and use the configured due offset", () => {
@@ -9,6 +9,26 @@ test("task defaults start today and use the configured due offset", () => {
 		dueDate: "2026-07-20",
 	});
 	assert.equal(defaultTaskDates(new Date("2026-07-13T00:00:00Z"), false, 0).startDate, undefined);
+});
+
+test("project access is based on the active integration catalog rather than channel or team scope", () => {
+	const projects = [{ id: 3 }, { id: 7 }, { id: 18 }];
+	assert.equal(projectAccessAllowed(3, projects), true);
+	assert.equal(projectAccessAllowed(18, projects), true);
+	assert.equal(projectAccessAllowed(99, projects), false);
+});
+
+test("terminal proposal cleanup deletes the public review card and clears its pointer", async () => {
+	let deleted = false;
+	let cleared;
+	const client = { channels: { fetch: async () => ({
+		isTextBased: () => true,
+		messages: { fetch: async () => ({ delete: async () => { deleted = true; }, edit: async () => {} }) },
+	}) } };
+	const db = { clearProposalReviewMessage: async (id, messageId) => { cleared = [id, messageId]; } };
+	assert.equal(await removeProposalReviewCard(client, db, { id: "proposal", channel_id: "channel", review_message_id: "message" }), true);
+	assert.equal(deleted, true);
+	assert.deepEqual(cleared, ["proposal", "message"]);
 });
 
 test("Today and Tomorrow use Eastern Time rather than UTC", () => {
@@ -93,6 +113,14 @@ test("creation metadata uses explicit deadline horizons", () => {
 		priorities: planningOptions.priorities, sizes: planningOptions.sizes,
 	});
 	assert.equal(inferred.priority?.name, "High");
+});
+
+test("prose punctuation does not inflate inferred task size", () => {
+	const inferred = inferCreationMetadata({
+		title: "Review schema", description: "Review the schema. Document the result. Share it with the team.",
+		priorities: planningOptions.priorities, sizes: planningOptions.sizes,
+	});
+	assert.equal(inferred.size?.value, "🐇 Small");
 });
 
 test("task creation pings explicit owners once", () => {
@@ -189,7 +217,7 @@ test("AI task descriptions retain URLs from cited messages", () => {
 		{ id: "followup", authorAlias: "USER_2", text: "Created: https://docs.google.com/spreadsheets/d/example", timestamp: "2026-07-06T21:59:00Z" },
 	], ["primary", "followup"]);
 	assert.match(description, /## References/);
-	assert.match(description, /- Create the outreach tracker\./);
+	assert.match(description, /^Create the outreach tracker\./);
 	assert.match(description, /https:\/\/docs\.google\.com\/spreadsheets\/d\/example/);
 });
 

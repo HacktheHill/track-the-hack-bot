@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { config as loadDotEnv } from "dotenv";
 import { z } from "zod";
-import { automaticCandidateEligible, AzureTaskExtractor, mergeRelatedTaskCandidates, StructuredOutputError, type ExtractedTasks, type MinimizedMessage } from "./azure-openai.js";
+import { automaticCandidateEligible, AzureTaskExtractor, mergeRelatedTaskCandidates, StructuredOutputError, type AutomaticCandidateAssessment, type ExtractedTasks, type MinimizedMessage } from "./azure-openai.js";
 import type { IntegrationConfig } from "./config.js";
 import { resolveProposedAction } from "./rag.js";
 import { taskReferencesAreValid } from "./task-proposals.js";
@@ -65,20 +65,25 @@ export function runtimeProposalCandidates(
 	messages: MinimizedMessage[],
 	routing: { availableTargetSourceMessageIds?: string[][] } = {},
 	mode: "manual" | "automatic" = "automatic",
+	automaticAssessments: AutomaticCandidateAssessment[] = [],
 ) {
+	const grounded = runtimeGroundedCandidates(tasks, messages);
+	const eligible = mode === "automatic"
+		? grounded.filter((_, index) => automaticCandidateEligible(automaticAssessments[index]))
+		: grounded;
+	return eligible.filter(task => {
+		const targetAvailable = routing.availableTargetSourceMessageIds?.some(ids => ids.every(id => task.source_message_ids.includes(id))) ?? false;
+		return resolveProposedAction(task.proposed_action, targetAvailable) !== "no_action";
+	});
+}
+
+export function runtimeGroundedCandidates(tasks: ExtractedTask[], messages: MinimizedMessage[]) {
 	const validMessageIds = new Set(messages.map(message => message.id));
 	const focalMessageIds = new Set(messages
 		.filter(message => message.contextRole === "primary" || message.priority)
 		.map(message => message.id));
 	const validAttachmentIds = new Set(messages.flatMap(message => (message.attachments ?? []).map(attachment => attachment.id)));
-	const grounded = tasks.filter(task => {
-		if (mode === "automatic" && !automaticCandidateEligible(task)) return false;
-		return taskReferencesAreValid(task, validMessageIds, focalMessageIds, validAttachmentIds);
-	});
-	return mergeRelatedTaskCandidates(grounded).filter(task => {
-		const targetAvailable = routing.availableTargetSourceMessageIds?.some(ids => ids.every(id => task.source_message_ids.includes(id))) ?? false;
-		return resolveProposedAction(task.proposed_action, targetAvailable) !== "no_action";
-	});
+	return mergeRelatedTaskCandidates(tasks.filter(task => taskReferencesAreValid(task, validMessageIds, focalMessageIds, validAttachmentIds)));
 }
 
 function ratio(numerator: number, denominator: number) {
@@ -95,6 +100,21 @@ function percent(value: number) {
 
 function sleep(milliseconds: number) {
 	return new Promise(resolveSleep => setTimeout(resolveSleep, milliseconds));
+}
+
+export function providerFailureCategory(error: unknown) {
+	if (error instanceof StructuredOutputError) return "invalid_output";
+	const message = error instanceof Error ? error.message : String(error);
+	const status = message.match(/\s([45]\d\d):/)?.[1];
+	if (status) return `http_${status}`;
+	if (error instanceof Error && error.name === "AbortError") return "timeout";
+	if (error instanceof TypeError) return "network_error";
+	return "provider_error";
+}
+
+export function retryableProviderFailure(error: unknown) {
+	const category = providerFailureCategory(error);
+	return category === "timeout" || category === "network_error" || ["http_408", "http_409", "http_425", "http_429", "http_500", "http_502", "http_503", "http_504"].includes(category);
 }
 
 async function main() {
@@ -126,6 +146,7 @@ async function main() {
 	let totalTokens = 0;
 	let providerRetries = 0;
 	let lastRequestAt = 0;
+	const providerErrorCategories: Record<string, number> = {};
 	const cases: Array<Record<string, unknown>> = [];
 
 	for (const window of windows) {
@@ -139,7 +160,7 @@ async function main() {
 					extraction = await extractor.extract(window.messages as MinimizedMessage[], { mode: window.mode, metadata: window.metadata });
 					break;
 				} catch (error) {
-					if (error instanceof StructuredOutputError || attempt === env.AI_EVAL_PROVIDER_RETRIES) throw error;
+					if (error instanceof StructuredOutputError || !retryableProviderFailure(error) || attempt === env.AI_EVAL_PROVIDER_RETRIES) throw error;
 					providerRetries++;
 					await sleep(Math.max(env.AI_EVAL_MIN_INTERVAL_MS, 1000) * (attempt + 1));
 				}
@@ -149,7 +170,18 @@ async function main() {
 			totalLatencyMs += extraction.latencyMs;
 			latencySamples++;
 			totalTokens += extraction.usage?.totalTokens ?? 0;
-			const predicted = runtimeProposalCandidates(extraction.result.tasks, window.messages as MinimizedMessage[], window.routing, window.mode);
+			const grounded = runtimeGroundedCandidates(extraction.result.tasks, window.messages as MinimizedMessage[]);
+			let assessments: AutomaticCandidateAssessment[] = [];
+			if (window.mode === "automatic" && grounded.length) {
+				const waitForGate = Math.max(0, env.AI_EVAL_MIN_INTERVAL_MS - (Date.now() - lastRequestAt));
+				if (waitForGate) await sleep(waitForGate);
+				lastRequestAt = Date.now();
+				const gate = await extractor.assessAutomaticCandidates(extraction.inputMessages, grounded);
+				assessments = gate.assessments;
+				totalLatencyMs += gate.latencyMs;
+				totalTokens += gate.usage?.totalTokens ?? 0;
+			}
+			const predicted = runtimeProposalCandidates(extraction.result.tasks, window.messages as MinimizedMessage[], window.routing, window.mode, assessments);
 			const unmatched = new Set(predicted.map((_, index) => index));
 			let matched = 0;
 			for (const expected of window.expected.proposals) {
@@ -178,9 +210,13 @@ async function main() {
 			cases.push({ id: window.id, expectedProposals: window.expected.proposals.length, predictedProposals: predicted.length, matchedProposals: matched, validOutput: true });
 		} catch (error) {
 			if (error instanceof StructuredOutputError) invalidOutputs++;
-			else providerErrors++;
+			else {
+				providerErrors++;
+				const category = providerFailureCategory(error);
+				providerErrorCategories[category] = (providerErrorCategories[category] ?? 0) + 1;
+			}
 			falseNegatives += window.expected.proposals.length;
-			cases.push({ id: window.id, expectedProposals: window.expected.proposals.length, predictedProposals: 0, matchedProposals: 0, validOutput: false, errorType: error instanceof StructuredOutputError ? "invalid_output" : "provider_error" });
+			cases.push({ id: window.id, expectedProposals: window.expected.proposals.length, predictedProposals: 0, matchedProposals: 0, validOutput: false, errorType: providerFailureCategory(error) });
 		}
 	}
 
@@ -201,6 +237,7 @@ async function main() {
 			providerRetries,
 		},
 		counts: { truePositives, falsePositives, falseNegatives },
+		providerErrorCategories,
 		targets: { proposalPrecision: 0.95, ownerAccuracy: 0.90, deadlineAccuracy: 0.90, validOutputRate: 0.99 },
 		cases,
 	};
@@ -213,16 +250,18 @@ async function main() {
 		"",
 		"| Metric | Result | Target |",
 		"| --- | ---: | ---: |",
-		`| Proposal precision | ${percent(report.metrics.proposalPrecision)} | 95% |`,
-		`| Proposal recall | ${percent(report.metrics.proposalRecall)} | — |`,
-		`| Owner accuracy | ${percent(report.metrics.ownerAccuracy)} | 90% |`,
-		`| Deadline accuracy | ${percent(report.metrics.deadlineAccuracy)} | 90% |`,
+		`| Proposal precision | ${validOutputs ? percent(report.metrics.proposalPrecision) : "N/A"} | 95% |`,
+		`| Proposal recall | ${validOutputs ? percent(report.metrics.proposalRecall) : "N/A"} | — |`,
+		`| Owner accuracy | ${validOutputs ? percent(report.metrics.ownerAccuracy) : "N/A"} | 90% |`,
+		`| Deadline accuracy | ${validOutputs ? percent(report.metrics.deadlineAccuracy) : "N/A"} | 90% |`,
 		`| Valid structured output | ${percent(report.metrics.validOutputRate)} | 99% |`,
 		`| Average latency | ${Math.round(report.metrics.averageLatencyMs)} ms | — |`,
 		`| Total tokens | ${report.metrics.totalTokens} | — |`,
 		`| Provider retries | ${report.metrics.providerRetries} | — |`,
 		"",
 		`Invalid outputs: ${invalidOutputs}; provider errors: ${providerErrors}.`,
+		providerErrors ? `Provider error categories: ${Object.entries(providerErrorCategories).map(([category, count]) => `${category}=${count}`).join(", ")}.` : "",
+		!validOutputs ? "\n> Evaluation incomplete: no valid model outputs were produced. Quality metrics are unavailable; fix provider access before using this report for a rollout decision." : "",
 		windows.length < 100 ? "\n> Warning: this corpus has fewer than the planned 100 representative windows." : "",
 	].join("\n");
 	await writeFile(`${outputPrefix}.json`, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });

@@ -77,12 +77,21 @@ OpenAI resource, such as **Cognitive Services OpenAI User**. Registry pull and
 Key Vault access should likewise be granted only to the identity that needs
 them.
 
-Evaluate at least 100 representative pseudonymized conversation windows and
-record latency, valid-output rate, false-task rate, assignee accuracy, deadline
-accuracy, source-ID accuracy, and token usage. Production may remain in
-`OPENPROJECT_AUTOMATION_MODE=review` while this evaluation improves; every
+Evaluate at least 100 representative pseudonymized conversation windows through
+both extraction and the schema-v3 precision gate. Record per-stage latency and
+tokens, valid-output rate, false-task rate, assignee accuracy, deadline accuracy,
+source-ID accuracy, sensitivity outcomes, and routing accuracy. Start with
+`OPENPROJECT_AUTOMATION_MODE=shadow`, which records extraction and gate telemetry
+without persisting proposals or posting review cards. Move to `review` only after
+the private corpus and retained-event replay meet the rollout targets; every
 proposal still requires a permitted human reviewer and the bot never creates
 tasks automatically. `off` remains the emergency kill switch.
+
+Normal proposal reviews seed the private corpus after migrations have created
+the proposal-to-extraction linkage and dismissal-reason fields. Export them with
+`npm run export:ai-corpus -- /secure/path/reviewed-corpus.jsonl` from a private
+one-off Container Apps Job, then evaluate that file from the same network. Do
+not persist the corpus in the image, logs, repository, or a public artifact.
 
 RAG requires separate Azure OpenAI embedding configuration and the PostgreSQL
 `vector` extension. Set `OPENPROJECT_RAG_MODE=shadow` to synchronize vectors
@@ -95,9 +104,12 @@ Required settings are `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`,
 `AZURE_OPENAI_EMBEDDING_DIMENSIONS`, `OPENPROJECT_RAG_MODE`, and
 `OPENPROJECT_EXCLUDED_CHANNEL_IDS`. The embedding deployment must be separate
 from the chat extraction deployment. RAG proposals use PostgreSQL similarity
-search filtered by OpenProject project and are applied only after a reviewer
-confirms the update; the current `lockVersion` is checked immediately before
-the PATCH.
+catalog synchronization includes every active project visible to the integration
+account, while each similarity lookup remains filtered to its selected project.
+Matches are applied only after a reviewer confirms the update; the current
+`lockVersion` is checked immediately before the PATCH. Internal channel category
+and team mappings choose defaults, not project authorization. Keep the External
+category in `OPENPROJECT_EXCLUDED_CHANNEL_IDS`.
 
 ## Build and deployment workflow
 

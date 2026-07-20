@@ -1,8 +1,9 @@
 import "dotenv/config";
 import pg from "pg";
 import { z } from "zod";
-import { AzureTaskExtractor, SensitiveContentError, type MinimizedMessage } from "./azure-openai.js";
+import { automaticCandidateEligible, AzureTaskExtractor, mergeRelatedTaskCandidates, SensitiveContentError, type MinimizedMessage } from "./azure-openai.js";
 import type { IntegrationConfig } from "./config.js";
+import { taskReferencesAreValid } from "./task-proposals.js";
 
 const { Pool } = pg;
 const replayConfigSchema = z.object({
@@ -66,17 +67,22 @@ async function main() {
 					metadata: row.decision?.extractionMetadata,
 					allowSensitiveContent: row.decision?.extractionOptions?.allowSensitiveContent,
 				});
+				const validMessageIds = new Set(messages.map(message => message.id));
+				const focalMessageIds = new Set(messages.filter(message => message.priority || message.contextRole === "primary").map(message => message.id));
+				const validAttachmentIds = new Set(messages.flatMap(message => (message.attachments ?? []).map(attachment => attachment.id)));
+				const candidates = mergeRelatedTaskCandidates(extraction.result.tasks.filter(task => taskReferencesAreValid(task, validMessageIds, focalMessageIds, validAttachmentIds)));
+				if (candidates.length) await new Promise(resolve => setTimeout(resolve, config.AI_REPLAY_MIN_INTERVAL_MS));
+				const gate = candidates.length ? await extractor.assessAutomaticCandidates(extraction.inputMessages, candidates) : { assessments: [] };
 				console.log(JSON.stringify({
 					id: row.id,
 					source: row.source,
 					originalOutcome: row.outcome,
 					fidelity,
-					candidates: extraction.result.tasks.map(task => ({
+					candidates: candidates.map((task, index) => ({
 						title: task.title,
 						action: task.proposed_action,
-						automaticEligibility: task.automatic_eligibility,
-						triggerKind: task.trigger_kind,
-						lifecycle: task.lifecycle,
+						automaticEligibility: automaticCandidateEligible(gate.assessments[index]) ? "eligible" : "ineligible",
+						assessment: gate.assessments[index],
 						sourceMessageIds: task.source_message_ids,
 					})),
 				}));
