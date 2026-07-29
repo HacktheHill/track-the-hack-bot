@@ -73,11 +73,13 @@ test("proposal operations use readable metadata labels and values", () => {
 });
 
 test("Markdown composition preserves body sections without rendering source links", () => {
-	const body = "## Objective\n\nShip it.\n\n## References\n\n- https://example.test/reference\n\n## Related links\n\n- https://example.test/related\n\n## Source\n\nHuman-authored source details";
+	const body = "## Objective\n\nShip it.\n\n## References\n\n- https://example.test/reference\n- https://discord.com/channels/1/2/3\n\n## Related links\n\n- [Discussion](https://discord.com/channels/1/2/4)\n- https://example.test/related\n\n## Source\n\nHuman-authored source details";
 	const markdown = composeOpenProjectMarkdown(body, "marker");
 	assert.match(markdown, /## References[\s\S]*https:\/\/example\.test\/reference/);
 	assert.match(markdown, /## Related links[\s\S]*https:\/\/example\.test\/related/);
 	assert.match(markdown, /## Source[\s\S]*Human-authored source details/);
+	assert.equal(markdown.includes("discord.com/channels"), false);
+	assert.match(markdown, /Discussion/);
 	assert.ok(markdown.endsWith("<!-- marker -->"));
 });
 
@@ -129,5 +131,12 @@ test("generated descriptions retain repeated instructions under different headin
 	assert.equal(
 		formatGeneratedTaskDescription("## Mobile\n\n- Verify navigation.\n- Verify navigation.\n\n## Desktop\n\n- Verify navigation."),
 		"## Mobile\n\n- Verify navigation.\n\n## Desktop\n\n- Verify navigation.",
+	);
+});
+
+test("generated descriptions scope repeated nested headings to their parents", () => {
+	assert.equal(
+		formatGeneratedTaskDescription("## Mobile\n\n### Requirements\n\n- Verify navigation.\n\n## Desktop\n\n### Requirements\n\n- Verify navigation."),
+		"## Mobile\n\n### Requirements\n\n- Verify navigation.\n\n## Desktop\n\n### Requirements\n\n- Verify navigation.",
 	);
 });

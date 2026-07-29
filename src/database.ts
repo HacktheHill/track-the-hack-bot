@@ -858,6 +858,7 @@ export class Database {
 			 review_message_id: string | null;
 			 claim_expires_at: string | null;
 			 rag_candidates: ProposalRagCandidate[];
+			 ambiguities: string[];
 		}>("SELECT * FROM task_proposals WHERE id=$1", [id]);
 		const row = result.rows[0];
 		return row ? { ...row, metadata_patch: proposalMetadataPatchSchema.parse(row.metadata_patch ?? {}), metadata_inference: row.metadata_inference ?? {} } : undefined;

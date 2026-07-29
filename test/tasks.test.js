@@ -258,6 +258,7 @@ test("reviewers can retarget a nominated update through its allowlisted menu", a
 		target_work_package_id: 41, title: "Revise prospectus", description: "Apply the revisions",
 		assignee_discord_id: null, priority_id: null, size_href: null, start_date: null, due_date: "2026-08-01",
 		estimated_hours: null, metadata_patch: { dueDate: "2026-08-01" }, content_operation: "postComment",
+		ambiguities: ["Confirm the final deadline"],
 		rag_candidates: [candidate], review_message_id: null,
 	};
 	const interaction = {
@@ -285,6 +286,7 @@ test("reviewers can retarget a nominated update through its allowlisted menu", a
 	assert.deepEqual(retargeted.metadataPatch, { dueDate: "2026-08-01" });
 	assert.deepEqual(edited.allowedMentions, { parse: [] });
 	assert.match(edited.content, /\*\*Proposed comment\*\*\nApply the revisions/);
+	assert.match(edited.content, /Ambiguities: Confirm the final deadline/);
 });
 
 test("proposal content identifies comments and replacement descriptions", () => {
@@ -337,6 +339,12 @@ test("proposal card truncation preserves Markdown boundaries", () => {
 
 	const emphasized = boundedDiscordContent(`${"Context ".repeat(10)}**important ${"detail ".repeat(20)}`, 120);
 	assert.equal((emphasized.match(/\*\*/g) ?? []).length % 2, 0);
+
+	const inlineCode = boundedDiscordContent(`${"Context ".repeat(10)}\`**\` ${"detail ".repeat(20)}`, 120);
+	assert.equal(inlineCode.replace(/\n\n\[Preview truncated\]$/, "").endsWith("**"), false);
+
+	const doubleBackticks = boundedDiscordContent(`${"Context ".repeat(5)}\`\`code ** ${"detail ".repeat(20)}`, 120);
+	assert.match(doubleBackticks, /``\n\n\[Preview truncated\]$/);
 });
 
 test("work package proposal links include the ID and title", () => {
@@ -465,13 +473,32 @@ test("OpenProject creation uploads Discord images and embeds native attachment r
 			projectId: 3, subject: "Ship portal", description: "Complete it",
 			attachments: [{ id: "a1", name: "schema.png", contentType: "image/png", url: "https://cdn.discordapp.com/attachments/1/2/schema.png" }],
 		});
-		const creationPayload = JSON.parse(calls[0].init.body);
+		const creationPayload = JSON.parse(calls.find(call => call.url.endsWith("/form")).init.body);
 		assert.match(creationPayload.description.raw, /!\[schema\.png\]\(attachment:a1-schema\.png\)/);
 		assert.equal(creationPayload.description.raw.includes("cdn.discordapp.com"), false);
 		const upload = calls.find(call => call.init.body instanceof FormData);
 		assert.ok(upload);
 		assert.equal(JSON.parse(await upload.init.body.get("metadata").text()).fileName, "a1-schema.png");
 		assert.equal(upload.init.body.get("file").type, "image/png");
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("OpenProject validates images before creating a work package", async () => {
+	const calls = [];
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init = {}) => {
+		calls.push({ url: String(url), init });
+		return new Response("not an image");
+	};
+	try {
+		const client = new OpenProjectClient({ OPENPROJECT_BASE_URL: "https://project.example", OPENPROJECT_API_KEY: "test" });
+		await assert.rejects(client.createWorkPackage({
+			projectId: 3, subject: "Ship portal", description: "Complete it",
+			attachments: [{ id: "a1", name: "schema.png", url: "https://cdn.discordapp.com/attachments/1/2/schema.png" }],
+		}), /not a supported image/);
+		assert.deepEqual(calls.map(call => call.url), ["https://cdn.discordapp.com/attachments/1/2/schema.png"]);
 	} finally {
 		globalThis.fetch = originalFetch;
 	}

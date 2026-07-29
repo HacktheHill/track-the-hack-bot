@@ -23,6 +23,7 @@ export type WorkPackage = {
 export type Activity = { id: number; comment?: { raw?: string } | null; _links?: Record<string, HalLink> };
 export type OpenProjectAttachmentInput = { id: string; name: string; contentType?: string; url: string };
 type Attachment = { id: number; fileName: string };
+export type PreparedOpenProjectAttachment = OpenProjectAttachmentInput & { fileName: string; bytes: Uint8Array; detectedContentType: string };
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 
 export function openProjectAttachmentFileName(attachment: OpenProjectAttachmentInput) {
@@ -159,17 +160,14 @@ export class OpenProjectClient {
 		return openProjectAttachmentFileName(attachment);
 	}
 
-	private attachmentMarkdown(attachments: readonly OpenProjectAttachmentInput[]) {
-		return attachments.map(attachment => ({ name: attachment.name, fileName: this.attachmentFileName(attachment) }));
+	private attachmentMarkdown(attachments: readonly PreparedOpenProjectAttachment[]) {
+		return attachments.map(attachment => ({ name: attachment.name, fileName: attachment.fileName }));
 	}
 
-	private async uploadAttachments(containerPath: string, attachments: readonly OpenProjectAttachmentInput[]) {
-		if (!attachments.length) return;
-		const existing = await this.collection<Attachment>(`${containerPath}/attachments?pageSize=100`);
-		const existingNames = new Set(existing.map(attachment => attachment.fileName));
+	private async prepareAttachments(attachments: readonly OpenProjectAttachmentInput[]) {
+		const prepared: PreparedOpenProjectAttachment[] = [];
+		let totalPreparedBytes = 0;
 		for (const attachment of attachments) {
-			const fileName = this.attachmentFileName(attachment);
-			if (existingNames.has(fileName)) continue;
 			const sourceUrl = new URL(attachment.url);
 			if (!new Set(["cdn.discordapp.com", "media.discordapp.net"]).has(sourceUrl.hostname)) {
 				throw new OpenProjectRequestError(`Refusing to download an attachment from ${sourceUrl.hostname}.`);
@@ -180,13 +178,49 @@ export class OpenProjectClient {
 			if (Number.isFinite(declaredSize) && declaredSize > MAX_ATTACHMENT_BYTES) {
 				throw new OpenProjectRequestError(`Discord image ${attachment.name} exceeds the 20 MiB upload limit.`);
 			}
-			const bytes = new Uint8Array(await response.arrayBuffer());
-			if (bytes.byteLength > MAX_ATTACHMENT_BYTES) throw new OpenProjectRequestError(`Discord image ${attachment.name} exceeds the 20 MiB upload limit.`);
-			const contentType = detectedImageType(bytes);
-			if (!contentType) throw new OpenProjectRequestError(`Discord attachment ${attachment.name} is not a supported image.`);
+			if (Number.isFinite(declaredSize) && totalPreparedBytes + declaredSize > MAX_ATTACHMENT_BYTES) {
+				throw new OpenProjectRequestError("Discord images exceed the 20 MiB total upload limit.");
+			}
+			if (!response.body) throw new OpenProjectRequestError(`Discord image ${attachment.name} returned no data.`);
+			const chunks: Uint8Array[] = [];
+			let byteLength = 0;
+			for await (const chunk of response.body) {
+				byteLength += chunk.byteLength;
+				if (byteLength > MAX_ATTACHMENT_BYTES) throw new OpenProjectRequestError(`Discord image ${attachment.name} exceeds the 20 MiB upload limit.`);
+				if (totalPreparedBytes + byteLength > MAX_ATTACHMENT_BYTES) throw new OpenProjectRequestError("Discord images exceed the 20 MiB total upload limit.");
+				chunks.push(chunk);
+			}
+			const bytes = new Uint8Array(byteLength);
+			let offset = 0;
+			for (const chunk of chunks) {
+				bytes.set(chunk, offset);
+				offset += chunk.byteLength;
+			}
+			const detectedContentType = detectedImageType(bytes);
+			if (!detectedContentType) throw new OpenProjectRequestError(`Discord attachment ${attachment.name} is not a supported image.`);
+			prepared.push({ ...attachment, fileName: this.attachmentFileName(attachment), bytes, detectedContentType });
+			totalPreparedBytes += byteLength;
+		}
+		return prepared;
+	}
+
+	private async prepareMissingAttachments(containerPath: string, attachments: readonly OpenProjectAttachmentInput[]) {
+		if (!attachments.length) return [];
+		const existing = await this.collection<Attachment>(`${containerPath}/attachments?pageSize=100`);
+		const existingNames = new Set(existing.map(attachment => attachment.fileName));
+		return this.prepareAttachments(attachments.filter(attachment => !existingNames.has(this.attachmentFileName(attachment))));
+	}
+
+	private async uploadAttachments(containerPath: string, attachments: readonly PreparedOpenProjectAttachment[]) {
+		if (!attachments.length) return;
+		const existing = await this.collection<Attachment>(`${containerPath}/attachments?pageSize=100`);
+		const existingNames = new Set(existing.map(attachment => attachment.fileName));
+		for (const attachment of attachments) {
+			const { fileName } = attachment;
+			if (existingNames.has(fileName)) continue;
 			const form = new FormData();
 			form.append("metadata", new Blob([JSON.stringify({ fileName })], { type: "application/json" }));
-			form.append("file", new Blob([bytes], { type: contentType }), fileName);
+			form.append("file", new Blob([Uint8Array.from(attachment.bytes)], { type: attachment.detectedContentType }), fileName);
 			await this.request<Attachment>(`${containerPath}/attachments`, { method: "POST", body: form });
 			existingNames.add(fileName);
 		}
@@ -303,7 +337,7 @@ export class OpenProjectClient {
 	}
 
 	async createWorkPackage(input: WorkPackageInput) {
-		const attachments = input.attachments ?? [];
+		const attachments = await this.prepareAttachments(input.attachments ?? []);
 		const description = composeOpenProjectMarkdown(
 			input.description,
 			input.correlationId ? `track-the-hack-correlation:${input.correlationId}` : undefined,
@@ -391,29 +425,40 @@ export class OpenProjectClient {
 	}
 
 	async attachWorkPackageImages(id: number, attachments: OpenProjectAttachmentInput[]) {
+		const containerPath = `/api/v3/work_packages/${id}`;
+		await this.uploadAttachments(containerPath, await this.prepareMissingAttachments(containerPath, attachments));
+	}
+
+	async prepareWorkPackageImages(id: number, attachments: OpenProjectAttachmentInput[]) {
+		return this.prepareMissingAttachments(`/api/v3/work_packages/${id}`, attachments);
+	}
+
+	async attachPreparedWorkPackageImages(id: number, attachments: PreparedOpenProjectAttachment[]) {
 		await this.uploadAttachments(`/api/v3/work_packages/${id}`, attachments);
 	}
 
 	async commentWorkPackage(id: number, markdown: string, correlationId: string, attachments: OpenProjectAttachmentInput[] = []) {
 		const marker = `track-the-hack-proposal:${correlationId}:comment`;
-		const body = composeOpenProjectMarkdown(markdown, marker, this.attachmentMarkdown(attachments));
 		const existing = (await this.workPackageActivities(id)).find(activity => activity.comment?.raw?.includes(`<!-- ${marker} -->`));
 		if (existing) {
-			await this.uploadAttachments(`/api/v3/activities/${existing.id}`, attachments);
+			const containerPath = `/api/v3/activities/${existing.id}`;
+			await this.uploadAttachments(containerPath, await this.prepareMissingAttachments(containerPath, attachments));
 			return existing;
 		}
+		const preparedAttachments = await this.prepareAttachments(attachments);
+		const body = composeOpenProjectMarkdown(markdown, marker, this.attachmentMarkdown(preparedAttachments));
 		try {
 			const activity = await this.request<Activity>(`/api/v3/work_packages/${id}/activities`, {
 				method: "POST",
 				body: JSON.stringify({ comment: { raw: body } }),
 			});
-			await this.uploadAttachments(`/api/v3/activities/${activity.id}`, attachments);
+			await this.uploadAttachments(`/api/v3/activities/${activity.id}`, preparedAttachments);
 			return activity;
 		} catch (error) {
 			if (!(error instanceof OpenProjectRequestError) || !error.ambiguous) throw error;
 			const recovered = (await this.workPackageActivities(id)).find(activity => activity.comment?.raw?.includes(`<!-- ${marker} -->`));
 			if (recovered) {
-				await this.uploadAttachments(`/api/v3/activities/${recovered.id}`, attachments);
+				await this.uploadAttachments(`/api/v3/activities/${recovered.id}`, preparedAttachments);
 				return recovered;
 			}
 			throw error;

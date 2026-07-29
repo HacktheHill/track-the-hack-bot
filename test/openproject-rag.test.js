@@ -240,6 +240,56 @@ test("OpenProject comments reuse an existing correlated activity", async () => {
 	}
 });
 
+test("OpenProject comment retries reuse uploaded images without Discord", async () => {
+	const originalFetch = globalThis.fetch;
+	const calls = [];
+	globalThis.fetch = async (url) => {
+		calls.push(String(url));
+		if (String(url).endsWith("/activities?pageSize=100")) {
+			return Response.json({ _embedded: { elements: [{ id: 7, comment: { raw: "<!-- track-the-hack-proposal:proposal:comment -->" } }] }, _links: {} });
+		}
+		if (String(url).endsWith("/api/v3/activities/7/attachments?pageSize=100")) {
+			return Response.json({ _embedded: { elements: [{ id: 8, fileName: "a1-update.png" }] }, _links: {} });
+		}
+		throw new Error(`Unexpected request: ${url}`);
+	};
+	try {
+		const client = new OpenProjectClient({ OPENPROJECT_BASE_URL: "https://openproject.example", OPENPROJECT_API_KEY: "secret", OPENPROJECT_CACHE_TTL_MS: 1000 });
+		assert.equal((await client.commentWorkPackage(42, "Update", "proposal", [
+			{ id: "a1", name: "update.png", url: "https://cdn.discordapp.com/expired.png" },
+		])).id, 7);
+		assert.equal(calls.some(url => url.includes("cdn.discordapp.com")), false);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("replacement image preparation fails before a work package PATCH", async () => {
+	const originalFetch = globalThis.fetch;
+	const calls = [];
+	globalThis.fetch = async (url, init = {}) => {
+		calls.push({ url: String(url), method: init.method ?? "GET" });
+		if (String(url).endsWith("/api/v3/work_packages/42/attachments?pageSize=100")) {
+			return Response.json({ _embedded: { elements: [] }, _links: {} });
+		}
+		if (String(url).includes("cdn.discordapp.com")) return new Response("not an image");
+		throw new Error(`Unexpected request: ${url}`);
+	};
+	try {
+		const client = new OpenProjectClient({ OPENPROJECT_BASE_URL: "https://openproject.example", OPENPROJECT_API_KEY: "secret", OPENPROJECT_CACHE_TTL_MS: 1000 });
+		await assert.rejects(async () => {
+			const prepared = await client.prepareWorkPackageImages(42, [
+				{ id: "a1", name: "update.png", url: "https://cdn.discordapp.com/invalid.png" },
+			]);
+			await client.updateWorkPackage(42, { description: { raw: "attachment:a1-update.png" } });
+			await client.attachPreparedWorkPackageImages(42, prepared);
+		}, /not a supported image/);
+		assert.equal(calls.some(call => call.method === "PATCH"), false);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
 test("OpenProject comments upload images to the created activity", async () => {
 	const originalFetch = globalThis.fetch;
 	const requests = [];

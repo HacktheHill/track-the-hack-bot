@@ -122,18 +122,23 @@ function compactDescription(value: string) {
 	const output: string[] = [];
 	const seenHeadings = new Set<string>();
 	const seenItemsBySection = new Map<string, Set<string>>();
+	const headingPath: string[] = [];
 	let section = "";
 	for (const rawLine of value.split(/\r?\n/)) {
 		const line = rawLine.trimEnd();
-		const heading = /^\s*#{1,6}\s+/.test(line);
+		const headingMatch = /^\s*(#{1,6})\s+/.exec(line);
+		const heading = Boolean(headingMatch);
 		const item = /^\s*(?:[-*+]\s+|\d+[.)]\s+)/.test(line);
 		if (heading || item) {
 			const normalized = line.replace(/^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)/, "")
 				.replace(/\s+/g, " ").trim().toLocaleLowerCase();
 			if (heading) {
-				section = normalized;
-				if (seenHeadings.has(normalized)) continue;
-				seenHeadings.add(normalized);
+				const level = headingMatch![1].length;
+				headingPath.length = level - 1;
+				headingPath[level - 1] = normalized;
+				section = headingPath.map((part, index) => `${index + 1}:${part}`).join("/");
+				if (seenHeadings.has(section)) continue;
+				seenHeadings.add(section);
 			} else {
 				const seenItems = seenItemsBySection.get(section) ?? new Set<string>();
 				if (seenItems.has(normalized)) continue;
@@ -162,13 +167,19 @@ export function composeOpenProjectMarkdown(
 	marker?: string,
 	images: readonly { name: string; fileName: string }[] = [],
 ) {
+	const discordUrl = /https:\/\/(?:canary\.|ptb\.)?discord(?:app)?\.com\/channels\/\d+\/\d+(?:\/\d+)?\/?(?:[?#][^\s<>()]*)?/gi;
+	const sanitizedBody = body
+		.replace(new RegExp(`\\[([^\\]]+)\\]\\((${discordUrl.source})\\)`, "gi"), "$1")
+		.split(/\r?\n/)
+		.map(line => line.replace(discordUrl, "").replace(/^\s*[-*+]\s*$/, ""))
+		.join("\n");
 	const imageSection = images.length
 		? `## Images\n\n${images.map(image => {
 			const alt = image.name.replace(/[\r\n]+/g, " ").replace(/[\\[\]()`*_<>]/g, "").replace(/\s+/g, " ").trim().slice(0, 200) || "Image";
 			return `![${alt}](attachment:${image.fileName})`;
 		}).join("\n\n")}`
 		: "";
-	return [body.trim(), imageSection, marker ? `<!-- ${marker} -->` : ""].filter(Boolean).join("\n\n");
+	return [sanitizedBody.trim(), imageSection, marker ? `<!-- ${marker} -->` : ""].filter(Boolean).join("\n\n");
 }
 
 export function planExistingTaskOperations(input: ExistingTaskPlanInput) {

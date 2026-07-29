@@ -217,16 +217,46 @@ export function boundedDiscordContent(value: string, limit = 2000) {
 		const incompleteLink = closeBracket < 0 || (body[closeBracket + 1] === "(" && body.indexOf(")", closeBracket + 2) < 0);
 		if (incompleteLink) body = body.slice(0, openBracket > 0 && body[openBracket - 1] === "!" ? openBracket - 1 : openBracket).trimEnd();
 	}
-
-	const unescapedCount = (token: string) => [...body.matchAll(new RegExp(`(?<!\\\\)${token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "g"))].length;
-	const fenceOpen = unescapedCount("```") % 2 === 1;
-	let closers = fenceOpen ? "\n```" : "";
-	if (!fenceOpen) {
-		if (unescapedCount("`") % 2 === 1) closers += "`";
-		if (unescapedCount("**") % 2 === 1) closers += "**";
-		if (unescapedCount("__") % 2 === 1) closers += "__";
-		if (unescapedCount("~~") % 2 === 1) closers += "~~";
+	const openAutolink = body.lastIndexOf("<");
+	if (openAutolink >= 0 && body.indexOf(">", openAutolink + 1) < 0 && /^<https?:\/\//i.test(body.slice(openAutolink))) {
+		body = body.slice(0, openAutolink).trimEnd();
 	}
+
+	let fenced = false;
+	let inlineCodeDelimiter = 0;
+	let linkDestination = false;
+	const formatting: string[] = [];
+	for (let index = 0; index < body.length; index++) {
+		if (body[index] === "\\") {
+			index++;
+			continue;
+		}
+		if (body[index] === "`") {
+			let runLength = 1;
+			while (body[index + runLength] === "`") runLength++;
+			if (!inlineCodeDelimiter && runLength >= 3) fenced = !fenced;
+			else if (!fenced && !inlineCodeDelimiter) inlineCodeDelimiter = runLength;
+			else if (!fenced && runLength === inlineCodeDelimiter) inlineCodeDelimiter = 0;
+			index += runLength - 1;
+			continue;
+		}
+		if (fenced || inlineCodeDelimiter) continue;
+		if (body.startsWith("](", index)) {
+			linkDestination = true;
+			index++;
+			continue;
+		}
+		if (linkDestination) {
+			if (body[index] === ")") linkDestination = false;
+			continue;
+		}
+		const token = ["**", "__", "~~"].find(candidate => body.startsWith(candidate, index));
+		if (!token) continue;
+		if (formatting.at(-1) === token) formatting.pop();
+		else formatting.push(token);
+		index += token.length - 1;
+	}
+	const closers = fenced ? "\n```" : `${"`".repeat(inlineCodeDelimiter)}${formatting.reverse().join("")}`;
 	return `${body}${closers}${suffix}`.slice(0, limit);
 }
 
@@ -1822,9 +1852,10 @@ async function completeAiCandidate(
 			await proposalMetadataDisplayNames(interaction.guild!, services, displayedPatch, displayedProjectId),
 		);
 		const displayedContent = redisplayed?.content_markdown ?? operations.contentMarkdown;
+		const displayedAmbiguities = redisplayed?.ambiguities ?? result.ambiguities;
 		const warning = displayedOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : "";
 		await deliverProposalReply(interaction, services, proposal.id, {
-			content: boundedDiscordContent(`**Possible ${displayedAction} for ${displayedWorkPackageLink}**\n${operationSummary.map(item => `- ${item}`).join("\n")}${warning}${formatProposalContent(displayedOperation, displayedContent)}${redisplayed ? "" : `\n\nSimilarity: ${Math.round(match.similarity * 100)}%`}${result.ambiguities.length ? `\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`),
+			content: boundedDiscordContent(`**Possible ${displayedAction} for ${displayedWorkPackageLink}**\n${operationSummary.map(item => `- ${item}`).join("\n")}${warning}${formatProposalContent(displayedOperation, displayedContent)}${redisplayed ? "" : `\n\nSimilarity: ${Math.round(match.similarity * 100)}%`}${displayedAmbiguities.length ? `\nAmbiguities: ${displayedAmbiguities.join("; ")}` : ""}`),
 			components: proposalReviewComponents(proposal.id, displayedAction, redisplayed?.rag_candidates ?? ragCandidates),
 		}, !proposal.reused, replaceReply);
 		return;
@@ -1884,24 +1915,48 @@ async function completeAiCandidate(
 			},
 		});
 	}
-	const displayedProject = projectId === project?.id ? project : (await services.openProject.projects()).find(item => item.id === projectId);
-	const details = redisplayed ? "" : [
-		`Project: ${displayedProject?.name ?? "Not resolved"}`,
-		`Assignee: ${assigneeMember?.displayName ?? "Not inferred"}`,
-		`Accountable: ${context.sourceRecords.get(context.primaryId)?.author ?? "Not resolved"}`,
-		`Priority: ${priority?.name ?? "Not inferred"}`,
-		`Size: ${size?.value ?? "Not inferred"}`,
-		`Dates: ${startDate ?? "Not set"} → ${dueDate}`,
-		`Estimate: ${estimatedHours !== undefined ? `${estimatedHours}h` : "Not inferred"}`,
-	].join("\n");
 	const displayedAction = redisplayed?.action ?? "create";
-	let displayedTarget = "";
+	const displayedAmbiguities = redisplayed?.ambiguities ?? [...result.ambiguities, ...(advisory ? [advisory] : [])];
+	let cardBody: string;
 	if (displayedAction !== "create" && redisplayed?.target_work_package_id) {
 		const workPackage = await services.openProject.workPackage(redisplayed.target_work_package_id);
-		displayedTarget = `Possible ${displayedAction} for ${workPackageMarkdownLink(workPackage.id, workPackage.subject, services.openProject.workPackageUrl(workPackage.id))}\n\n`;
+		const targetProjectId = workPackage.project?.id ?? (Number(workPackage._links.project?.href.split("/").at(-1)) || projectId);
+		const operationSummary = describeProposalOperations(
+			redisplayed.content_operation ?? "none",
+			redisplayed.metadata_patch,
+			await proposalMetadataDisplayNames(interaction.guild!, services, redisplayed.metadata_patch, targetProjectId),
+		);
+		cardBody = `Possible ${displayedAction} for ${workPackageMarkdownLink(workPackage.id, workPackage.subject, services.openProject.workPackageUrl(workPackage.id))}\nProposed title: **${redisplayed.title}**\n${operationSummary.map(item => `- ${item}`).join("\n")}${formatProposalContent(redisplayed.content_operation ?? "none", redisplayed.content_markdown)}`;
+	} else {
+		const displayedProjectId = redisplayed ? redisplayed.project_id ?? undefined : projectId;
+		const displayedAssigneeId = redisplayed ? redisplayed.assignee_discord_id ?? undefined : assigneeId;
+		const displayedAccountableId = redisplayed ? redisplayed.accountable_discord_id ?? undefined : accountableId;
+		const displayedPriorityId = redisplayed ? redisplayed.priority_id ?? undefined : priority?.id;
+		const displayedSizeHref = redisplayed ? redisplayed.size_href ?? undefined : size ? `/api/v3/custom_options/${size.id}` : undefined;
+		const displayedSizeId = displayedSizeHref ? Number(displayedSizeHref.split("/").at(-1)) : undefined;
+		const displayedStartDate = redisplayed ? databaseDate(redisplayed.start_date) : startDate;
+		const displayedDueDate = redisplayed ? databaseDate(redisplayed.due_date) : dueDate;
+		const displayedEstimate = redisplayed ? redisplayed.estimated_hours : estimatedHours;
+		const [projects, displayedAssignee, displayedAccountable, displayedPriorities, displayedSizes] = await Promise.all([
+			services.openProject.projects(),
+			displayedAssigneeId ? interaction.guild!.members.fetch(displayedAssigneeId).catch(() => null) : null,
+			displayedAccountableId ? interaction.guild!.members.fetch(displayedAccountableId).catch(() => null) : null,
+			displayedPriorityId ? services.openProject.priorities() : [],
+			displayedProjectId && displayedSizeId ? services.openProject.sizeOptions(displayedProjectId) : [],
+		]);
+		const details = [
+			`Project: ${projects.find(item => item.id === displayedProjectId)?.name ?? "Not resolved"}`,
+			`Assignee: ${displayedAssignee?.displayName ?? "Not inferred"}`,
+			`Accountable: ${displayedAccountable?.displayName ?? (redisplayed ? "Not resolved" : context.sourceRecords.get(context.primaryId)?.author ?? "Not resolved")}`,
+			`Priority: ${displayedPriorities.find(item => item.id === displayedPriorityId)?.name ?? "Not inferred"}`,
+			`Size: ${displayedSizes.find(item => item.id === displayedSizeId)?.value ?? "Not inferred"}`,
+			`Dates: ${displayedStartDate ?? "Not set"} → ${displayedDueDate ?? "Not set"}`,
+			`Estimate: ${displayedEstimate !== undefined && displayedEstimate !== null ? `${displayedEstimate}h` : "Not inferred"}`,
+		].join("\n");
+		cardBody = `**${redisplayed?.title ?? candidate.title}**\n${redisplayed?.description ?? description}\n\n${details}`;
 	}
 	await deliverProposalReply(interaction, services, proposal.id, {
-		content: boundedDiscordContent(`${displayedTarget}**${redisplayed?.title ?? candidate.title}**\n${redisplayed?.description ?? description}${details ? `\n\n${details}` : ""}${redisplayed ? "" : `${advisory ? `\n\n${advisory}` : ""}${result.ambiguities.length ? `\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`}`),
+		content: boundedDiscordContent(`${cardBody}${displayedAmbiguities.length ? `\n\nAmbiguities: ${displayedAmbiguities.join("; ")}` : ""}`),
 		components: proposalReviewComponents(proposal.id, displayedAction, displayedAction === "create" ? redisplayed?.rag_candidates ?? ragCandidates : []),
 	}, !proposal.reused, replaceReply);
 }
@@ -1989,7 +2044,7 @@ async function applyExistingProposalTarget(
 	const buttons = manualProposalButtons(proposal.id, resultingAction);
 	if (!interaction.message.flags.has(MessageFlags.Ephemeral)) buttons.push(new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary));
 	await interaction.editReply({
-		content: boundedDiscordContent(`Proposal will ${resultingAction} OpenProject task ${workPackageMarkdownLink(target.id, target.subject, services.openProject.workPackageUrl(target.id))}\nProposed title: **${proposal.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch, await proposalMetadataDisplayNames(interaction.guild!, services, operations.metadataPatch, targetProjectId)).map(item => `- ${item}`).join("\n")}${formatProposalContent(operations.contentOperation, operations.contentMarkdown)}`),
+		content: boundedDiscordContent(`Proposal will ${resultingAction} OpenProject task ${workPackageMarkdownLink(target.id, target.subject, services.openProject.workPackageUrl(target.id))}\nProposed title: **${proposal.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch, await proposalMetadataDisplayNames(interaction.guild!, services, operations.metadataPatch, targetProjectId)).map(item => `- ${item}`).join("\n")}${formatProposalContent(operations.contentOperation, operations.contentMarkdown)}${proposal.ambiguities.length ? `\n\nAmbiguities: ${proposal.ambiguities.join("; ")}` : ""}`),
 		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons)],
 		allowedMentions: { parse: [] },
 	});
@@ -2321,6 +2376,9 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 						(args.sourceAttachments ?? []).map(attachment => ({ name: attachment.name, fileName: openProjectAttachmentFileName(attachment) })),
 					) };
 				}
+				const preparedDescriptionImages = !proposal.patch_applied_at && proposal.content_operation === "descriptionReplacement"
+					? await services.openProject.prepareWorkPackageImages(proposal.target_work_package_id, args.sourceAttachments ?? [])
+					: [];
 
 				let updated = await services.openProject.workPackage(proposal.target_work_package_id);
 				if (!proposal.patch_applied_at && Object.keys(changes).length) {
@@ -2330,7 +2388,7 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 						updated = await services.openProject.updateWorkPackage(proposal.target_work_package_id, changes, proposal.target_lock_version ?? undefined);
 					}
 					if (proposal.content_operation === "descriptionReplacement") {
-						await services.openProject.attachWorkPackageImages(proposal.target_work_package_id, args.sourceAttachments ?? []);
+						await services.openProject.attachPreparedWorkPackageImages(proposal.target_work_package_id, preparedDescriptionImages);
 					}
 					await services.db.markProposalPatchApplied(proposal.id, updated.lockVersion);
 				} else if (!proposal.patch_applied_at && proposal.target_lock_version !== null && updated.lockVersion !== proposal.target_lock_version) {
