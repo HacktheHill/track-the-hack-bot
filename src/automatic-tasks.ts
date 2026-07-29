@@ -177,6 +177,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 		let completedGate: Awaited<ReturnType<TaskExtractor["assessAutomaticCandidates"]>> | undefined;
 		try {
 			const channelProjectId = await categoryProject(primary, services);
+			const projects = await services.openProject.projects();
 			const priorities = await services.openProject.priorities();
 			const sizes = channelProjectId ? await services.openProject.sizeOptions(channelProjectId) : [];
 			const extraction = completedExtraction = await services.extractor.extract(minimized, {
@@ -327,7 +328,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS,
 					});
 					const reviewPayload: ReviewCardPayload = {
-						content: boundedDiscordContent(`${ownerText}Proposed ${action} for OpenProject task ${workPackageMarkdownLink(target!.id, target!.subject, services.openProject.workPackageUrl(target!.id))}\nProposed title: **${task.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch).map(item => `- ${item}`).join("\n")}${operations.contentOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : ""}${formatProposalContent(operations.contentOperation, operations.contentMarkdown)}${result.ambiguities.length ? `\n\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`),
+						content: boundedDiscordContent(`${ownerText}Proposed ${action} for OpenProject task ${workPackageMarkdownLink(target!.id, target!.subject, services.openProject.workPackageUrl(target!.id))}\nProposed title: **${task.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch, { assignee: assignee?.displayName ?? assignee?.user.username, priority: priority?.name, size: size?.value }).map(item => `- ${item}`).join("\n")}${operations.contentOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : ""}${formatProposalContent(operations.contentOperation, operations.contentMarkdown)}${result.ambiguities.length ? `\n\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`),
 						components: proposalReviewComponents(proposal.id, action, ragCandidates, true),
 						allowedMentions: { parse: [] },
 					};
@@ -399,7 +400,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						ragCandidates,
 				});
 				const reviewPayload: ReviewCardPayload = {
-					content: boundedDiscordContent(`${ownerText}Proposed OpenProject task: **${task.title}**\n${description}${advisory ? `\n\n${advisory}` : ""}${result.ambiguities.length ? `\n\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`),
+					content: boundedDiscordContent(`${ownerText}Proposed OpenProject task: **${task.title}**\n${description}\n\nProject: ${projects.find(item => item.id === projectId)?.name ?? "Not resolved"}\nPriority: ${priority?.name ?? "Not inferred"}\nSize: ${size?.value ?? "Not inferred"}\nDates: ${task.start_date ?? "Not set"} → ${dueDate}\nEstimate: ${estimatedHours !== undefined ? `${estimatedHours}h` : "Not inferred"}${advisory ? `\n\n${advisory}` : ""}${result.ambiguities.length ? `\n\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`),
 					components: proposalReviewComponents(proposal.id, "create", ragCandidates, true),
 					allowedMentions: { parse: [] },
 				};

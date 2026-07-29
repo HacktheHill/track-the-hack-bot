@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	composeOpenProjectMarkdown,
+	describeProposalOperations,
 	formatGeneratedTaskDescription,
 	isEffectivelyEmptyDescription,
 	planExistingTaskOperations,
@@ -55,6 +56,20 @@ test("unresolved metadata is preserved instead of being cleared", () => {
 		metadataFields: ["assignee", "priority", "due_date"], values: { title: "Existing title" },
 	});
 	assert.deepEqual(planned.metadataPatch, {});
+});
+
+test("proposal operations use readable metadata labels and values", () => {
+	assert.deepEqual(describeProposalOperations("none", {
+		assigneeDiscordId: "123", priorityId: 4, sizeHref: "/api/v3/custom_options/7",
+		dueDate: "2026-08-01", estimatedHours: 2.5, status: "complete",
+	}, { assignee: "Alex", priority: "High", size: "Small" }), [
+		"Change assignee to Alex",
+		"Change priority to High",
+		"Change size to Small",
+		"Change due date to 2026-08-01",
+		"Change estimate to 2.5h",
+		"Change status to Complete",
+	]);
 });
 
 test("Markdown composition preserves body sections without rendering source links", () => {

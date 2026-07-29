@@ -193,13 +193,32 @@ export function planExistingTaskOperations(input: ExistingTaskPlanInput) {
 	return { metadataPatch, contentOperation, contentMarkdown: contentOperation === "none" ? null : input.description.trim() };
 }
 
-export function describeProposalOperations(contentOperation: ContentOperation, metadataPatch: ProposalMetadataPatch) {
+export type ProposalMetadataDisplayNames = {
+	assignee?: string;
+	priority?: string;
+	size?: string;
+};
+
+export function describeProposalOperations(
+	contentOperation: ContentOperation,
+	metadataPatch: ProposalMetadataPatch,
+	displayNames: ProposalMetadataDisplayNames = {},
+) {
 	const content = contentOperation === "postComment"
 		? "Add an update comment"
 		: contentOperation === "descriptionReplacement" ? "Replace the task description" : null;
 	const metadata = Object.entries(metadataPatch).map(([field, value]) => {
-		const name = field.replace(/([A-Z])/g, " $1").replace(/_/g, " ");
-		return `Change ${name} to ${value === null ? "not set" : String(value)}`;
+		const names: Record<keyof ProposalMetadataPatch, string> = {
+			subject: "title", assigneeDiscordId: "assignee", priorityId: "priority", sizeHref: "size",
+			startDate: "start date", dueDate: "due date", estimatedHours: "estimate", status: "status",
+		};
+		let displayedValue = value === null ? "not set" : String(value);
+		if (value !== null && field === "assigneeDiscordId") displayedValue = displayNames.assignee ?? "selected assignee";
+		if (value !== null && field === "priorityId") displayedValue = displayNames.priority ?? "selected priority";
+		if (value !== null && field === "sizeHref") displayedValue = displayNames.size ?? "selected size";
+		if (value !== null && field === "estimatedHours") displayedValue = `${value}h`;
+		if (value !== null && field === "status") displayedValue = value === "complete" ? "Complete" : "Reopen";
+		return `Change ${names[field as keyof ProposalMetadataPatch]} to ${displayedValue}`;
 	});
 	return [...(content ? [content] : []), ...metadata];
 }

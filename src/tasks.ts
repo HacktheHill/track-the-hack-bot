@@ -255,6 +255,25 @@ function proposalSnapshot(input: {
 	return input;
 }
 
+async function proposalMetadataDisplayNames(
+	guild: Guild,
+	services: Services,
+	metadataPatch: ProposalMetadataPatch,
+	projectId?: number,
+) {
+	const sizeId = metadataPatch.sizeHref ? Number(metadataPatch.sizeHref.split("/").at(-1)) : undefined;
+	const [assignee, priorities, sizes] = await Promise.all([
+		typeof metadataPatch.assigneeDiscordId === "string" ? guild.members.fetch(metadataPatch.assigneeDiscordId).catch(() => null) : null,
+		metadataPatch.priorityId ? services.openProject.priorities() : [],
+		projectId && sizeId ? services.openProject.sizeOptions(projectId) : [],
+	]);
+	return {
+		assignee: assignee?.displayName,
+		priority: priorities.find(item => item.id === metadataPatch.priorityId)?.name,
+		size: sizes.find(item => item.id === sizeId)?.value,
+	};
+}
+
 async function deliverProposalReply(
 	interaction: MessageContextMenuCommandInteraction | ChatInputCommandInteraction | ButtonInteraction,
 	services: Services,
@@ -1769,7 +1788,12 @@ async function completeAiCandidate(
 		const displayedTarget = redisplayed?.target_work_package_id ?? match.workPackageId;
 		const displayedWorkPackage = displayedTarget === target!.id ? target! : await services.openProject.workPackage(displayedTarget);
 		const displayedWorkPackageLink = workPackageMarkdownLink(displayedWorkPackage.id, displayedWorkPackage.subject, services.openProject.workPackageUrl(displayedWorkPackage.id));
-		const operationSummary = describeProposalOperations(displayedOperation, displayedPatch);
+		const displayedProjectId = displayedWorkPackage.project?.id ?? (Number(displayedWorkPackage._links.project?.href.split("/").at(-1)) || projectId);
+		const operationSummary = describeProposalOperations(
+			displayedOperation,
+			displayedPatch,
+			await proposalMetadataDisplayNames(interaction.guild!, services, displayedPatch, displayedProjectId),
+		);
 		const displayedContent = redisplayed?.content_markdown ?? operations.contentMarkdown;
 		const warning = displayedOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : "";
 		await deliverProposalReply(interaction, services, proposal.id, {
@@ -1833,10 +1857,11 @@ async function completeAiCandidate(
 			},
 		});
 	}
+	const displayedProject = projectId === project?.id ? project : (await services.openProject.projects()).find(item => item.id === projectId);
 	const details = redisplayed ? "" : [
-		`Project: ${project?.name ?? "Not resolved"}`,
-		`Assignee: ${assigneeId ? `<@${assigneeId}>` : "Not inferred"}`,
-		`Accountable: <@${accountableId}>`,
+		`Project: ${displayedProject?.name ?? "Not resolved"}`,
+		`Assignee: ${assigneeMember?.displayName ?? "Not inferred"}`,
+		`Accountable: ${context.sourceRecords.get(context.primaryId)?.author ?? "Not resolved"}`,
 		`Priority: ${priority?.name ?? "Not inferred"}`,
 		`Size: ${size?.value ?? "Not inferred"}`,
 		`Dates: ${startDate ?? "Not set"} → ${dueDate}`,
@@ -1937,7 +1962,7 @@ async function applyExistingProposalTarget(
 	const buttons = manualProposalButtons(proposal.id, resultingAction);
 	if (!interaction.message.flags.has(MessageFlags.Ephemeral)) buttons.push(new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary));
 	await interaction.editReply({
-		content: boundedDiscordContent(`Proposal will ${resultingAction} OpenProject task ${workPackageMarkdownLink(target.id, target.subject, services.openProject.workPackageUrl(target.id))}\nProposed title: **${proposal.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch).map(item => `- ${item}`).join("\n")}${formatProposalContent(operations.contentOperation, operations.contentMarkdown)}`),
+		content: boundedDiscordContent(`Proposal will ${resultingAction} OpenProject task ${workPackageMarkdownLink(target.id, target.subject, services.openProject.workPackageUrl(target.id))}\nProposed title: **${proposal.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch, await proposalMetadataDisplayNames(interaction.guild!, services, operations.metadataPatch, targetProjectId)).map(item => `- ${item}`).join("\n")}${formatProposalContent(operations.contentOperation, operations.contentMarkdown)}`),
 		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons)],
 		allowedMentions: { parse: [] },
 	});
