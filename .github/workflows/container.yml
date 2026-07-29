@@ -100,11 +100,18 @@ jobs:
               --name track-the-hack-bot \
               --image "$image"
             for job in track-the-hack-bot-embeddings tth-bot-corpus-sync tth-bot-ai-evaluate; do
-              if az containerapp job show --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" --name "$job" >/dev/null 2>&1; then
-                az containerapp job update \
-                  --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-                  --name "$job" \
-                  --image "$image"
+              az containerapp job update \
+                --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+                --name "$job" \
+                --image "$image" \
+                --output none
+              job_image="$(az containerapp job show \
+                --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+                --name "$job" \
+                --query properties.template.containers[0].image --output tsv)"
+              if [ "$job_image" != "$image" ]; then
+                echo "Expected $job to use $image, got $job_image." >&2
+                exit 1
               fi
             done
             for attempt in $(seq 1 20); do
