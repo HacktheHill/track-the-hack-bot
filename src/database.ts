@@ -64,6 +64,21 @@ export type ProposalMetrics = {
 	averageExtractionLatencyMs: number;
 	totalTokens: number;
 	invalidOutputs: number;
+	ragEvaluations: number;
+	ragRecommendations: number;
+	ragAbstentions: number;
+	ragFailures: number;
+	ragRecommendationRate: number;
+	ragAbstentionRate: number;
+	ragFailureRate: number;
+	ragAverageLatencyMs: number;
+	ragSelections: number;
+	ragRecommendationAcceptanceRate: number;
+	ragMeanReciprocalRank: number;
+	ragRecallAt3: number;
+	ragReviewedCandidates: number;
+	ragKeepNewDecisions: number;
+	ragKeepNewRate: number;
 	correctionRates: Record<CorrectionField, number>;
 };
 
@@ -85,6 +100,7 @@ export type ProposalRagCandidate = {
 	relationship: "same_work" | "related";
 	confidence: number;
 	similarity: number;
+	recommended?: boolean;
 };
 
 export type ScheduledMessage = {
@@ -1241,13 +1257,60 @@ export class Database {
 			 FROM ai_extraction_events WHERE created_at >= now() - ($1::text || ' days')::interval`,
 			[days],
 		);
+		const rag = await this.pool.query<{
+			evaluations: string; recommendations: string; abstentions: string; failures: string;
+			average_latency_ms: string | null;
+		}>(
+			`WITH evaluations AS (
+				SELECT evaluation
+				FROM ai_extraction_events
+				CROSS JOIN LATERAL jsonb_array_elements(CASE
+					WHEN jsonb_typeof(decision->'ragEvaluations')='array' THEN decision->'ragEvaluations'
+					WHEN jsonb_typeof(decision->'rag')='object' THEN jsonb_build_array(decision->'rag')
+					ELSE '[]'::jsonb
+				END) AS evaluation
+				WHERE created_at >= now() - ($1::text || ' days')::interval
+			)
+			SELECT COUNT(*) FILTER (WHERE evaluation->>'outcome'<>'disabled')::text AS evaluations,
+				COUNT(*) FILTER (WHERE evaluation->>'outcome'='recommended')::text AS recommendations,
+				COUNT(*) FILTER (WHERE evaluation->>'outcome' IN ('review','no_commonality','no_candidates'))::text AS abstentions,
+				COUNT(*) FILTER (WHERE evaluation->>'outcome' IN ('error','reranker_unavailable'))::text AS failures,
+				AVG(COALESCE((evaluation->>'latencyMs')::numeric,0) + COALESCE((evaluation->>'retrievalLatencyMs')::numeric,0) + COALESCE((evaluation->>'rerankLatencyMs')::numeric,0))
+					FILTER (WHERE evaluation->>'outcome'<>'disabled')::text AS average_latency_ms
+			FROM evaluations`,
+			[days],
+		);
+		const ragReview = await this.pool.query<{
+			selections: string; accepted_recommendations: string; mean_reciprocal_rank: string | null; recall_at_3: string | null;
+			reviewed_candidates: string; keep_new_decisions: string;
+		}>(
+			`SELECT
+				(SELECT COUNT(*) FROM task_audit_log WHERE event='rag_target_selected' AND created_at >= now() - ($1::text || ' days')::interval)::text AS selections,
+				(SELECT COUNT(*) FROM task_audit_log WHERE event='rag_target_selected' AND metadata->>'recommended'='true' AND created_at >= now() - ($1::text || ' days')::interval)::text AS accepted_recommendations,
+				(SELECT AVG(1.0 / ((metadata->>'retrievalRank')::numeric + 1)) FROM task_audit_log WHERE event='rag_target_selected' AND metadata ? 'retrievalRank' AND created_at >= now() - ($1::text || ' days')::interval)::text AS mean_reciprocal_rank,
+				(SELECT AVG(CASE WHEN (metadata->>'retrievalRank')::integer < 3 THEN 1.0 ELSE 0.0 END) FROM task_audit_log WHERE event='rag_target_selected' AND metadata ? 'retrievalRank' AND created_at >= now() - ($1::text || ' days')::interval)::text AS recall_at_3,
+				COUNT(*) FILTER (WHERE reviewed_at IS NOT NULL AND jsonb_array_length(rag_candidates)>0)::text AS reviewed_candidates,
+				COUNT(*) FILTER (WHERE reviewed_at IS NOT NULL AND jsonb_array_length(rag_candidates)>0 AND action='create' AND review_outcome='approved')::text AS keep_new_decisions
+			FROM task_proposals WHERE reviewed_at >= now() - ($1::text || ' days')::interval`,
+			[days],
+		);
 		const p = proposal.rows[0];
 		const e = extraction.rows[0];
+		const r = rag.rows[0];
+		const rr = ragReview.rows[0];
 		const proposals = Number(p?.proposals ?? 0);
 		const approved = Number(p?.approved ?? 0);
 		const reviewed = approved + Number(p?.dismissed ?? 0) + Number(p?.duplicates ?? 0) + Number(p?.failures ?? 0);
 		const correctionCounts = p?.correction_flags ?? {};
 		const rate = (count: number, total = reviewed) => total ? count / total : 0;
+		const ragEvaluations = Number(r?.evaluations ?? 0);
+		const ragRecommendations = Number(r?.recommendations ?? 0);
+		const ragAbstentions = Number(r?.abstentions ?? 0);
+		const ragFailures = Number(r?.failures ?? 0);
+		const ragCompleted = ragRecommendations + ragAbstentions;
+		const ragSelections = Number(rr?.selections ?? 0);
+		const ragReviewedCandidates = Number(rr?.reviewed_candidates ?? 0);
+		const ragKeepNewDecisions = Number(rr?.keep_new_decisions ?? 0);
 		return {
 			days, proposals, approved,
 			dismissed: Number(p?.dismissed ?? 0),
@@ -1262,6 +1325,21 @@ export class Database {
 			averageExtractionLatencyMs: Number(e?.average_latency_ms ?? 0),
 			totalTokens: Number(e?.total_tokens ?? 0),
 			invalidOutputs: Number(e?.invalid_outputs ?? 0),
+			ragEvaluations,
+			ragRecommendations,
+			ragAbstentions,
+			ragFailures,
+			ragRecommendationRate: rate(ragRecommendations, ragCompleted),
+			ragAbstentionRate: rate(ragAbstentions, ragCompleted),
+			ragFailureRate: rate(ragFailures, ragEvaluations),
+			ragAverageLatencyMs: Number(r?.average_latency_ms ?? 0),
+			ragSelections,
+			ragRecommendationAcceptanceRate: rate(Number(rr?.accepted_recommendations ?? 0), ragSelections),
+			ragMeanReciprocalRank: Number(rr?.mean_reciprocal_rank ?? 0),
+			ragRecallAt3: Number(rr?.recall_at_3 ?? 0),
+			ragReviewedCandidates,
+			ragKeepNewDecisions,
+			ragKeepNewRate: rate(ragKeepNewDecisions, ragReviewedCandidates),
 			correctionRates: Object.fromEntries(correctionFields.map(field => [field, rate(Number(correctionCounts[field] ?? 0), approved)])) as Record<CorrectionField, number>,
 		};
 	}

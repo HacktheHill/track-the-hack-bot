@@ -220,7 +220,7 @@ export class OpenProjectRag {
 			const assessments = new Map(reranked.assessments.map(assessment => [assessment.candidate_index, assessment]));
 			const assessed = matches.map((match, retrievalRank) => ({ match, retrievalRank, assessment: assessments.get(retrievalRank) }))
 				.filter((item): item is typeof item & { assessment: NonNullable<typeof item.assessment> } => Boolean(item.assessment));
-			const candidates = assessed
+			let candidates = assessed
 				.filter(item => item.assessment.relationship !== "unrelated" && item.assessment.confidence >= RAG_DISPLAY_CONFIDENCE)
 				.sort((left, right) => {
 					const relationship = Number(right.assessment.relationship === "same_work") - Number(left.assessment.relationship === "same_work");
@@ -245,6 +245,7 @@ export class OpenProjectRag {
 				&& (!runnerUp || winner.confidence - runnerUp.confidence >= RAG_RECOMMENDATION_MARGIN)
 				? { workPackageId: winner.workPackageId, similarity: winner.similarity }
 				: undefined;
+			candidates = candidates.map(candidate => ({ ...candidate, recommended: candidate.workPackageId === recommendedMatch?.workPackageId }));
 			return {
 				candidates,
 				recommendedMatch,

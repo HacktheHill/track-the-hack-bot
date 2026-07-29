@@ -374,11 +374,20 @@ test("AI metrics formatter reports operational quality without content", () => {
 		assigneeAcceptanceRate: 0.9, deadlineAcceptanceRate: 0.8,
 		averageReviewDurationMs: 12000, averageExtractionLatencyMs: 950,
 		totalTokens: 4200, invalidOutputs: 1,
+		ragEvaluations: 20, ragRecommendations: 8, ragAbstentions: 10, ragFailures: 2,
+		ragRecommendationRate: 8 / 18, ragAbstentionRate: 10 / 18, ragFailureRate: 0.1,
+		ragAverageLatencyMs: 325, ragSelections: 5, ragRecommendationAcceptanceRate: 0.6,
+		ragMeanReciprocalRank: 0.7, ragRecallAt3: 0.8, ragReviewedCandidates: 6,
+		ragKeepNewDecisions: 2, ragKeepNewRate: 1 / 3,
 		correctionRates: Object.fromEntries(["title", "description", "project", "assignee", "accountable", "priority", "size", "startDate", "dueDate", "estimate"].map(field => [field, 0.1])),
 	});
 	assert.match(text, /last 30 days/);
 	assert.match(text, /Assignee accepted: 90%/);
 	assert.match(text, /invalid outputs: 1/);
+	assert.match(text, /RAG: 20 evaluations/);
+	assert.match(text, /MRR: 0\.70/);
+	assert.match(text, /recall@3: 80%/);
+	assert.match(text, /keep new: 2\/6 \(33%\)/);
 });
 
 test("duplicate detection normalizes punctuation and compares meaningful words", () => {

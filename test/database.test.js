@@ -373,6 +373,34 @@ test("extraction events retain structured metrics but no message content", async
 	assert.deepEqual(inserted.values, ["automatic", "proposal", "model", 1, 250, '{"totalTokens":123}', null, '[{"id":"message","text":"minimized"}]', '[{"message_id":"message","relevance":"relevant"}]', '{"outcome":"proposal"}', ["00000000-0000-4000-8000-000000000001"]]);
 });
 
+test("proposal metrics aggregate RAG model and reviewer outcomes", async () => {
+	const db = databaseWithPool({
+		async query(sql) {
+			if (sql.includes("WITH evaluations AS")) return { rows: [{
+				evaluations: "20", recommendations: "8", abstentions: "10", failures: "2", average_latency_ms: "325.5",
+			}] };
+			if (sql.includes("event='rag_target_selected'")) return { rows: [{
+				selections: "5", accepted_recommendations: "3", mean_reciprocal_rank: "0.7", recall_at_3: "0.8",
+				reviewed_candidates: "6", keep_new_decisions: "2",
+			}] };
+			if (sql.includes("FROM ai_extraction_events")) return { rows: [{ average_latency_ms: "950", total_tokens: "4200", invalid_outputs: "1" }] };
+			if (sql.includes("FROM task_proposals")) return { rows: [{
+				proposals: "10", approved: "7", dismissed: "1", duplicates: "1", failures: "1", reconciliations: "0",
+				review_failures: "0", average_review_duration_ms: "12000", correction_flags: {},
+			}] };
+			throw new Error(`Unexpected query: ${sql}`);
+		},
+	});
+	const metrics = await db.proposalMetrics(30);
+	assert.equal(metrics.ragRecommendationRate, 8 / 18);
+	assert.equal(metrics.ragAbstentionRate, 10 / 18);
+	assert.equal(metrics.ragFailureRate, 0.1);
+	assert.equal(metrics.ragRecommendationAcceptanceRate, 0.6);
+	assert.equal(metrics.ragMeanReciprocalRank, 0.7);
+	assert.equal(metrics.ragRecallAt3, 0.8);
+	assert.equal(metrics.ragKeepNewRate, 1 / 3);
+});
+
 test("dismissed proposals require and persist a structured reason", async () => {
 	let query;
 	const db = databaseWithPool({ async query(sql, values) { query = { sql, values }; return { rowCount: 1, rows: [] }; } });

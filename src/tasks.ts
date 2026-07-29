@@ -194,6 +194,8 @@ export function formatProposalMetrics(metrics: ProposalMetrics) {
 		`Approval rate: ${percent(metrics.approvalRate)} · duplicate rate: ${percent(metrics.duplicateRate)} · reconciliations: ${metrics.reconciliations}`,
 		`Assignee accepted: ${percent(metrics.assigneeAcceptanceRate)} · deadline accepted: ${percent(metrics.deadlineAcceptanceRate)}`,
 		`Average approval processing: ${Math.round(metrics.averageReviewDurationMs / 1000)}s · extraction: ${Math.round(metrics.averageExtractionLatencyMs)}ms · tokens: ${metrics.totalTokens} · invalid outputs: ${metrics.invalidOutputs}`,
+		`RAG: ${metrics.ragEvaluations} evaluations · recommendations: ${metrics.ragRecommendations} (${percent(metrics.ragRecommendationRate)}) · abstentions: ${metrics.ragAbstentions} (${percent(metrics.ragAbstentionRate)}) · failures: ${metrics.ragFailures} (${percent(metrics.ragFailureRate)}) · average latency: ${Math.round(metrics.ragAverageLatencyMs)}ms`,
+		`RAG review: ${metrics.ragSelections} existing-task selections · recommendation accepted: ${percent(metrics.ragRecommendationAcceptanceRate)} · MRR: ${metrics.ragMeanReciprocalRank.toFixed(2)} · recall@3: ${percent(metrics.ragRecallAt3)} · keep new: ${metrics.ragKeepNewDecisions}/${metrics.ragReviewedCandidates} (${percent(metrics.ragKeepNewRate)})`,
 		`Field edit rates — ${edits}`,
 	].join("\n");
 }
