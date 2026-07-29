@@ -28,7 +28,7 @@ export interface CorpusStore {
 	listCases(): Promise<CorpusCaseSummary[]>;
 	getCase(id: string): Promise<{ case: CorpusCase; etag: string }>;
 	putCase(value: CorpusCase, etag?: string): Promise<{ etag: string }>;
-	exportApproved(): Promise<CorpusExportManifest>;
+	exportIncluded(): Promise<CorpusExportManifest>;
 	getExportManifest(): Promise<CorpusExportManifest | null>;
 }
 
@@ -153,7 +153,7 @@ export class AzureBlobCorpusStore implements CorpusStore {
 				conditions: etag ? { ifMatch: etag } : { ifNoneMatch: "*" },
 			});
 			if (!response.etag) throw new Error("Corpus case write did not return an ETag.");
-			if (etag) await this.invalidateApprovedExportsUnlocked();
+			if (etag) await this.invalidateIncludedExportsUnlocked();
 			return { etag: response.etag };
 		};
 		return etag ? this.withExportLock(write) : write();
@@ -162,15 +162,15 @@ export class AzureBlobCorpusStore implements CorpusStore {
 	async deleteCase(id: string) {
 		await this.withExportLock(async () => {
 			const result = await this.caseBlob(id).deleteIfExists({ deleteSnapshots: "include" });
-			if (result.succeeded) await this.invalidateApprovedExportsUnlocked();
+			if (result.succeeded) await this.invalidateIncludedExportsUnlocked();
 		});
 	}
 
-	async invalidateApprovedExports() {
-		await this.withExportLock(() => this.invalidateApprovedExportsUnlocked());
+	async invalidateIncludedExports() {
+		await this.withExportLock(() => this.invalidateIncludedExportsUnlocked());
 	}
 
-	private async invalidateApprovedExportsUnlocked() {
+	private async invalidateIncludedExportsUnlocked() {
 		await this.container.getBlobClient(this.name("exports/current-manifest.json")).deleteIfExists({ deleteSnapshots: "include" });
 		for await (const item of this.container.listBlobsFlat({ prefix: this.name("exports/snapshots/") })) {
 			await this.container.getBlobClient(item.name).deleteIfExists({ deleteSnapshots: "include" });
@@ -180,20 +180,20 @@ export class AzureBlobCorpusStore implements CorpusStore {
 		}
 	}
 
-	private async approvedCaseVersions() {
+	private async includedCaseVersions() {
 		const versions: Record<string, string> = {};
 		for await (const item of this.container.listBlobsFlat({ prefix: this.name("cases/"), includeMetadata: true })) {
-			if (!item.name.endsWith(".json") || item.metadata?.status !== "approved" || !item.properties.etag) continue;
+			if (!item.name.endsWith(".json") || item.metadata?.status !== "included" || !item.properties.etag) continue;
 			versions[item.name.slice(item.name.lastIndexOf("/") + 1, -5)] = item.properties.etag;
 		}
 		return versions;
 	}
 
 	private async assertExportCurrentUnlocked(manifest: Pick<CorpusExportManifest, "caseVersions">) {
-		const actual = await this.approvedCaseVersions();
+		const actual = await this.includedCaseVersions();
 		const expected = manifest.caseVersions;
 		const ids = new Set([...Object.keys(actual), ...Object.keys(expected)]);
-		if ([...ids].some(id => actual[id] !== expected[id])) throw new Error("Approved corpus changed after this export was created.");
+		if ([...ids].some(id => actual[id] !== expected[id])) throw new Error("Included corpus changed after this export was created.");
 	}
 
 	async assertExportCurrent(manifest: Pick<CorpusExportManifest, "caseVersions">) {
@@ -212,11 +212,11 @@ export class AzureBlobCorpusStore implements CorpusStore {
 		});
 	}
 
-	async exportApproved() {
+	async exportIncluded() {
 		return this.withExportLock(async () => {
 			const summaries = await this.listCases();
-			const approved = await Promise.all(summaries.filter(item => item.status === "approved").map(item => this.getCase(item.id)));
-			const windows = approved.map(item => item.case.window);
+			const included = await Promise.all(summaries.filter(item => item.status === "included").map(item => this.getCase(item.id)));
+			const windows = included.map(item => item.case.window);
 			const jsonl = corpusJsonl(windows);
 			const runId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID()}`;
 			const blobName = this.name(`exports/snapshots/${runId}.jsonl`);
@@ -228,7 +228,7 @@ export class AzureBlobCorpusStore implements CorpusStore {
 				negativeCases: windows.filter(window => window.expected.proposals.length === 0).length,
 				sha256: createHash("sha256").update(jsonl).digest("hex"),
 				blobName,
-				caseVersions: Object.fromEntries(approved.map(item => [item.case.id, item.etag])),
+				caseVersions: Object.fromEntries(included.map(item => [item.case.id, item.etag])),
 			};
 			await this.container.getBlockBlobClient(blobName).uploadData(Buffer.from(jsonl), {
 				blobHTTPHeaders: { blobContentType: "application/x-ndjson; charset=utf-8", blobCacheControl: "no-store" },
@@ -257,7 +257,7 @@ function statusCode(error: unknown) {
 }
 
 function zStatus(value: string): CorpusCase["adjudication"]["status"] {
-	if (value === "pending" || value === "approved" || value === "rejected") return value;
+	if (value === "pending" || value === "included" || value === "excluded") return value;
 	throw new Error("Corpus blob has invalid status metadata.");
 }
 

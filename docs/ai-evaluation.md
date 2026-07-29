@@ -56,13 +56,19 @@ recovery.
 Review states have distinct meanings:
 
 - `pending`: not part of evaluation;
-- `approved`: included in the immutable snapshot referenced by
+- `included`: included in the immutable snapshot referenced by
   `exports/current-manifest.json`; and
-- `rejected`: invalid corpus material, not a negative example.
+- `excluded`: invalid corpus material retained with one or more structured
+  exclusion reasons, not a negative example.
 
-To label a valid negative scenario, approve it with an empty expected proposal
-list. **Export approved** writes an immutable JSONL snapshot and a digest- and
+To label a valid negative scenario, include it with an empty expected proposal
+list. **Export included** writes an immutable JSONL snapshot and a digest- and
 case-version-bound current manifest.
+Exclusion reasons cover missing context, missing attachments, broken references,
+ambiguous ground truth, sensitive content, duplicates, malformed captures,
+out-of-scope cases, and `other`. Multiple reasons may apply; `other` requires an
+explanation. Reviewer notes remain human-only audit context and are never written
+to evaluation snapshots.
 Start `tth-bot-ai-evaluate` manually before release decisions; reports are
 written under `reports/<run-id>/` and corpus text is not printed to logs.
 
@@ -95,7 +101,7 @@ attachment IDs, removes live attachment URLs, and evaluates every exported case
 in automatic mode. In particular, an accepted manual extraction means that the
 automatic pipeline should find the work in that context.
 
-Approved proposals use their final reviewed title, action, source messages, and
+Included proposals use their final reviewed title, action, source messages, and
 target semantics. The direct Dismiss control records `not_actionable` and becomes
 a negative case. The direct Incorrect control records `incorrect_proposal` and is
 excluded until a corrected expected result is reviewed. Historical clear-negative

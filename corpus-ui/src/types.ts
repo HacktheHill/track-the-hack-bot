@@ -1,4 +1,5 @@
-export type ReviewStatus = "pending" | "approved" | "rejected";
+export type ReviewStatus = "pending" | "included" | "excluded";
+export type ExclusionReason = "missing_context" | "missing_attachment" | "broken_reference" | "ambiguous_ground_truth" | "sensitive_content" | "duplicate" | "malformed_capture" | "out_of_scope" | "other";
 export type ProposalAction = "create" | "update" | "complete" | "reopen";
 export type ContextRole = "primary" | "preceding" | "subsequent" | "thread_root" | "reply_target" | "referenced_history";
 
@@ -23,7 +24,7 @@ export interface ExpectedProposal {
 }
 
 export interface CorpusCase {
-	schemaVersion: "v1";
+	schemaVersion: "v2";
 	id: string;
 	origin: { type: "reviewed_proposal" | "sampled_no_task" | "manual_scenario"; [key: string]: unknown };
 	window: {
@@ -36,6 +37,7 @@ export interface CorpusCase {
 	};
 	adjudication: {
 		status: ReviewStatus;
+		exclusionReasons: ExclusionReason[];
 		notes: string;
 		reviewedAt?: string;
 		reviewedBy?: string;
@@ -61,9 +63,9 @@ export interface DashboardSummary {
 	counters?: Partial<Record<ReviewStatus | "total", number>>;
 	total?: number;
 	pending?: number;
-	approved?: number;
-	rejected?: number;
-	export?: { lastExportedAt?: string; approvedCount?: number; filename?: string };
+	included?: number;
+	excluded?: number;
+	export?: { lastExportedAt?: string; includedCount?: number; filename?: string };
 	lastExportedAt?: string;
 	[key: string]: unknown;
 }

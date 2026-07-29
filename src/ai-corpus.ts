@@ -3,7 +3,19 @@ import { z } from "zod";
 import { minimizeText } from "./azure-openai.js";
 
 export const CORPUS_SCHEMA_VERSION = "v1" as const;
-export const CORPUS_CASE_SCHEMA_VERSION = "v1" as const;
+export const CORPUS_CASE_SCHEMA_VERSION = "v2" as const;
+
+export const corpusExclusionReasonSchema = z.enum([
+	"missing_context",
+	"missing_attachment",
+	"broken_reference",
+	"ambiguous_ground_truth",
+	"sensitive_content",
+	"duplicate",
+	"malformed_capture",
+	"out_of_scope",
+	"other",
+]);
 
 export const corpusMessageSchema = z.object({
 	id: z.string().min(1),
@@ -48,6 +60,24 @@ export const corpusWindowSchema = z.object({
 	}
 });
 
+const corpusAdjudicationSchema = z.object({
+	status: z.enum(["pending", "included", "excluded"]),
+	exclusionReasons: z.array(corpusExclusionReasonSchema).default([]),
+	notes: z.string().max(4000).default(""),
+	reviewedAt: z.iso.datetime().optional(),
+	reviewedBy: z.string().max(200).optional(),
+}).superRefine((adjudication, context) => {
+	if (adjudication.status === "excluded" && !adjudication.exclusionReasons.length) {
+		context.addIssue({ code: "custom", message: "Excluded corpus cases require at least one exclusion reason." });
+	}
+	if (adjudication.status !== "excluded" && adjudication.exclusionReasons.length) {
+		context.addIssue({ code: "custom", message: "Only excluded corpus cases may have exclusion reasons." });
+	}
+	if (adjudication.exclusionReasons.includes("other") && !adjudication.notes.trim()) {
+		context.addIssue({ code: "custom", message: "The other exclusion reason requires reviewer notes." });
+	}
+});
+
 export const corpusCaseSchema = z.object({
 	schemaVersion: z.literal(CORPUS_CASE_SCHEMA_VERSION),
 	id: z.string().min(1).max(160).regex(/^[a-zA-Z0-9._-]+$/),
@@ -57,18 +87,14 @@ export const corpusCaseSchema = z.object({
 		fingerprint: z.string().optional(),
 	}),
 	window: corpusWindowSchema,
-	adjudication: z.object({
-		status: z.enum(["pending", "approved", "rejected"]),
-		notes: z.string().max(4000).default(""),
-		reviewedAt: z.iso.datetime().optional(),
-		reviewedBy: z.string().max(200).optional(),
-	}),
+	adjudication: corpusAdjudicationSchema,
 	createdAt: z.iso.datetime(),
 	updatedAt: z.iso.datetime(),
 });
 
 export type CorpusWindow = z.infer<typeof corpusWindowSchema>;
 export type CorpusCase = z.infer<typeof corpusCaseSchema>;
+export type CorpusExclusionReason = z.infer<typeof corpusExclusionReasonSchema>;
 
 function sanitizeMetadata(value: unknown): unknown {
 	if (typeof value === "string") return minimizeText(value);

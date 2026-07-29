@@ -250,7 +250,7 @@ it in production.
 
 The canonical reviewed corpus lives in a private Azure Blob container. Real
 review outcomes are synchronized by the private `tth-bot-corpus-sync` Container
-Apps Job and enter an explicit approval queue. Start the review desk locally
+Apps Job and enter an explicit inclusion queue. Start the review desk locally
 after `az login`:
 
 ```bash
@@ -260,10 +260,11 @@ AI_CORPUS_STORAGE_ACCOUNT_URL=https://tthbotcorpus51fa.blob.core.windows.net \
 
 The server binds only to `127.0.0.1`, authenticates through
 `DefaultAzureCredential`, and prints the local URL. Cases remain excluded from
-evaluation until approved. An approved case with zero expected proposals is a
-valid negative example; rejecting a case removes it from the approved export.
+evaluation until included. An included case with zero expected proposals is a
+valid negative example. Unusable cases are retained as excluded records with
+structured reasons, but never enter evaluation exports.
 
-Use **Export approved** in the UI, then start the manual
+Use **Export included** in the UI, then start the manual
 `tth-bot-ai-evaluate` Azure job. Local file evaluation remains available:
 
 ```bash

@@ -46,16 +46,16 @@ export function createCorpusApp(options: { store: CorpusStore; token: string; as
 	app.get("/api/summary", async (_request, response, next) => {
 		try {
 			const cases = await options.store.listCases();
-			const counters = { total: cases.length, pending: 0, approved: 0, rejected: 0 };
+			const counters = { total: cases.length, pending: 0, included: 0, excluded: 0 };
 			for (const item of cases) counters[item.status]++;
 			const manifest = await options.store.getExportManifest();
-			response.json({ counters, ...counters, export: manifest ? { lastExportedAt: manifest.generatedAt, approvedCount: manifest.caseCount, sha256: manifest.sha256 } : null });
+			response.json({ counters, ...counters, export: manifest ? { lastExportedAt: manifest.generatedAt, includedCount: manifest.caseCount, sha256: manifest.sha256 } : null });
 		} catch (error) { next(error); }
 	});
 
 	app.get("/api/cases", async (request, response, next) => {
 		try {
-			const status = z.enum(["pending", "approved", "rejected"]).optional().parse(request.query.status);
+			const status = z.enum(["pending", "included", "excluded"]).optional().parse(request.query.status);
 			const query = typeof request.query.query === "string" ? request.query.query.toLocaleLowerCase().trim() : "";
 			const cases = (await options.store.listCases()).filter(item => (!status || item.status === status) && (!query || `${item.id}\n${item.preview}`.toLocaleLowerCase().includes(query)));
 			response.json({ cases });
@@ -92,7 +92,7 @@ export function createCorpusApp(options: { store: CorpusStore; token: string; as
 			const value = sanitizeCorpusCase(corpusCaseSchema.parse({
 				...input.case,
 				origin: { type: "manual_scenario" },
-				adjudication: { status: "pending", notes: input.case.adjudication.notes },
+				adjudication: { status: "pending", exclusionReasons: [], notes: input.case.adjudication.notes },
 				createdAt: now,
 				updatedAt: now,
 			}));
@@ -103,8 +103,8 @@ export function createCorpusApp(options: { store: CorpusStore; token: string; as
 
 	app.post("/api/export", async (_request, response, next) => {
 		try {
-			const manifest = await options.store.exportApproved();
-			response.json({ count: manifest.caseCount, message: `Exported ${manifest.caseCount} approved cases.`, manifest });
+			const manifest = await options.store.exportIncluded();
+			response.json({ count: manifest.caseCount, message: `Exported ${manifest.caseCount} included cases.`, manifest });
 		} catch (error) { next(error); }
 	});
 

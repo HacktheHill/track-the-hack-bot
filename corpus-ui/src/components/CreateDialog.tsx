@@ -30,11 +30,11 @@ export function CreateDialog({ open, onClose, onCreate }: CreateDialogProps) {
 		}
 		const now = new Date().toISOString();
 		const value: CorpusCase = {
-			schemaVersion: "v1",
+			schemaVersion: "v2",
 			id: id.trim(),
 			origin: { type: "manual_scenario" },
 			window: { id: id.trim(), mode, messages: [{ id: "m1", authorAlias: author.trim(), text: message.trim(), timestamp: now, contextRole: "primary", priority: true }], expected: { proposals: [] } },
-			adjudication: { status: "pending", notes: "" },
+			adjudication: { status: "pending", exclusionReasons: [], notes: "" },
 			createdAt: now,
 			updatedAt: now,
 		};

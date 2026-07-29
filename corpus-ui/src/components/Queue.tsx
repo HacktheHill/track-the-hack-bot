@@ -11,7 +11,7 @@ interface QueueProps {
 	onSelect: (id: string) => void;
 }
 
-const statuses: Array<ReviewStatus | "all"> = ["all", "pending", "approved", "rejected"];
+const statuses: Array<ReviewStatus | "all"> = ["all", "pending", "included", "excluded"];
 
 function summaryStatus(item: CaseSummary): ReviewStatus {
 	return item.status ?? item.adjudication?.status ?? "pending";

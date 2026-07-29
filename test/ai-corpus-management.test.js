@@ -7,7 +7,7 @@ import { noTaskEventIsSafe } from "../dist/sync-ai-corpus.js";
 function sampleCase(status = "pending") {
 	const now = "2026-07-29T12:00:00.000Z";
 	return corpusCaseSchema.parse({
-		schemaVersion: "v1",
+		schemaVersion: "v2",
 		id: "case-1",
 		origin: { type: "manual_scenario" },
 		window: {
@@ -16,7 +16,7 @@ function sampleCase(status = "pending") {
 			metadata: { projects: ["Partnerships Team"] },
 			expected: { proposals: [{ action: "create", titleIncludes: ["sponsor", "deck"], projectName: "Partnerships Team", sourceMessageIds: ["m1"] }] },
 		},
-		adjudication: { status, notes: "" },
+		adjudication: { status, exclusionReasons: status === "excluded" ? ["other"] : [], notes: status === "excluded" ? "Unusable capture." : "" },
 		createdAt: now, updatedAt: now,
 	});
 }
@@ -33,6 +33,15 @@ test("corpus cases reject unknown sources and invalid focal windows", () => {
 	const withoutFocus = sampleCase();
 	withoutFocus.window.messages[0].contextRole = "preceding";
 	assert.throws(() => corpusCaseSchema.parse(withoutFocus), /exactly one/);
+});
+
+test("corpus exclusions require structured reasons and notes for other", () => {
+	assert.throws(() => corpusCaseSchema.parse({ ...sampleCase(), adjudication: { status: "excluded", exclusionReasons: [], notes: "Missing context." } }), /exclusion reason/);
+	assert.throws(() => corpusCaseSchema.parse({ ...sampleCase(), adjudication: { status: "excluded", exclusionReasons: ["other"], notes: "" } }), /reviewer notes/);
+	assert.throws(() => corpusCaseSchema.parse({ ...sampleCase(), adjudication: { status: "included", exclusionReasons: ["missing_context"], notes: "" } }), /Only excluded/);
+	assert.equal(corpusCaseSchema.parse({ ...sampleCase(), adjudication: { status: "excluded", exclusionReasons: ["missing_context", "missing_attachment"], notes: "" } }).adjudication.status, "excluded");
+	assert.throws(() => corpusCaseSchema.parse({ ...sampleCase(), schemaVersion: "v1" }));
+	assert.throws(() => corpusCaseSchema.parse({ ...sampleCase(), adjudication: { status: "approved", exclusionReasons: [], notes: "" } }));
 });
 
 test("no-task sampling excludes contextual sensitivity and manual overrides", () => {
@@ -54,7 +63,7 @@ test("localhost corpus API requires its session token and uses ETags", async () 
 			if (expected && expected !== etag) throw Object.assign(new Error("conflict"), { statusCode: 412 });
 			value = next; etag = '"two"'; return { etag };
 		},
-		async exportApproved() { return { schemaVersion: "v1", generatedAt: new Date().toISOString(), caseCount: 0, positiveCases: 0, negativeCases: 0, sha256: "hash" }; },
+		async exportIncluded() { return { schemaVersion: "v1", generatedAt: new Date().toISOString(), caseCount: 0, positiveCases: 0, negativeCases: 0, sha256: "hash" }; },
 		async getExportManifest() { return null; },
 	};
 	const app = createCorpusApp({ store, token: "secret", assetsDirectory: "/does-not-matter", reviewer: "tester" });
@@ -68,14 +77,14 @@ test("localhost corpus API requires its session token and uses ETags", async () 
 		const summary = await fetch(`${base}/api/summary`, { headers: { Cookie: "corpus_session=secret" } });
 		assert.equal(summary.status, 200);
 		assert.equal((await summary.json()).pending, 1);
-		const approved = sampleCase("approved");
+		const included = sampleCase("included");
 		const update = await fetch(`${base}/api/cases/case-1`, {
 			method: "PUT", headers: { "Content-Type": "application/json", Cookie: "corpus_session=secret" },
-			body: JSON.stringify({ case: approved, etag: '"one"' }),
+			body: JSON.stringify({ case: included, etag: '"one"' }),
 		});
 		assert.equal(update.status, 200);
 		assert.equal((await update.json()).case.adjudication.reviewedBy, "tester");
-		const requested = sampleCase("approved");
+		const requested = sampleCase("included");
 		requested.id = "case-2";
 		requested.window.id = "case-2";
 		requested.adjudication.reviewedBy = "untrusted-client";

@@ -14,11 +14,11 @@ const databaseConfigSchema = z.object({ DATABASE_URL: z.string().min(1) });
 function caseFromWindow(window: CorpusWindow, origin: CorpusCase["origin"]): CorpusCase {
 	const now = new Date().toISOString();
 	return corpusCaseSchema.parse({
-		schemaVersion: "v1",
+		schemaVersion: "v2",
 		id: window.id,
 		origin,
 		window,
-		adjudication: { status: "pending", notes: "" },
+		adjudication: { status: "pending", exclusionReasons: [], notes: "" },
 		createdAt: now,
 		updatedAt: now,
 	});
@@ -51,7 +51,7 @@ async function reconcileCase(store: AzureBlobCorpusStore, value: CorpusCase) {
 		if (existing.case.origin.fingerprint === value.origin.fingerprint) return "unchanged" as const;
 		await store.putCase({
 			...value,
-			adjudication: { status: "pending", notes: existing.case.adjudication.notes },
+			adjudication: { status: "pending", exclusionReasons: [], notes: existing.case.adjudication.notes },
 			createdAt: existing.case.createdAt,
 			updatedAt: new Date().toISOString(),
 		}, existing.etag);
@@ -114,7 +114,7 @@ async function main() {
 				excluded++;
 				invalidated = true;
 			}
-			if (invalidated) await store.invalidateApprovedExports();
+			if (invalidated) await store.invalidateIncludedExports();
 		}
 		const rows = await loadReviewedExtractionRows(pool, corpusConfig.AI_CORPUS_SYNC_DAYS);
 		const reviewed = rows.map(row => ({ row, window: buildCorpusWindow(row) }));

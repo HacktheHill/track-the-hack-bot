@@ -33,5 +33,5 @@ export const corpusApi = {
 		method: "POST",
 		body: JSON.stringify({ case: value }),
 	}),
-	exportApproved: () => request<{ filename?: string; count?: number; message?: string }>("/api/export", { method: "POST" }),
+	exportIncluded: () => request<{ filename?: string; count?: number; message?: string }>("/api/export", { method: "POST" }),
 };

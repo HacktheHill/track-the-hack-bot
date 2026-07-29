@@ -43,7 +43,7 @@ async function main() {
 		const corpusBlob = container.getBlobClient(manifest.blobName);
 		const corpusPath = join(directory, "current.jsonl");
 		const corpusText = await streamText((await corpusBlob.download()).readableStreamBody);
-		if (createHash("sha256").update(corpusText).digest("hex") !== manifest.sha256) throw new Error("Approved corpus digest does not match its manifest.");
+		if (createHash("sha256").update(corpusText).digest("hex") !== manifest.sha256) throw new Error("Included corpus digest does not match its manifest.");
 		await writeFile(corpusPath, corpusText, { mode: 0o600 });
 		const evaluationConfig = evaluationEnvSchema.parse(process.env);
 		const cacheKeys = parseCorpusJsonl(corpusText).map(window => evaluationCacheKey(window, evaluationConfig));
