@@ -1,4 +1,4 @@
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, Client, Message, type MessageCreateOptions } from "discord.js";
+import { ChannelType, Client, Message, type MessageCreateOptions } from "discord.js";
 import { automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, SensitiveContentError, StructuredOutputError, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 import { isOrganizerGuild, type IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
@@ -308,6 +308,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						startDate: task.start_date ?? undefined, dueDate, estimatedHours, metadataInference,
 						sourceMessageIds: task.source_message_ids, sourceLinks,
 						sourceAttachments,
+						ragCandidates,
 						modelDeployment: deployment, permittedReviewerIds: [...reviewers], evidence: task.evidence,
 						ambiguities: [...result.ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: pipelineLatencyMs, tokenUsage: pipelineUsage,
 						action, targetWorkPackageId: match.workPackageId, targetLockVersion: target!.lockVersion,
@@ -327,10 +328,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					});
 					const reviewPayload: ReviewCardPayload = {
 						content: boundedDiscordContent(`${ownerText}Proposed ${action} for OpenProject task ${workPackageMarkdownLink(target!.id, target!.subject, services.openProject.workPackageUrl(target!.id))}\nProposed title: **${task.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch).map(item => `- ${item}`).join("\n")}${operations.contentOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : ""}`),
-						components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
-							new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and apply").setStyle(ButtonStyle.Primary),
-							new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
-						)],
+						components: proposalReviewComponents(proposal.id, action, ragCandidates, true),
 						allowedMentions: { parse: [] },
 					};
 					proposalIds.add(proposal.id);

@@ -271,6 +271,25 @@ test("reviewers can safely retarget a create proposal as an update", async () =>
 	assert.deepEqual(updated.values, ["proposal", 42, 3, "{}", "postComment", "## Update\n\n- Revise it.", 7]);
 });
 
+test("existing proposals retarget only before any operation is applied", async () => {
+	let updated;
+	const db = databaseWithPool({
+		async query(sql, values) {
+			updated = { sql, values };
+			return { rowCount: 1, rows: [] };
+		},
+	});
+	await db.retargetProposal({
+		id: "proposal", expectedTargetWorkPackageId: 41, projectId: 7,
+		targetWorkPackageId: 42, targetLockVersion: 3,
+		metadataPatch: { dueDate: "2026-08-01" }, contentOperation: "postComment", contentMarkdown: "Update",
+	});
+	assert.match(updated.sql, /target_work_package_id=\$2/);
+	assert.match(updated.sql, /patch_applied_at IS NULL/);
+	assert.match(updated.sql, /comment_activity_id IS NULL/);
+	assert.deepEqual(updated.values, ["proposal", 41, 42, 3, '{"dueDate":"2026-08-01"}', "postComment", "Update", 7]);
+});
+
 test("proposal creation finalizes status, audit, and reviewed snapshot atomically", async () => {
 	const queries = [];
 	const client = {

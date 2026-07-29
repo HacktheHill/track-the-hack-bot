@@ -781,6 +781,28 @@ export class Database {
 		if (result.rowCount !== 1) throw new Error("This proposal is no longer available for target selection.");
 	}
 
+	async retargetProposal(input: {
+		id: string;
+		expectedTargetWorkPackageId: number;
+		projectId: number;
+		targetWorkPackageId: number;
+		targetLockVersion: number;
+		metadataPatch: ProposalMetadataPatch;
+		contentOperation: ContentOperation;
+		contentMarkdown: string | null;
+	}) {
+		const result = await this.pool.query(
+			`UPDATE task_proposals SET target_work_package_id=$3, target_lock_version=$4,
+			 operation_schema_version=1, metadata_patch=$5, content_operation=$6, content_markdown=$7,
+			 project_id=$8, updated_at=now()
+			 WHERE id=$1 AND status='pending_review' AND target_work_package_id=$2
+			 AND patch_applied_at IS NULL AND comment_activity_id IS NULL`,
+			[input.id, input.expectedTargetWorkPackageId, input.targetWorkPackageId, input.targetLockVersion,
+				jsonParameter(input.metadataPatch), input.contentOperation, input.contentMarkdown, input.projectId],
+		);
+		if (result.rowCount !== 1) throw new Error("This proposal changed or is no longer available for retargeting.");
+	}
+
 	async proposal(id: string) {
 		const result = await this.pool.query<{
 			id: string; requester_discord_id: string | null; channel_id: string;

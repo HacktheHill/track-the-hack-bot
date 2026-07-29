@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, proposalReviewComponents, relevantImageAttachments, removeProposalReviewCard, taskCommand, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
+import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, handleProposalTargetSelect, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, proposalReviewComponents, relevantImageAttachments, removeProposalReviewCard, taskCommand, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
 import { normalizeTaskTitle, OpenProjectClient, openProjectAttachmentFileName, titlesLikelyDuplicate, workPackageMarkdownLink } from "../dist/openproject.js";
 
 test("task defaults start today and use the configured due offset", () => {
@@ -237,6 +237,52 @@ test("RAG proposal candidates use a bounded single-choice target menu", () => {
 		["43", "#43 Sponsor outreach"],
 	]);
 	assert.equal(menu.max_values, 1);
+	assert.equal(proposalReviewComponents("proposal", "update", [{
+		workPackageId: 42, projectId: 7, lockVersion: 1, subject: "Sponsor prospectus", retrievalRank: 0,
+		relationship: "same_work", confidence: 0.93, similarity: 0.72,
+	}]).length, 2);
+});
+
+test("reviewers can retarget a nominated update through its allowlisted menu", async () => {
+	let retargeted;
+	let edited;
+	let deferred = false;
+	const candidate = {
+		workPackageId: 42, projectId: 7, lockVersion: 3, subject: "Sponsor prospectus", retrievalRank: 1,
+		relationship: "same_work", confidence: 0.9, similarity: 0.7,
+	};
+	const proposal = {
+		id: "proposal", status: "pending_review", expires_at: "2999-01-01T00:00:00Z", claim_expires_at: null,
+		requester_discord_id: "reviewer", permitted_reviewer_ids: ["reviewer"], action: "update",
+		target_work_package_id: 41, title: "Revise prospectus", description: "Apply the revisions",
+		assignee_discord_id: null, priority_id: null, size_href: null, start_date: null, due_date: "2026-08-01",
+		estimated_hours: null, metadata_patch: { dueDate: "2026-08-01" }, content_operation: "postComment",
+		rag_candidates: [candidate], review_message_id: null,
+	};
+	const interaction = {
+		customId: "op-existing-target:proposal", values: ["42"], user: { id: "reviewer" },
+		message: { id: "message", flags: { has: () => true } },
+		deferUpdate: async () => { deferred = true; },
+		editReply: async payload => { edited = payload; },
+	};
+	const services = {
+		db: {
+			proposal: async () => proposal,
+			retargetProposal: async input => { retargeted = input; },
+			logTaskEvent: async () => {},
+		},
+		openProject: {
+			workPackage: async id => ({ id, subject: "Sponsor prospectus", description: "Existing scope", lockVersion: 4, project: { id: 7 }, _links: {} }),
+			projects: async () => [{ id: 7 }],
+			workPackageUrl: id => `https://openproject.test/work_packages/${id}`,
+		},
+	};
+	assert.equal(await handleProposalTargetSelect(interaction, services), true);
+	assert.equal(deferred, true);
+	assert.equal(retargeted.expectedTargetWorkPackageId, 41);
+	assert.equal(retargeted.targetWorkPackageId, 42);
+	assert.deepEqual(retargeted.metadataPatch, { dueDate: "2026-08-01" });
+	assert.deepEqual(edited.allowedMentions, { parse: [] });
 });
 
 test("AI task descriptions omit Discord attachment links without verbatim source text", () => {

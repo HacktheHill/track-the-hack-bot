@@ -32,7 +32,7 @@ import { correctionFields, Database, proposalDismissalReasons, type CorrectionFl
 import { OpenProjectClient, OpenProjectRequestError, openProjectAttachmentFileName, workPackageChangesApplied, workPackageMarkdownLink, type OpenProjectAttachmentInput } from "./openproject.js";
 import { attachExtractionDiagnostics, automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, StructuredOutputError, type ExtractedTasks, type ExtractionResult, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
-import { composeOpenProjectMarkdown, describeProposalOperations, formatGeneratedTaskDescription, planExistingTaskOperations, sourceContentHash, taskReferencesAreValid, type ProposalMetadataPatch } from "./task-proposals.js";
+import { composeOpenProjectMarkdown, describeProposalOperations, formatGeneratedTaskDescription, planExistingTaskOperations, sourceContentHash, taskReferencesAreValid, type MetadataFieldName, type ProposalMetadataPatch } from "./task-proposals.js";
 
 export const taskCommand = new SlashCommandBuilder()
 	.setName("task")
@@ -552,7 +552,7 @@ export function proposalReviewComponents(
 	const rows: Array<ActionRowBuilder<ButtonBuilder> | ActionRowBuilder<StringSelectMenuBuilder>> = [
 		new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons),
 	];
-	if (action === "create" && candidates.length) {
+	if (candidates.length) {
 		const menu = new StringSelectMenuBuilder()
 			.setCustomId(`op-existing-target:${proposalId}`)
 			.setPlaceholder("Use an existing OpenProject task instead")
@@ -1713,6 +1713,7 @@ async function completeAiCandidate(
 			estimatedHours, metadataInference, sourceMessageIds: candidate.source_message_ids,
 			sourceLinks,
 			sourceAttachments,
+			ragCandidates,
 			modelDeployment: deployment, evidence: candidate.evidence,
 			ambiguities: [...result.ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: proposalLatencyMs,
 			tokenUsage: proposalTokenUsage, escalationReason: extraction.escalationReason,
@@ -1772,7 +1773,7 @@ async function completeAiCandidate(
 		const warning = displayedOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : "";
 		await deliverProposalReply(interaction, services, proposal.id, {
 			content: boundedDiscordContent(`**Possible ${displayedAction} for ${displayedWorkPackageLink}**\n${operationSummary.map(item => `- ${item}`).join("\n")}${warning}\n\n${redisplayed?.title ?? candidate.title}\n${redisplayed?.description ?? description}${redisplayed ? "" : `\n\nSimilarity: ${Math.round(match.similarity * 100)}%`}`),
-			components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...manualProposalButtons(proposal.id, displayedAction))],
+			components: proposalReviewComponents(proposal.id, displayedAction, redisplayed?.rag_candidates ?? ragCandidates),
 		}, !proposal.reused, replaceReply);
 		return;
 	}
@@ -1876,7 +1877,6 @@ async function applyExistingProposalTarget(
 	targetId: number,
 	selectedCandidate?: ProposalRagCandidate,
 ) {
-	if (proposal.action !== "create") throw new Error("This proposal already targets existing work.");
 	if (!Number.isSafeInteger(targetId) || targetId <= 0) throw new Error("The suggested OpenProject task is invalid.");
 	const target = await services.openProject.workPackage(targetId);
 	const targetProjectId = (target.project?.id ?? Number(target._links.project?.href.split("/").at(-1))) || undefined;
@@ -1884,23 +1884,45 @@ async function applyExistingProposalTarget(
 		throw new Error("The suggested task is not in an active OpenProject project.");
 	}
 	if (selectedCandidate && selectedCandidate.projectId !== targetProjectId) throw new Error("The suggested task moved projects. Run extraction again before selecting it.");
+	const fieldNames: Record<string, MetadataFieldName> = {
+		subject: "subject", assigneeDiscordId: "assignee", priorityId: "priority", sizeHref: "size",
+		startDate: "start_date", dueDate: "due_date", estimatedHours: "estimated_hours",
+	};
+	const metadataFields = proposal.action === "create"
+		? []
+		: Object.keys(proposal.metadata_patch).map(field => fieldNames[field]).filter((field): field is MetadataFieldName => Boolean(field));
+	const contentIntent = proposal.action === "create" || proposal.content_operation === "postComment"
+		? "update_note" as const
+		: proposal.content_operation === "descriptionReplacement" ? "replace_description" as const : "none" as const;
 	const operations = planExistingTaskOperations({
 		workPackage: target,
-		requestedAction: "update",
-		contentIntent: "update_note",
+		requestedAction: proposal.action === "create" ? "update" : proposal.action,
+		contentIntent,
 		description: proposal.description,
-		metadataFields: [],
-		values: { title: proposal.title },
+		metadataFields,
+		values: {
+			title: proposal.title,
+			assigneeDiscordId: proposal.assignee_discord_id ?? undefined,
+			priorityId: proposal.priority_id ?? undefined,
+			sizeHref: proposal.size_href ?? undefined,
+			startDate: databaseDate(proposal.start_date) ?? undefined,
+			dueDate: databaseDate(proposal.due_date) ?? undefined,
+			estimatedHours: proposal.estimated_hours == null ? undefined : Number(proposal.estimated_hours),
+		},
 	});
-	await services.db.convertProposalToUpdate({
-		id: proposal.id,
-		projectId: targetProjectId,
-		targetWorkPackageId: target.id,
-		targetLockVersion: target.lockVersion,
-		metadataPatch: operations.metadataPatch,
-		contentOperation: operations.contentOperation,
-		contentMarkdown: operations.contentMarkdown,
-	});
+	if (proposal.action === "create") {
+		await services.db.convertProposalToUpdate({
+			id: proposal.id, projectId: targetProjectId, targetWorkPackageId: target.id, targetLockVersion: target.lockVersion,
+			metadataPatch: operations.metadataPatch, contentOperation: operations.contentOperation, contentMarkdown: operations.contentMarkdown,
+		});
+	} else {
+		if (!proposal.target_work_package_id) throw new Error("This proposal has no current target.");
+		await services.db.retargetProposal({
+			id: proposal.id, expectedTargetWorkPackageId: proposal.target_work_package_id,
+			projectId: targetProjectId, targetWorkPackageId: target.id, targetLockVersion: target.lockVersion,
+			metadataPatch: operations.metadataPatch, contentOperation: operations.contentOperation, contentMarkdown: operations.contentMarkdown,
+		});
+	}
 	if (selectedCandidate) {
 		void services.db.logTaskEvent(target.id, "rag_target_selected", interaction.user.id, {
 			proposalId: proposal.id,
@@ -1910,16 +1932,17 @@ async function applyExistingProposalTarget(
 			retrievalScore: selectedCandidate.similarity,
 		}).catch(error => console.error("RAG target selection audit failed", { proposalId: proposal.id, error: (error as Error).message }));
 	}
-	const buttons = manualProposalButtons(proposal.id, "update");
+	const resultingAction = proposal.action === "create" ? "update" : proposal.action;
+	const buttons = manualProposalButtons(proposal.id, resultingAction);
 	if (!interaction.message.flags.has(MessageFlags.Ephemeral)) buttons.push(new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary));
 	await interaction.editReply({
-		content: boundedDiscordContent(`Proposal will update OpenProject task ${workPackageMarkdownLink(target.id, target.subject, services.openProject.workPackageUrl(target.id))}\nProposed title: **${proposal.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch).map(item => `- ${item}`).join("\n")}`),
+		content: boundedDiscordContent(`Proposal will ${resultingAction} OpenProject task ${workPackageMarkdownLink(target.id, target.subject, services.openProject.workPackageUrl(target.id))}\nProposed title: **${proposal.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch).map(item => `- ${item}`).join("\n")}`),
 		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons)],
 		allowedMentions: { parse: [] },
 	});
 }
 
-async function handleProposalTargetSelect(interaction: StringSelectMenuInteraction, services: Services) {
+export async function handleProposalTargetSelect(interaction: StringSelectMenuInteraction, services: Services) {
 	if (!interaction.customId.startsWith("op-existing-target:")) return false;
 	const id = interaction.customId.split(":")[1];
 	const proposal = await services.db.proposal(id);
