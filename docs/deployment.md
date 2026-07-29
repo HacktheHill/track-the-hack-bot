@@ -78,7 +78,7 @@ Key Vault access should likewise be granted only to the identity that needs
 them.
 
 Evaluate at least 100 representative pseudonymized conversation windows through
-both extraction and the schema-v3 precision gate. Record per-stage latency and
+both extraction and the schema-v4 precision gate. Record per-stage latency and
 tokens, valid-output rate, false-task rate, assignee accuracy, deadline accuracy,
 source-ID accuracy, sensitivity outcomes, and routing accuracy. Start with
 `OPENPROJECT_AUTOMATION_MODE=shadow`, which records extraction and gate telemetry

@@ -9,7 +9,7 @@ async function guildChannel(guild: Guild, channelId: string) {
 export function normalizeProjectName(value: string) {
 	return value
 		.normalize("NFKC")
-		.replace(/[\p{Extended_Pictographic}\p{Emoji_Modifier}\uFE0E\uFE0F\u200D]/gu, " ")
+		.replace(/[\p{Extended_Pictographic}\p{Emoji_Presentation}\p{Emoji_Modifier}\uFE0E\uFE0F\u200D]/gu, " ")
 		.replace(/[_-]+/g, " ")
 		.replace(/\s+/g, " ")
 		.trim()

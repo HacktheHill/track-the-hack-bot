@@ -89,10 +89,10 @@ above the Hacker and Organizer roles that it manages.
 - **`/task create`**: Members-role users in the Organizer server create tasks;
   the title is required, while the project can be selected explicitly or
   inferred by matching the channel name and then its category name to an active
-  OpenProject project. Description, assignee,
-  accountable user, priority, size, dates, and estimates are optional.
+  OpenProject project, or from one unambiguous proposed-owner team. Description,
+  assignee, accountable user, priority, size, dates, and estimates are optional.
 - **`/task view|assign|reschedule|close|reopen|announce`**: Manage an existing task.
-- **`/task link-user`, `/task reconcile`**: Organizer-only identity and
+- **`/task link-user`, `/task reconcile`**: Organizer-only identity mapping and
   ambiguous-create recovery commands.
 - **`/task metrics`**: Organizer-only AI proposal outcomes, edit rates, latency,
   token usage, and failure counts for the previous 7, 30, or 90 days.
@@ -127,7 +127,8 @@ source-message author's team is never used for routing.
 `OPENPROJECT_BLOCKED_CHANNEL_IDS` remains supported
 for exact channel blocks. `OPENPROJECT_EXCLUDED_CHANNEL_IDS` accepts both
 channel and category IDs; category IDs exclude all descendant channels and are
-used for the External category.
+used for the External and Information categories. Exclusions block manual and
+automatic task creation and extraction.
 
 The bot also reconciles unmapped Organizer members with assignable active or
 invited OpenProject users at startup and daily. It auto-links only unique exact

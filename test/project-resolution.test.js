@@ -9,6 +9,7 @@ const channel = (id, name, parentId = null, type = ChannelType.GuildText) => ({
 
 test("project names ignore Discord emoji, separators, whitespace, and case", () => {
 	assert.equal(normalizeProjectName("  Communications-Team 📢 "), "communications team");
+	assert.equal(normalizeProjectName("Logistics 🇨🇦"), "logistics");
 	assert.equal(projectIdForName("community_team 🎭", [{ id: 7, name: "Community Team" }]), 7);
 	assert.equal(projectIdForName("General", [{ id: 1, name: "General" }, { id: 2, name: "general" }]), undefined);
 });
