@@ -383,6 +383,9 @@ test("proposal metrics aggregate RAG model and reviewer outcomes", async () => {
 			if (sql.includes("WITH evaluations AS")) return { rows: [{
 				evaluations: "20", recommendations: "8", abstentions: "10", failures: "2", average_latency_ms: "325.5",
 			}] };
+			if (sql.includes("WITH decisions AS")) return { rows: [{
+				no_task: "3", incorrect: "2", reextracted: "1", reextracted_approved: "1",
+			}] };
 			if (sql.includes("event='rag_target_selected'")) return { rows: [{
 				selections: "5", accepted_recommendations: "3", mean_reciprocal_rank: "0.7", recall_at_3: "0.8",
 				reviewed_candidates: "6", keep_new_decisions: "2",
@@ -403,6 +406,10 @@ test("proposal metrics aggregate RAG model and reviewer outcomes", async () => {
 	assert.equal(metrics.ragMeanReciprocalRank, 0.7);
 	assert.equal(metrics.ragRecallAt3, 0.8);
 	assert.equal(metrics.ragKeepNewRate, 1 / 3);
+	assert.equal(metrics.noTaskDismissals, 3);
+	assert.equal(metrics.incorrectProposals, 2);
+	assert.equal(metrics.incorrectReextractions, 1);
+	assert.equal(metrics.incorrectReextractionApprovalRate, 1);
 });
 
 test("dismissed proposals require and persist a structured reason", async () => {
@@ -412,6 +419,26 @@ test("dismissed proposals require and persist a structured reason", async () => 
 	assert.equal(await db.setProposalStatus("proposal", "dismissed", "reviewer", "question_or_announcement"), true);
 	assert.match(query.sql, /dismissal_reason=\$4/);
 	assert.deepEqual(query.values, ["proposal", "dismissed", "reviewer", "question_or_announcement"]);
+});
+
+test("direct proposal dismissals atomically preserve immutable review telemetry", async () => {
+	const queries = [];
+	const client = {
+		async query(sql, values) {
+			queries.push({ sql, values });
+			if (sql.includes("UPDATE task_proposals")) return { rowCount: 1, rows: [{ id: "proposal" }] };
+			return { rowCount: null, rows: [] };
+		},
+		release() {},
+	};
+	const db = databaseWithPool({ async connect() { return client; } });
+	assert.equal(await db.dismissProposal("proposal", "reviewer", "incorrect_proposal"), true);
+	assert.equal(queries[0].sql, "BEGIN");
+	assert.match(queries[1].sql, /dismissal_reason=\$3/);
+	assert.deepEqual(queries[1].values, ["proposal", "reviewer", "incorrect_proposal"]);
+	assert.match(queries[2].sql, /'proposal_dismissed'/);
+	assert.deepEqual(queries[2].values, ["proposal", "reviewer", { reason: "incorrect_proposal" }]);
+	assert.equal(queries[3].sql, "COMMIT");
 });
 
 test("proposal delivery failures become retryable failed proposals", async () => {

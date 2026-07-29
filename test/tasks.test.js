@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, handleProposalTargetSelect, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, proposalReviewComponents, relevantImageAttachments, removeProposalReviewCard, taskCommand, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
+import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, directProposalDismissalReason, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, handleProposalButton, handleProposalTargetSelect, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, proposalReviewComponents, relevantImageAttachments, removeProposalReviewCard, taskCommand, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
 import { formatProposalContent } from "../dist/task-proposals.js";
 import { normalizeTaskTitle, OpenProjectClient, openProjectAttachmentFileName, titlesLikelyDuplicate, workPackageMarkdownLink } from "../dist/openproject.js";
 
@@ -220,10 +220,49 @@ test("AI task descriptions omit URLs from cited messages", () => {
 	assert.equal(description, "Create the outreach tracker.");
 });
 
-test("ephemeral proposal controls omit Dismiss and remain actionable", () => {
-	assert.deepEqual(manualProposalButtons("proposal", "update").map(button => button.toJSON().custom_id), ["op-review:proposal"]);
-	assert.deepEqual(manualProposalButtons("proposal", "create").map(button => button.toJSON().custom_id), ["op-review:proposal", "op-duplicate:proposal"]);
-	assert.deepEqual(manualProposalButtons("proposal", "create", 42).map(button => button.toJSON().custom_id), ["op-review:proposal", "op-use-existing:proposal:42", "op-duplicate:proposal"]);
+test("proposal controls expose the three direct review outcomes", () => {
+	for (const action of ["create", "update", "complete", "reopen"]) {
+		const buttons = manualProposalButtons("proposal", action).map(button => button.toJSON());
+		assert.deepEqual(buttons.map(button => [button.custom_id, button.label]), [
+			["op-review:proposal", "Review"],
+			["op-dismiss-no-task:proposal", "Dismiss"],
+			["op-incorrect:proposal", "Incorrect"],
+		]);
+	}
+	assert.equal(directProposalDismissalReason("op-dismiss-no-task:proposal"), "not_actionable");
+	assert.equal(directProposalDismissalReason("op-incorrect:proposal"), "incorrect_proposal");
+	assert.equal(directProposalDismissalReason("op-review:proposal"), undefined);
+});
+
+test("direct dismissal buttons immediately persist their distinct classifications", async () => {
+	const decisions = [];
+	for (const [customId, expectedReason, expectedContent] of [
+		["op-dismiss-no-task:proposal", "not_actionable", "Proposal dismissed."],
+		["op-incorrect:proposal", "incorrect_proposal", "Proposal marked incorrect."],
+	]) {
+		let deferred = false;
+		let reply;
+		const interaction = {
+			customId,
+			user: { id: "reviewer" },
+			message: { id: "message", flags: { has: () => true } },
+			async deferUpdate() { deferred = true; },
+			async editReply(payload) { reply = payload; },
+		};
+		const services = {
+			db: {
+				async proposal() { return {
+					id: "proposal", status: "pending_review", expires_at: "2999-01-01T00:00:00Z", claim_expires_at: null,
+					requester_discord_id: "reviewer", permitted_reviewer_ids: ["reviewer"], review_message_id: null,
+				}; },
+				async dismissProposal(id, reviewerId, reason) { decisions.push([id, reviewerId, reason]); return true; },
+			},
+		};
+		await handleProposalButton(interaction, services);
+		assert.equal(deferred, true);
+		assert.deepEqual(reply, { content: expectedContent, components: [] });
+		assert.deepEqual(decisions.at(-1), ["proposal", "reviewer", expectedReason]);
+	}
 });
 
 test("RAG proposal candidates use a bounded single-choice target menu", () => {
@@ -400,6 +439,7 @@ test("AI metrics formatter reports operational quality without content", () => {
 		ragAverageLatencyMs: 325, ragSelections: 5, ragRecommendationAcceptanceRate: 0.6,
 		ragMeanReciprocalRank: 0.7, ragRecallAt3: 0.8, ragReviewedCandidates: 6,
 		ragKeepNewDecisions: 2, ragKeepNewRate: 1 / 3,
+		noTaskDismissals: 3, incorrectProposals: 2, incorrectReextractions: 1, incorrectReextractionApprovalRate: 1,
 		correctionRates: Object.fromEntries(["title", "description", "project", "assignee", "accountable", "priority", "size", "startDate", "dueDate", "estimate"].map(field => [field, 0.1])),
 	});
 	assert.match(text, /last 30 days/);
@@ -409,6 +449,7 @@ test("AI metrics formatter reports operational quality without content", () => {
 	assert.match(text, /MRR: 0\.70/);
 	assert.match(text, /recall@3: 80%/);
 	assert.match(text, /keep new: 2\/6 \(33%\)/);
+	assert.match(text, /Dismissals: no task: 3 · incorrect: 2 · re-extracted: 1 · corrected and approved: 100%/);
 });
 
 test("duplicate detection normalizes punctuation and compares meaningful words", () => {

@@ -309,7 +309,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					});
 					const reviewPayload: ReviewCardPayload = {
 						content: boundedDiscordContent(`${ownerText}Proposed ${action} for OpenProject task ${workPackageMarkdownLink(target!.id, target!.subject, services.openProject.workPackageUrl(target!.id))}\nProposed title: **${task.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch, { assignee: assignee?.displayName ?? assignee?.user.username, priority: priority?.name, size: size?.value }).map(item => `- ${item}`).join("\n")}${operations.contentOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : ""}${formatProposalContent(operations.contentOperation, operations.contentMarkdown)}${result.ambiguities.length ? `\n\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`),
-						components: proposalReviewComponents(proposal.id, action, ragCandidates, true),
+						components: proposalReviewComponents(proposal.id, action, ragCandidates),
 						allowedMentions: { parse: [] },
 					};
 					proposalIds.add(proposal.id);
@@ -381,7 +381,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				});
 				const reviewPayload: ReviewCardPayload = {
 					content: boundedDiscordContent(`${ownerText}Proposed OpenProject task: **${task.title}**\n${description}\n\nProject: ${projects.find(item => item.id === projectId)?.name ?? "Not resolved"}\nPriority: ${priority?.name ?? "Not inferred"}\nSize: ${size?.value ?? "Not inferred"}\nDates: ${task.start_date ?? "Not set"} → ${dueDate}\nEstimate: ${estimatedHours !== undefined ? `${estimatedHours}h` : "Not inferred"}${advisory ? `\n\n${advisory}` : ""}${result.ambiguities.length ? `\n\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`),
-					components: proposalReviewComponents(proposal.id, "create", ragCandidates, true),
+					components: proposalReviewComponents(proposal.id, "create", ragCandidates),
 					allowedMentions: { parse: [] },
 				};
 				proposalIds.add(proposal.id);

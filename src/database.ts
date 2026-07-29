@@ -79,6 +79,10 @@ export type ProposalMetrics = {
 	ragReviewedCandidates: number;
 	ragKeepNewDecisions: number;
 	ragKeepNewRate: number;
+	noTaskDismissals: number;
+	incorrectProposals: number;
+	incorrectReextractions: number;
+	incorrectReextractionApprovalRate: number;
 	correctionRates: Record<CorrectionField, number>;
 };
 
@@ -861,6 +865,35 @@ export class Database {
 		return result.rowCount === 1;
 	}
 
+	async dismissProposal(id: string, reviewerId: string, reason: "not_actionable" | "incorrect_proposal") {
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			const result = await client.query(
+				`UPDATE task_proposals SET status='dismissed', reviewer_discord_id=$2,
+				 review_outcome='dismissed', dismissal_reason=$3, reviewed_at=now(),
+				 review_duration_ms=GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(review_started_at, created_at))) * 1000)::integer,
+				 updated_at=now() WHERE id=$1 AND status='pending_review' AND expires_at > now() RETURNING id`,
+				[id, reviewerId, reason],
+			);
+			if (result.rowCount !== 1) {
+				await client.query("ROLLBACK");
+				return false;
+			}
+			await client.query(
+				"INSERT INTO task_audit_log(proposal_id,event,actor_discord_id,metadata) VALUES($1,'proposal_dismissed',$2,$3)",
+				[id, reviewerId, { reason }],
+			);
+			await client.query("COMMIT");
+			return true;
+		} catch (error) {
+			await client.query("ROLLBACK");
+			throw error;
+		} finally {
+			client.release();
+		}
+	}
+
 	async markProposalDeliveryFailed(id: string, error: string) {
 		await this.pool.query(
 			`UPDATE task_proposals SET status='failed', review_outcome='delivery_failed', error=$2,
@@ -1258,10 +1291,31 @@ export class Database {
 			FROM task_proposals WHERE reviewed_at >= now() - ($1::text || ' days')::interval`,
 			[days],
 		);
+		const dismissal = await this.pool.query<{
+			no_task: string; incorrect: string; reextracted: string; reextracted_approved: string;
+		}>(
+			`WITH decisions AS (
+				SELECT proposal_id,created_at,metadata->>'reason' AS reason
+				FROM task_audit_log
+				WHERE event='proposal_dismissed' AND created_at >= now() - ($1::text || ' days')::interval
+			), outcomes AS (
+				SELECT decisions.*,
+				 EXISTS (SELECT 1 FROM task_proposal_extractions link JOIN ai_extraction_events extraction ON extraction.id=link.extraction_event_id
+					WHERE link.proposal_id=decisions.proposal_id AND extraction.created_at > decisions.created_at) AS reextracted
+				FROM decisions
+			)
+			SELECT COUNT(*) FILTER (WHERE reason='not_actionable')::text AS no_task,
+				COUNT(*) FILTER (WHERE reason='incorrect_proposal')::text AS incorrect,
+				COUNT(*) FILTER (WHERE reason='incorrect_proposal' AND reextracted)::text AS reextracted,
+				COUNT(*) FILTER (WHERE reason='incorrect_proposal' AND reextracted AND proposal.review_outcome IN ('approved','update','complete','reopen'))::text AS reextracted_approved
+			FROM outcomes LEFT JOIN task_proposals proposal ON proposal.id=outcomes.proposal_id`,
+			[days],
+		);
 		const p = proposal.rows[0];
 		const e = extraction.rows[0];
 		const r = rag.rows[0];
 		const rr = ragReview.rows[0];
+		const d = dismissal.rows[0];
 		const proposals = Number(p?.proposals ?? 0);
 		const approved = Number(p?.approved ?? 0);
 		const reviewed = approved + Number(p?.dismissed ?? 0) + Number(p?.duplicates ?? 0) + Number(p?.failures ?? 0);
@@ -1275,6 +1329,7 @@ export class Database {
 		const ragSelections = Number(rr?.selections ?? 0);
 		const ragReviewedCandidates = Number(rr?.reviewed_candidates ?? 0);
 		const ragKeepNewDecisions = Number(rr?.keep_new_decisions ?? 0);
+		const incorrectReextractions = Number(d?.reextracted ?? 0);
 		return {
 			days, proposals, approved,
 			dismissed: Number(p?.dismissed ?? 0),
@@ -1304,6 +1359,10 @@ export class Database {
 			ragReviewedCandidates,
 			ragKeepNewDecisions,
 			ragKeepNewRate: rate(ragKeepNewDecisions, ragReviewedCandidates),
+			noTaskDismissals: Number(d?.no_task ?? 0),
+			incorrectProposals: Number(d?.incorrect ?? 0),
+			incorrectReextractions,
+			incorrectReextractionApprovalRate: rate(Number(d?.reextracted_approved ?? 0), incorrectReextractions),
 			correctionRates: Object.fromEntries(correctionFields.map(field => [field, rate(Number(correctionCounts[field] ?? 0), approved)])) as Record<CorrectionField, number>,
 		};
 	}

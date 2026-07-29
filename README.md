@@ -278,9 +278,10 @@ any provider request. Use `--fresh` only for a deliberately uncached run.
 The legacy file exporter builds an initial corpus from normal proposal reviews. Accepted
 manual extractions are evaluated in automatic mode as examples the automatic
 workflow should detect. Accepted automatic proposals, reviewer corrections, and
-clear negative dismissal reasons are also used. Dismissal asks the reviewer to
-choose a reason; sensitive, ambiguous, duplicate-only, and otherwise
-under-specified outcomes are excluded rather than guessed. New extraction events
+clear negative dismissals are also used. Proposal cards expose direct Review,
+Dismiss, and Incorrect controls: Dismiss is a no-task label, while Incorrect is
+excluded until a corrected outcome is reviewed. Sensitive, duplicate-only, and
+otherwise under-specified outcomes are excluded rather than guessed. New extraction events
 are linked directly to their proposals, so only reviews collected after the
 corresponding database migration can be exported reliably. Run the exporter only
 in the private runtime with database access and keep its mode-0600 output outside

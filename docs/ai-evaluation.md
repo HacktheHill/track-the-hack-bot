@@ -96,11 +96,12 @@ in automatic mode. In particular, an accepted manual extraction means that the
 automatic pipeline should find the work in that context.
 
 Approved proposals use their final reviewed title, action, source messages, and
-target semantics. Dismissals labeled `not_actionable`,
-`question_or_announcement`, `already_completed`, or `not_worth_tracking` become
-negative cases. Sensitive overrides, sensitive/private dismissals, duplicates,
-ambiguous reasons, pending reviews, and incorrect proposals without a corrected
-expected result are excluded. Reviewer retargeting, source-lineage action
+target semantics. The direct Dismiss control records `not_actionable` and becomes
+a negative case. The direct Incorrect control records `incorrect_proposal` and is
+excluded until a corrected expected result is reviewed. Historical clear-negative
+dismissal reasons remain exportable, while sensitive overrides, sensitive/private
+dismissals, duplicates, ambiguous reasons, and pending reviews are excluded.
+Reviewer retargeting, source-lineage action
 conversion, incomplete final snapshots, source IDs absent from the exact input,
 superseded extraction links, and multi-candidate manual extractions are also
 excluded rather than assigned potentially incorrect labels. The

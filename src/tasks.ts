@@ -195,6 +195,7 @@ export function formatProposalMetrics(metrics: ProposalMetrics) {
 		`Average approval processing: ${Math.round(metrics.averageReviewDurationMs / 1000)}s · extraction: ${Math.round(metrics.averageExtractionLatencyMs)}ms · tokens: ${metrics.totalTokens} · invalid outputs: ${metrics.invalidOutputs}`,
 		`RAG: ${metrics.ragEvaluations} evaluations · recommendations: ${metrics.ragRecommendations} (${percent(metrics.ragRecommendationRate)}) · abstentions: ${metrics.ragAbstentions} (${percent(metrics.ragAbstentionRate)}) · failures: ${metrics.ragFailures} (${percent(metrics.ragFailureRate)}) · average latency: ${Math.round(metrics.ragAverageLatencyMs)}ms`,
 		`RAG review: ${metrics.ragSelections} existing-task selections · recommendation accepted: ${percent(metrics.ragRecommendationAcceptanceRate)} · MRR: ${metrics.ragMeanReciprocalRank.toFixed(2)} · recall@3: ${percent(metrics.ragRecallAt3)} · keep new: ${metrics.ragKeepNewDecisions}/${metrics.ragReviewedCandidates} (${percent(metrics.ragKeepNewRate)})`,
+		`Dismissals: no task: ${metrics.noTaskDismissals} · incorrect: ${metrics.incorrectProposals} · re-extracted: ${metrics.incorrectReextractions} · corrected and approved: ${percent(metrics.incorrectReextractionApprovalRate)}`,
 		`Field edit rates — ${edits}`,
 	].join("\n");
 }
@@ -600,30 +601,21 @@ export function citesExtractionFocus(sourceMessageIds: readonly string[], focusI
 	return sourceMessageIds.some(id => focusIds.has(id));
 }
 
-export function manualProposalButtons(proposalId: string, action: "create" | "update" | "complete" | "reopen", suggestedWorkPackageId?: number) {
-	const buttons = [new ButtonBuilder()
+export function manualProposalButtons(proposalId: string, _action: "create" | "update" | "complete" | "reopen", _suggestedWorkPackageId?: number) {
+	return [new ButtonBuilder()
 		.setCustomId(`op-review:${proposalId}`)
-		.setLabel(action === "create" ? "Review and edit" : "Review and apply")
-		.setStyle(ButtonStyle.Primary)];
-	if (action === "create" && suggestedWorkPackageId) buttons.push(new ButtonBuilder()
-		.setCustomId(`op-use-existing:${proposalId}:${suggestedWorkPackageId}`)
-		.setLabel(`Use existing #${suggestedWorkPackageId}`)
-		.setStyle(ButtonStyle.Secondary));
-	if (action === "create") buttons.push(new ButtonBuilder()
-		.setCustomId(`op-duplicate:${proposalId}`)
-		.setLabel("Already tracked")
-		.setStyle(ButtonStyle.Secondary));
-	return buttons;
+		.setLabel("Review")
+		.setStyle(ButtonStyle.Primary),
+	new ButtonBuilder().setCustomId(`op-dismiss-no-task:${proposalId}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
+	new ButtonBuilder().setCustomId(`op-incorrect:${proposalId}`).setLabel("Incorrect").setStyle(ButtonStyle.Secondary)];
 }
 
 export function proposalReviewComponents(
 	proposalId: string,
 	action: "create" | "update" | "complete" | "reopen",
 	candidates: readonly ProposalRagCandidate[] = [],
-	includeDismiss = false,
 ) {
 	const buttons = manualProposalButtons(proposalId, action);
-	if (includeDismiss) buttons.push(new ButtonBuilder().setCustomId(`op-dismiss:${proposalId}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary));
 	const rows: Array<ActionRowBuilder<ButtonBuilder> | ActionRowBuilder<StringSelectMenuBuilder>> = [
 		new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons),
 	];
@@ -641,6 +633,12 @@ export function proposalReviewComponents(
 		rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu));
 	}
 	return rows;
+}
+
+export function directProposalDismissalReason(customId: string) {
+	if (customId.startsWith("op-dismiss-no-task:")) return "not_actionable" as const;
+	if (customId.startsWith("op-incorrect:")) return "incorrect_proposal" as const;
+	return undefined;
 }
 
 async function allowedProjectIds(channelId: string, member: GuildMember, services: Services) {
@@ -2015,7 +2013,6 @@ async function applyExistingProposalTarget(
 	}
 	const resultingAction = proposal.action === "create" ? "update" : proposal.action;
 	const buttons = manualProposalButtons(proposal.id, resultingAction);
-	if (!interaction.message.flags.has(MessageFlags.Ephemeral)) buttons.push(new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary));
 	await interaction.editReply({
 		content: boundedDiscordContent(`Proposal will ${resultingAction} OpenProject task ${workPackageMarkdownLink(target.id, target.subject, services.openProject.workPackageUrl(target.id))}\nProposed title: **${proposal.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch, await proposalMetadataDisplayNames(interaction.guild!, services, operations.metadataPatch, targetProjectId)).map(item => `- ${item}`).join("\n")}${formatProposalContent(operations.contentOperation, operations.contentMarkdown)}${proposal.ambiguities.length ? `\n\nAmbiguities: ${proposal.ambiguities.join("; ")}` : ""}`),
 		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons)],
@@ -2044,14 +2041,27 @@ export async function handleProposalTargetSelect(interaction: StringSelectMenuIn
 	return true;
 }
 
-async function handleProposalButton(interaction: ButtonInteraction, services: Services) {
-	if (!interaction.customId.startsWith("op-review:") && !interaction.customId.startsWith("op-dismiss:") && !interaction.customId.startsWith("op-duplicate:") && !interaction.customId.startsWith("op-use-existing:")) return;
+export async function handleProposalButton(interaction: ButtonInteraction, services: Services) {
+	if (!interaction.customId.startsWith("op-review:") && !interaction.customId.startsWith("op-dismiss:") && !interaction.customId.startsWith("op-dismiss-no-task:") && !interaction.customId.startsWith("op-incorrect:") && !interaction.customId.startsWith("op-duplicate:") && !interaction.customId.startsWith("op-use-existing:")) return;
 	const id = interaction.customId.split(":")[1];
 	const proposal = await services.db.proposal(id);
 	if (!proposal || !proposalIsReviewable(proposal) || !await canReviewProposal(interaction, proposal, services)) throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
 	if (!interaction.message.flags.has(MessageFlags.Ephemeral)) {
 		await services.db.setProposalReviewMessage(proposal.id, interaction.message.id);
 		proposal.review_message_id = interaction.message.id;
+	}
+	const directDismissalReason = directProposalDismissalReason(interaction.customId);
+	if (directDismissalReason) {
+		await interaction.deferUpdate();
+		if (!await services.db.dismissProposal(id, interaction.user.id, directDismissalReason)) {
+			throw new Error("This proposal was already handled by another reviewer.");
+		}
+		if (interaction.message.flags.has(MessageFlags.Ephemeral)) {
+			await interaction.editReply({ content: directDismissalReason === "not_actionable" ? "Proposal dismissed." : "Proposal marked incorrect.", components: [] });
+		} else {
+			await removeProposalReviewCard(interaction.client, services.db, proposal);
+		}
+		return;
 	}
 	if (proposal.action !== "create" && (!proposal.operation_schema_version || !proposal.content_operation || !proposal.target_work_package_id || proposal.target_lock_version === null)) {
 		await services.db.supersedeLegacyProposal(proposal.id);
@@ -2145,7 +2155,9 @@ async function handleProposalDismissalReason(interaction: StringSelectMenuIntera
 		throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
 	}
 	await interaction.deferUpdate();
-	if (!await services.db.setProposalStatus(id, "dismissed", interaction.user.id, reason)) {
+	if (reason !== "not_actionable" && reason !== "incorrect_proposal"
+		? !await services.db.setProposalStatus(id, "dismissed", interaction.user.id, reason)
+		: !await services.db.dismissProposal(id, interaction.user.id, reason)) {
 		throw new Error("This proposal was already handled by another reviewer.");
 	}
 	await removeProposalReviewCard(interaction.client, services.db, proposal);
