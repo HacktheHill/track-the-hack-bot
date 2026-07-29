@@ -28,7 +28,7 @@ import {
 } from "discord.js";
 import { randomUUID } from "node:crypto";
 import { isOrganizerGuild, type IntegrationConfig, type TeamMapping } from "./config.js";
-import { correctionFields, Database, proposalDismissalReasons, type CorrectionFlags, type ProposalDismissalReason, type ProposalMetrics } from "./database.js";
+import { correctionFields, Database, proposalDismissalReasons, type CorrectionFlags, type ProposalDismissalReason, type ProposalMetrics, type ProposalRagCandidate } from "./database.js";
 import { OpenProjectClient, OpenProjectRequestError, openProjectAttachmentFileName, workPackageChangesApplied, workPackageMarkdownLink, type OpenProjectAttachmentInput } from "./openproject.js";
 import { attachExtractionDiagnostics, automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, StructuredOutputError, type ExtractedTasks, type ExtractionResult, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
@@ -539,6 +539,33 @@ export function manualProposalButtons(proposalId: string, action: "create" | "up
 		.setLabel("Already tracked")
 		.setStyle(ButtonStyle.Secondary));
 	return buttons;
+}
+
+export function proposalReviewComponents(
+	proposalId: string,
+	action: "create" | "update" | "complete" | "reopen",
+	candidates: readonly ProposalRagCandidate[] = [],
+	includeDismiss = false,
+) {
+	const buttons = manualProposalButtons(proposalId, action);
+	if (includeDismiss) buttons.push(new ButtonBuilder().setCustomId(`op-dismiss:${proposalId}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary));
+	const rows: Array<ActionRowBuilder<ButtonBuilder> | ActionRowBuilder<StringSelectMenuBuilder>> = [
+		new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons),
+	];
+	if (action === "create" && candidates.length) {
+		const menu = new StringSelectMenuBuilder()
+			.setCustomId(`op-existing-target:${proposalId}`)
+			.setPlaceholder("Use an existing OpenProject task instead")
+			.setMinValues(1)
+			.setMaxValues(1)
+			.addOptions(candidates.slice(0, 3).map(candidate => ({
+				label: `#${candidate.workPackageId} ${candidate.subject}`.slice(0, 100),
+				value: String(candidate.workPackageId),
+				description: candidate.relationship === "same_work" ? "AI assessment: same underlying work" : "AI assessment: related work",
+			})));
+		rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu));
+	}
+	return rows;
 }
 
 export async function isExcludedChannel(channelId: string, guild: Guild, excludedIds: ReadonlySet<string>) {
@@ -1610,8 +1637,13 @@ async function completeAiCandidate(
 		const source = context.messages.find(message => message.id === id);
 		return messageUrl(interaction.guildId!, source?.channelId ?? interaction.channelId!, id);
 	});
-	const similar = projectId && services.rag ? await services.rag.findSimilar(projectId, candidate.title, description) : [];
-	const suggestedMatch = services.config.OPENPROJECT_RAG_MODE === "review" && similar[0]?.similarity >= services.config.OPENPROJECT_RAG_SIMILARITY_THRESHOLD ? similar[0] : undefined;
+	const ragAssessment = projectId && services.rag
+		? await services.rag.assessSimilar(projectId, candidate.title, description)
+		: { candidates: [], recommendedMatch: undefined, latencyMs: 0, usage: undefined, telemetry: { outcome: "disabled" } };
+	const suggestedMatch = services.config.OPENPROJECT_RAG_MODE === "review" ? ragAssessment.recommendedMatch : undefined;
+	const ragCandidates = services.config.OPENPROJECT_RAG_MODE === "review" ? ragAssessment.candidates : [];
+	const proposalLatencyMs = extraction.latencyMs + ragAssessment.latencyMs;
+	const proposalTokenUsage = combinedTokenUsage(extraction.usage, ragAssessment.usage);
 	const sourceLinkedTargets = await services.db.trackedWorkPackagesForSourceMessages(candidate.source_message_ids);
 	const targetResolution = await resolveProposalTarget({
 		action: candidate.proposed_action,
@@ -1651,7 +1683,7 @@ async function completeAiCandidate(
 	if (action === "no_action") {
 		await services.db.recordExtraction({
 			source: "manual", outcome: "no_task", modelDeployment: deployment, triggerId: context.primaryId,
-			taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+			taskCount: result.tasks.length, latencyMs: proposalLatencyMs, tokenUsage: proposalTokenUsage,
 			inputSnapshot,
 			decision: { ...decisionTelemetry, requestedAction: candidate.proposed_action, outcome: "no_existing_match" },
 		});
@@ -1683,8 +1715,8 @@ async function completeAiCandidate(
 			sourceLinks,
 			sourceAttachments,
 			modelDeployment: deployment, evidence: candidate.evidence,
-			ambiguities: [...result.ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: extraction.latencyMs,
-			tokenUsage: extraction.usage, escalationReason: extraction.escalationReason,
+			ambiguities: [...result.ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: proposalLatencyMs,
+			tokenUsage: proposalTokenUsage, escalationReason: extraction.escalationReason,
 			retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS, action,
 			targetWorkPackageId: match.workPackageId, targetLockVersion: target!.lockVersion,
 			metadataPatch: operations.metadataPatch, contentOperation: operations.contentOperation,
@@ -1704,7 +1736,7 @@ async function completeAiCandidate(
 		if (proposal.reused) {
 			await services.db.recordExtraction({
 				source: "manual", outcome: "duplicate", modelDeployment: deployment, triggerId: context.primaryId,
-				taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+				taskCount: result.tasks.length, latencyMs: proposalLatencyMs, tokenUsage: proposalTokenUsage,
 				inputSnapshot, proposalIds: [proposal.id],
 				decision: { ...decisionTelemetry, action, targetWorkPackageId: match.workPackageId, outcome: "duplicate" },
 			});
@@ -1726,9 +1758,9 @@ async function completeAiCandidate(
 		} else {
 			await services.db.recordExtraction({
 				source: "manual", outcome: "proposal", modelDeployment: deployment, triggerId: context.primaryId,
-				taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+				taskCount: result.tasks.length, latencyMs: proposalLatencyMs, tokenUsage: proposalTokenUsage,
 				inputSnapshot, proposalIds: [proposal.id],
-				decision: { ...decisionTelemetry, action, targetWorkPackageId: match.workPackageId, similarity: match.similarity, outcome: "proposal" },
+				decision: { ...decisionTelemetry, action, targetWorkPackageId: match.workPackageId, outcome: "proposal", rag: ragAssessment.telemetry },
 			});
 		}
 		const displayedOperation = redisplayed?.content_operation ?? operations.contentOperation;
@@ -1745,8 +1777,8 @@ async function completeAiCandidate(
 		}, !proposal.reused, replaceReply);
 		return;
 	}
-	const advisory = suggestedMatch
-		? `Possible existing task: #${suggestedMatch.workPackageId} (${Math.round(suggestedMatch.similarity * 100)}% similarity). This proposal will still create a new task.`
+	const advisory = ragCandidates.length
+		? `${ragCandidates.length} existing OpenProject ${ragCandidates.length === 1 ? "task may" : "tasks may"} track the same or related work. This proposal will still create a new task unless you select one.`
 		: undefined;
 	const proposal = await services.db.createProposal({
 		requesterId: interaction.user.id, channelId: interaction.channelId, projectId,
@@ -1758,12 +1790,13 @@ async function completeAiCandidate(
 		sourceMessageIds: candidate.source_message_ids,
 		modelDeployment: deployment,
 		sourceAttachments,
+		ragCandidates,
 		evidence: candidate.evidence, ambiguities: [...result.ambiguities, ...(advisory ? [advisory] : [])],
 		workItemKey: candidate.work_item_key,
 		sourceContentHash: sourceContentHash(candidate.source_message_ids.map(id => ({
 			id, text: context.sourceRecords.get(id)?.text ?? "", attachments: context.sourceRecords.get(id)?.attachments,
 		}))),
-		latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+		latencyMs: proposalLatencyMs, tokenUsage: proposalTokenUsage,
 					escalationReason: extraction.escalationReason,
 					sourceLinks,
 					retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS,
@@ -1777,7 +1810,7 @@ async function completeAiCandidate(
 	if (proposal.reused) {
 		await services.db.recordExtraction({
 			source: "manual", outcome: "duplicate", modelDeployment: deployment,
-			taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+			taskCount: result.tasks.length, latencyMs: proposalLatencyMs, tokenUsage: proposalTokenUsage,
 			inputSnapshot, proposalIds: [proposal.id], decision: { ...decisionTelemetry, outcome: "proposal" },
 		});
 		const existing = await services.db.proposal(proposal.id);
@@ -1793,9 +1826,9 @@ async function completeAiCandidate(
 	} else {
 		await services.db.recordExtraction({
 			source: "manual", outcome: "proposal", modelDeployment: deployment, triggerId: context.primaryId,
-			taskCount: result.tasks.length, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage,
+			taskCount: result.tasks.length, latencyMs: proposalLatencyMs, tokenUsage: proposalTokenUsage,
 			inputSnapshot, proposalIds: [proposal.id], decision: {
-				...decisionTelemetry, action: "create", outcome: "proposal", ragMatch: similar[0] ? { workPackageId: similar[0].workPackageId, similarity: similar[0].similarity } : null,
+				...decisionTelemetry, action: "create", outcome: "proposal", rag: ragAssessment.telemetry,
 			},
 		});
 	}
@@ -1816,7 +1849,7 @@ async function completeAiCandidate(
 	}
 	await deliverProposalReply(interaction, services, proposal.id, {
 		content: boundedDiscordContent(`${displayedTarget}**${redisplayed?.title ?? candidate.title}**\n${redisplayed?.description ?? description}${details ? `\n\n${details}` : ""}${redisplayed ? "" : `${advisory ? `\n\n${advisory}` : ""}${result.ambiguities.length ? `\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`}`),
-		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...manualProposalButtons(proposal.id, displayedAction, displayedAction === "create" ? suggestedMatch?.workPackageId : undefined))],
+		components: proposalReviewComponents(proposal.id, displayedAction, displayedAction === "create" ? redisplayed?.rag_candidates ?? ragCandidates : []),
 	}, !proposal.reused, replaceReply);
 }
 
@@ -1835,6 +1868,79 @@ async function handleSensitiveOverrideButton(interaction: ButtonInteraction, ser
 	return true;
 }
 
+type StoredProposal = NonNullable<Awaited<ReturnType<Database["proposal"]>>>;
+
+async function applyExistingProposalTarget(
+	interaction: ButtonInteraction | StringSelectMenuInteraction,
+	services: Services,
+	proposal: StoredProposal,
+	targetId: number,
+	selectedCandidate?: ProposalRagCandidate,
+) {
+	if (proposal.action !== "create") throw new Error("This proposal already targets existing work.");
+	if (!Number.isSafeInteger(targetId) || targetId <= 0) throw new Error("The suggested OpenProject task is invalid.");
+	const target = await services.openProject.workPackage(targetId);
+	const targetProjectId = (target.project?.id ?? Number(target._links.project?.href.split("/").at(-1))) || undefined;
+	if (!targetProjectId || !(await services.openProject.projects()).some(project => project.id === targetProjectId)) {
+		throw new Error("The suggested task is not in an active OpenProject project.");
+	}
+	if (selectedCandidate && selectedCandidate.projectId !== targetProjectId) throw new Error("The suggested task moved projects. Run extraction again before selecting it.");
+	const operations = planExistingTaskOperations({
+		workPackage: target,
+		requestedAction: "update",
+		contentIntent: "update_note",
+		description: proposal.description,
+		metadataFields: [],
+		values: { title: proposal.title },
+	});
+	await services.db.convertProposalToUpdate({
+		id: proposal.id,
+		projectId: targetProjectId,
+		targetWorkPackageId: target.id,
+		targetLockVersion: target.lockVersion,
+		metadataPatch: operations.metadataPatch,
+		contentOperation: operations.contentOperation,
+		contentMarkdown: operations.contentMarkdown,
+	});
+	if (selectedCandidate) {
+		void services.db.logTaskEvent(target.id, "rag_target_selected", interaction.user.id, {
+			proposalId: proposal.id,
+			retrievalRank: selectedCandidate.retrievalRank,
+			relationship: selectedCandidate.relationship,
+			confidence: selectedCandidate.confidence,
+			retrievalScore: selectedCandidate.similarity,
+		}).catch(error => console.error("RAG target selection audit failed", { proposalId: proposal.id, error: (error as Error).message }));
+	}
+	const buttons = manualProposalButtons(proposal.id, "update");
+	if (!interaction.message.flags.has(MessageFlags.Ephemeral)) buttons.push(new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary));
+	await interaction.editReply({
+		content: boundedDiscordContent(`Proposal will update OpenProject task ${workPackageMarkdownLink(target.id, target.subject, services.openProject.workPackageUrl(target.id))}\nProposed title: **${proposal.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch).map(item => `- ${item}`).join("\n")}`),
+		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons)],
+		allowedMentions: { parse: [] },
+	});
+}
+
+async function handleProposalTargetSelect(interaction: StringSelectMenuInteraction, services: Services) {
+	if (!interaction.customId.startsWith("op-existing-target:")) return false;
+	const id = interaction.customId.split(":")[1];
+	const proposal = await services.db.proposal(id);
+	if (!proposal || !proposalIsReviewable(proposal) || !await canReviewProposal(interaction, proposal, services)) {
+		throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
+	}
+	const targetId = Number(interaction.values[0]);
+	const selectedCandidate = proposal.rag_candidates.find(candidate => candidate.workPackageId === targetId);
+	if (!selectedCandidate) {
+		throw new Error("That OpenProject task was not offered for this proposal.");
+	}
+	if (!interaction.message.flags.has(MessageFlags.Ephemeral)) {
+		await services.db.setProposalReviewMessage(proposal.id, interaction.message.id);
+		proposal.review_message_id = interaction.message.id;
+	}
+	await interaction.deferUpdate();
+	await applyExistingProposalTarget(interaction, services, proposal, targetId, selectedCandidate);
+	return true;
+}
+
 async function handleProposalButton(interaction: ButtonInteraction, services: Services) {
 	if (!interaction.customId.startsWith("op-review:") && !interaction.customId.startsWith("op-dismiss:") && !interaction.customId.startsWith("op-duplicate:") && !interaction.customId.startsWith("op-use-existing:")) return;
 	const id = interaction.customId.split(":")[1];
@@ -1850,37 +1956,9 @@ async function handleProposalButton(interaction: ButtonInteraction, services: Se
 		throw new Error("This older update proposal was invalidated. Extract the discussion again.");
 	}
 	if (interaction.customId.startsWith("op-use-existing:")) {
-		if (proposal.action !== "create") throw new Error("This proposal already targets existing work.");
 		const targetId = Number(interaction.customId.split(":")[2]);
-		if (!Number.isSafeInteger(targetId) || targetId <= 0) throw new Error("The suggested OpenProject task is invalid.");
-		const target = await services.openProject.workPackage(targetId);
-		const targetProjectId = (target.project?.id ?? Number(target._links.project?.href.split("/").at(-1))) || undefined;
-		if (!targetProjectId || !(await services.openProject.projects()).some(project => project.id === targetProjectId)) {
-			throw new Error("The suggested task is not in an active OpenProject project.");
-		}
-		const operations = planExistingTaskOperations({
-			workPackage: target,
-			requestedAction: "update",
-			contentIntent: "update_note",
-			description: proposal.description,
-			metadataFields: [],
-			values: { title: proposal.title },
-		});
-		await services.db.convertProposalToUpdate({
-			id: proposal.id,
-			projectId: targetProjectId,
-			targetWorkPackageId: target.id,
-			targetLockVersion: target.lockVersion,
-			metadataPatch: operations.metadataPatch,
-			contentOperation: operations.contentOperation,
-			contentMarkdown: operations.contentMarkdown,
-		});
-		const buttons = manualProposalButtons(proposal.id, "update");
-		if (!interaction.message.flags.has(MessageFlags.Ephemeral)) buttons.push(new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary));
-		await interaction.update({
-			content: boundedDiscordContent(`Proposal will update OpenProject task ${workPackageMarkdownLink(target.id, target.subject, services.openProject.workPackageUrl(target.id))}\nProposed title: **${proposal.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch).map(item => `- ${item}`).join("\n")}`),
-			components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons)],
-		});
+		await interaction.deferUpdate();
+		await applyExistingProposalTarget(interaction, services, proposal, targetId);
 		return;
 	}
 	if (interaction.customId.startsWith("op-dismiss:")) {
@@ -2303,7 +2381,7 @@ export function registerTaskInteractions(client: Client, services: Services) {
 				await handleAiContext(interaction, services);
 			}
 			else if (interaction.isStringSelectMenu()) {
-				if (!await handleProposalDismissalReason(interaction, services)) await handleContextSelect(interaction, services);
+				if (!await handleProposalDismissalReason(interaction, services) && !await handleProposalTargetSelect(interaction, services)) await handleContextSelect(interaction, services);
 			}
 			else if (interaction.isUserSelectMenu()) await handleContextSelect(interaction, services);
 			else if (interaction.isButton()) {

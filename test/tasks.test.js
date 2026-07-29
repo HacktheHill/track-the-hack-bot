@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, relevantImageAttachments, removeProposalReviewCard, taskCommand, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
+import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, proposalReviewComponents, relevantImageAttachments, removeProposalReviewCard, taskCommand, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
 import { normalizeTaskTitle, OpenProjectClient, titlesLikelyDuplicate, workPackageMarkdownLink } from "../dist/openproject.js";
 
 test("task defaults start today and use the configured due offset", () => {
@@ -223,6 +223,20 @@ test("ephemeral proposal controls omit Dismiss and remain actionable", () => {
 	assert.deepEqual(manualProposalButtons("proposal", "update").map(button => button.toJSON().custom_id), ["op-review:proposal"]);
 	assert.deepEqual(manualProposalButtons("proposal", "create").map(button => button.toJSON().custom_id), ["op-review:proposal", "op-duplicate:proposal"]);
 	assert.deepEqual(manualProposalButtons("proposal", "create", 42).map(button => button.toJSON().custom_id), ["op-review:proposal", "op-use-existing:proposal:42", "op-duplicate:proposal"]);
+});
+
+test("RAG proposal candidates use a bounded single-choice target menu", () => {
+	const rows = proposalReviewComponents("proposal", "create", [
+		{ workPackageId: 42, projectId: 7, lockVersion: 1, subject: "Sponsor prospectus", retrievalRank: 0, relationship: "same_work", confidence: 0.93, similarity: 0.72 },
+		{ workPackageId: 43, projectId: 7, lockVersion: 1, subject: "Sponsor outreach", retrievalRank: 1, relationship: "related", confidence: 0.8, similarity: 0.69 },
+	]);
+	const menu = rows[1].toJSON().components[0];
+	assert.equal(menu.custom_id, "op-existing-target:proposal");
+	assert.deepEqual(menu.options.map(option => [option.value, option.label]), [
+		["42", "#42 Sponsor prospectus"],
+		["43", "#43 Sponsor outreach"],
+	]);
+	assert.equal(menu.max_values, 1);
 });
 
 test("AI task descriptions omit Discord attachment links without verbatim source text", () => {

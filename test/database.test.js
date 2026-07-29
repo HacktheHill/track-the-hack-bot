@@ -133,6 +133,27 @@ test("AI proposal metadata is persisted for reviewed task creation", async () =>
 	assert.equal(inserted.values[17], '[{"id":"image","name":"mockup.png","contentType":"image/png","url":"https://cdn.discordapp.com/image"}]');
 });
 
+test("new proposals persist the RAG candidate allowlist transactionally", async () => {
+	const queries = [];
+	const db = databaseWithPool({
+		async query(sql, values) {
+			queries.push({ sql, values });
+			return sql.includes("INSERT INTO task_proposals") ? { rowCount: 1, rows: [{ id: "proposal" }] } : { rowCount: 0, rows: [] };
+		},
+	});
+	const candidates = [{
+		workPackageId: 42, projectId: 7, lockVersion: 3, subject: "Sponsor prospectus",
+		retrievalRank: 0, relationship: "same_work", confidence: 0.93, similarity: 0.72,
+	}];
+	await db.createProposal({
+		channelId: "channel", projectId: 7, title: "Publish prospectus", description: "Publish it",
+		sourceMessageIds: ["message"], modelDeployment: "model", ragCandidates: candidates,
+	});
+	const update = queries.find(query => query.sql.includes("SET rag_candidates"));
+	assert.deepEqual(update.values, ["proposal", JSON.stringify(candidates)]);
+	assert.equal(queries.findIndex(query => query.sql.includes("SET rag_candidates")) < queries.findIndex(query => query.sql === "COMMIT"), true);
+});
+
 test("existing-task proposals persist explicit operations and independent checkpoints", async () => {
 	const queries = [];
 	const db = databaseWithPool({

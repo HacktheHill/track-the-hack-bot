@@ -172,6 +172,37 @@ test("automatic precision gate judges raw evidence and validates complete candid
 	}
 });
 
+test("RAG reranker assesses every retrieved candidate with structured output", async () => {
+	const originalFetch = globalThis.fetch;
+	let request;
+	globalThis.fetch = async (_url, init) => {
+		request = JSON.parse(init.body);
+		return Response.json({
+			choices: [{ message: { content: JSON.stringify({ assessments: [
+				{ candidate_index: 0, relationship: "same_work", confidence: 0.93, reason: "Same deliverable" },
+				{ candidate_index: 1, relationship: "related", confidence: 0.81, reason: "Shared campaign only" },
+			] }) } }],
+			usage: { total_tokens: 37 },
+		});
+	};
+	try {
+		const result = await new AzureTaskExtractor(config, async () => "token").assessRagCandidates(
+			{ title: "Publish sponsor prospectus", description: "Finalize and publish the prospectus." },
+			[
+				{ workPackageId: 1, subject: "Sponsor prospectus", description: "Prepare the prospectus", retrievalScore: 0.74 },
+				{ workPackageId: 2, subject: "Sponsor outreach", description: "Contact sponsors", retrievalScore: 0.68 },
+			],
+		);
+		assert.deepEqual(result.assessments.map(item => item.relationship), ["same_work", "related"]);
+		assert.equal(result.usage.totalTokens, 37);
+		assert.equal(request.response_format.json_schema.name, "openproject_rag_rerank_v1");
+		assert.match(request.messages[0].content, /untrusted data/);
+		assert.equal(JSON.parse(request.messages[1].content).candidates.length, 2);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
 test("Azure extractor sends image attachments as multimodal inputs", async () => {
 	const originalFetch = globalThis.fetch;
 	let request;

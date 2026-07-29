@@ -47,6 +47,6 @@ export class AzureEmbeddingClient {
 	}
 }
 
-export function embeddingContentHash(subject: string, description: string) {
-	return createHash("sha256").update(`${subject}\n\n${description}`).digest("hex");
+export function embeddingContentHash(subject: string, description: string, model = "", dimensions?: number) {
+	return createHash("sha256").update(`work-package-v2\n${model}\n${dimensions ?? ""}\n${subject}\n\n${description}`).digest("hex");
 }

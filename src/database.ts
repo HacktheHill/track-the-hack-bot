@@ -54,6 +54,16 @@ export type SimilarWorkPackage = {
 	description: string;
 	similarity: number;
 };
+export type ProposalRagCandidate = {
+	workPackageId: number;
+	projectId: number;
+	lockVersion: number;
+	subject: string;
+	retrievalRank: number;
+	relationship: "same_work" | "related";
+	confidence: number;
+	similarity: number;
+};
 
 export type ScheduledMessage = {
 	id: string;
@@ -136,6 +146,7 @@ export class Database {
 				metadata_patch JSONB NOT NULL DEFAULT '{}',
 				content_operation TEXT,
 				content_markdown TEXT,
+				rag_candidates JSONB NOT NULL DEFAULT '[]',
 				patch_applied_at TIMESTAMPTZ,
 				applied_lock_version INTEGER,
 				comment_activity_id INTEGER,
@@ -292,6 +303,7 @@ export class Database {
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS metadata_patch JSONB NOT NULL DEFAULT '{}'");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS content_operation TEXT");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS content_markdown TEXT");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS rag_candidates JSONB NOT NULL DEFAULT '[]'");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS patch_applied_at TIMESTAMPTZ");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS applied_lock_version INTEGER");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS comment_activity_id INTEGER");
@@ -594,6 +606,7 @@ export class Database {
 		metadataPatch?: ProposalMetadataPatch;
 		contentOperation?: ContentOperation;
 		contentMarkdown?: string | null;
+		ragCandidates?: ProposalRagCandidate[];
 	}) {
 		if (input.action && input.action !== "create" && (!input.targetWorkPackageId || input.targetLockVersion === undefined)) {
 			throw new Error("Existing-task proposals require a target task and lock version.");
@@ -735,6 +748,9 @@ export class Database {
 					reused = true;
 				}
 			}
+			if (proposalId && input.ragCandidates && (!reused || revised)) {
+				await client.query("UPDATE task_proposals SET rag_candidates=$2,updated_at=now() WHERE id=$1 AND status='pending_review'", [proposalId, jsonParameter(input.ragCandidates)]);
+			}
 			await client.query("COMMIT");
 		} catch (error) {
 			await client.query("ROLLBACK");
@@ -781,6 +797,7 @@ export class Database {
 			 patch_applied_at: string | null; applied_lock_version: number | null; comment_activity_id: number | null;
 			 review_message_id: string | null;
 			 claim_expires_at: string | null;
+			 rag_candidates: ProposalRagCandidate[];
 		}>("SELECT * FROM task_proposals WHERE id=$1", [id]);
 		const row = result.rows[0];
 		return row ? { ...row, metadata_patch: proposalMetadataPatchSchema.parse(row.metadata_patch ?? {}), metadata_inference: row.metadata_inference ?? {} } : undefined;
@@ -1123,22 +1140,23 @@ export class Database {
 		);
 	}
 
-	async similarEmbeddings(projectId: number, embedding: number[], limit = 5): Promise<SimilarWorkPackage[]> {
+	async similarEmbeddings(projectId: number, embedding: number[], model: string, dimensions: number, limit = 5): Promise<SimilarWorkPackage[]> {
 		const vector = `[${embedding.join(",")}]`;
 		const result = await this.pool.query<SimilarWorkPackage & { distance: number }>(
 			`SELECT work_package_id AS "workPackageId", project_id AS "projectId", lock_version AS "lockVersion", subject, description,
 				1 - (embedding <=> $2::vector) AS similarity, embedding <=> $2::vector AS distance
-			 FROM openproject_embeddings WHERE project_id=$1 AND embedding IS NOT NULL ORDER BY embedding <=> $2::vector LIMIT $3`,
-			[projectId, vector, limit],
+			 FROM openproject_embeddings WHERE project_id=$1 AND embedding IS NOT NULL AND embedding_model=$3 AND embedding_dimensions=$4
+			 ORDER BY embedding <=> $2::vector LIMIT $5`,
+			[projectId, vector, model, dimensions, limit],
 		);
 		return result.rows;
 	}
 
-	async embeddingTitles(projectId: number): Promise<Omit<SimilarWorkPackage, "similarity">[]> {
+	async embeddingTitles(projectId: number, model: string, dimensions: number): Promise<Omit<SimilarWorkPackage, "similarity">[]> {
 		const result = await this.pool.query<Omit<SimilarWorkPackage, "similarity">>(
 			`SELECT work_package_id AS "workPackageId", project_id AS "projectId", lock_version AS "lockVersion", subject, description
-			 FROM openproject_embeddings WHERE project_id=$1`,
-			[projectId],
+			 FROM openproject_embeddings WHERE project_id=$1 AND embedding_model=$2 AND embedding_dimensions=$3`,
+			[projectId, model, dimensions],
 		);
 		return result.rows;
 	}

@@ -78,14 +78,15 @@ client.once("clientReady", async () => {
 		if (integrationConfig.OPENPROJECT_RUN_MIGRATIONS) await db.migrate(integrationConfig);
 		await db.cleanup(integrationConfig);
 		const openProject = new OpenProjectClient(integrationConfig);
+		const extractor = new AzureTaskExtractor(integrationConfig);
 		const rag = integrationConfig.OPENPROJECT_RAG_MODE !== "off" && integrationConfig.AZURE_OPENAI_EMBEDDING_DEPLOYMENT
-			? new OpenProjectRag(integrationConfig, db, openProject, new AzureEmbeddingClient(integrationConfig))
+			? new OpenProjectRag(integrationConfig, db, openProject, new AzureEmbeddingClient(integrationConfig), extractor)
 			: undefined;
 		const services = {
 			config: integrationConfig,
 			db,
 			openProject,
-			extractor: new AzureTaskExtractor(integrationConfig),
+			extractor,
 			rag,
 		};
 		registerTaskInteractions(client, services);

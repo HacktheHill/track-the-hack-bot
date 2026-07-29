@@ -201,13 +201,23 @@ OpenProject title and description embeddings into PostgreSQL with pgvector but
 does not propose updates. The `sync:embeddings` job is suitable for a
 Container Apps scheduled job.
 
-RAG matches are advisory: they are shown as possible duplicates and never turn
-a proposed new task into an update or suppress its review card without a
-reviewer decision. A reviewer can keep the new task or use the suggested
-existing task, which safely replans the proposal as an update. For an action
-that explicitly updates, completes, or reopens existing work, an exact task
-reference or a close RAG result nominates the target and the reviewer confirms
-its task ID. Existing-task metadata is changed only when the discussion
+The five strongest hybrid retrieval results are assessed together by the
+configured Azure OpenAI chat deployment as the same work, related work, or
+unrelated work. Only a high-confidence same-work result with a clear margin is
+nominated automatically. Up to three same or related results are shown in a
+reviewer-authorized target selection control; submitted targets are checked against
+the proposal's stored candidate set and refetched before use. Retrieval or
+reranking failures degrade to no suggestion rather than blocking task review.
+Both `AZURE_OPENAI_DEPLOYMENT` and the embedding settings are required when RAG
+is enabled because the reranker receives the proposed title and description and
+the retrieved OpenProject titles and descriptions.
+
+RAG matches are advisory: they never turn a proposed new task into an update or
+suppress its review card without a reviewer decision. A reviewer can keep the
+new task or select an existing task, which safely replans the proposal as an
+update. For an action that explicitly updates, completes, or reopens existing
+work, an exact task reference or a confidently reranked RAG result nominates the
+target. Existing-task metadata is changed only when the discussion
 explicitly requests that field. New requirements and clarifications are posted
 as Markdown activity comments, while a description is replaced only when the
 existing description has no substantive content or the discussion explicitly

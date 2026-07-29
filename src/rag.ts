@@ -2,6 +2,7 @@ import type { IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
 import { AzureEmbeddingClient, embeddingContentHash } from "./embeddings.js";
 import { OpenProjectClient, type WorkPackage } from "./openproject.js";
+import type { RagRerankCandidate, RagRerankResult } from "./azure-openai.js";
 
 export function resolveProposedAction(
 	action: "create" | "update" | "complete" | "reopen",
@@ -32,6 +33,30 @@ export function explicitWorkPackageId(texts: readonly string[], openProjectBaseU
 
 type ProposalAction = "create" | "update" | "complete" | "reopen";
 type TargetMatch = { workPackageId: number; similarity: number };
+export type AssessedRagCandidate = {
+	workPackageId: number;
+	projectId: number;
+	lockVersion: number;
+	subject: string;
+	similarity: number;
+	retrievalRank: number;
+	relationship: "same_work" | "related";
+	confidence: number;
+};
+export type RagAssessment = {
+	candidates: AssessedRagCandidate[];
+	recommendedMatch?: TargetMatch;
+	latencyMs: number;
+	usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number };
+	telemetry: Record<string, unknown>;
+};
+type RagReranker = {
+	assessRagCandidates(query: { title: string; description: string }, candidates: RagRerankCandidate[]): Promise<RagRerankResult>;
+};
+
+const RAG_RECOMMENDATION_CONFIDENCE = 0.8;
+const RAG_RECOMMENDATION_MARGIN = 0.15;
+const RAG_DISPLAY_CONFIDENCE = 0.6;
 
 function workPackageProjectId(workPackage?: WorkPackage) {
 	return (workPackage?.project?.id ?? Number(workPackage?._links.project?.href.split("/").at(-1))) || undefined;
@@ -109,6 +134,7 @@ export class OpenProjectRag {
 		private readonly db: Database,
 		private readonly openProject: OpenProjectClient,
 		private readonly embeddings: AzureEmbeddingClient,
+		private readonly reranker?: RagReranker,
 	) {}
 
 	get enabled() {
@@ -131,7 +157,7 @@ export class OpenProjectRag {
 				for (const workPackage of workPackages) {
 					const description = descriptionOf(workPackage);
 					const subject = workPackage.subject;
-					const contentHash = embeddingContentHash(subject, description);
+					const contentHash = embeddingContentHash(subject, description, this.config.AZURE_OPENAI_EMBEDDING_DEPLOYMENT, this.config.AZURE_OPENAI_EMBEDDING_DIMENSIONS);
 					if (await this.db.embeddingIsCurrent(workPackage.id, contentHash, workPackage.lockVersion)) continue;
 					pending.push({ workPackage, description, subject, contentHash });
 				}
@@ -139,10 +165,10 @@ export class OpenProjectRag {
 					const batch = pending.slice(offset, offset + 16);
 					const result = await this.embeddings.embed(batch.map(item => `${item.subject}\n\n${item.description}`));
 					for (const [index, item] of batch.entries()) {
-						await this.db.upsertEmbedding({
-							workPackageId: item.workPackage.id, projectId, lockVersion: item.workPackage.lockVersion,
-							subject: item.subject, description: item.description, contentHash: item.contentHash,
-							model: result.model, dimensions: result.dimensions, embedding: result.embeddings[index],
+					await this.db.upsertEmbedding({
+						workPackageId: item.workPackage.id, projectId, lockVersion: item.workPackage.lockVersion,
+						subject: item.subject, description: item.description, contentHash: item.contentHash,
+						model: this.config.AZURE_OPENAI_EMBEDDING_DEPLOYMENT!, dimensions: result.dimensions, embedding: result.embeddings[index],
 						});
 						indexed++;
 					}
@@ -161,8 +187,8 @@ export class OpenProjectRag {
 		if (!this.enabled) return [];
 		const result = await this.embeddings.embed([`${title}\n\n${description}`]);
 		const [semantic, lexicalPool] = await Promise.all([
-			this.db.similarEmbeddings(projectId, result.embeddings[0], 20),
-			this.db.embeddingTitles(projectId),
+			this.db.similarEmbeddings(projectId, result.embeddings[0], this.config.AZURE_OPENAI_EMBEDDING_DEPLOYMENT!, result.dimensions, 20),
+			this.db.embeddingTitles(projectId, this.config.AZURE_OPENAI_EMBEDDING_DEPLOYMENT!, result.dimensions),
 		]);
 		const candidates = new Map(semantic.map(item => [item.workPackageId, item]));
 		for (const item of lexicalPool) {
@@ -174,5 +200,69 @@ export class OpenProjectRag {
 			if (current || lexical > 0) candidates.set(item.workPackageId, { ...item, similarity });
 		}
 		return [...candidates.values()].sort((left, right) => right.similarity - left.similarity).slice(0, 5);
+	}
+
+	async assessSimilar(projectId: number, title: string, description: string): Promise<RagAssessment> {
+		const started = Date.now();
+		try {
+			const matches = await this.findSimilar(projectId, title, description);
+			if (!matches.length || !this.reranker) {
+				return { candidates: [], latencyMs: Date.now() - started, telemetry: { outcome: matches.length ? "reranker_unavailable" : "no_candidates", retrievalLatencyMs: Date.now() - started } };
+			}
+			const reranked = await this.reranker.assessRagCandidates({ title, description }, matches.map(match => ({
+				workPackageId: match.workPackageId,
+				subject: match.subject,
+				description: match.description,
+				retrievalScore: match.similarity,
+			})));
+			const assessments = new Map(reranked.assessments.map(assessment => [assessment.candidate_index, assessment]));
+			const assessed = matches.map((match, retrievalRank) => ({ match, retrievalRank, assessment: assessments.get(retrievalRank) }))
+				.filter((item): item is typeof item & { assessment: NonNullable<typeof item.assessment> } => Boolean(item.assessment));
+			const candidates = assessed
+				.filter(item => item.assessment.relationship !== "unrelated" && item.assessment.confidence >= RAG_DISPLAY_CONFIDENCE)
+				.sort((left, right) => {
+					const relationship = Number(right.assessment.relationship === "same_work") - Number(left.assessment.relationship === "same_work");
+					return relationship || right.assessment.confidence - left.assessment.confidence || right.match.similarity - left.match.similarity;
+				})
+				.slice(0, 3)
+				.map(({ match, retrievalRank, assessment }) => ({
+					workPackageId: match.workPackageId,
+					projectId: match.projectId,
+					lockVersion: match.lockVersion,
+					subject: match.subject,
+					similarity: match.similarity,
+					retrievalRank,
+					relationship: assessment.relationship as "same_work" | "related",
+					confidence: assessment.confidence,
+				}));
+			const sameWork = candidates.filter(candidate => candidate.relationship === "same_work" && candidate.similarity >= this.config.OPENPROJECT_RAG_SIMILARITY_THRESHOLD);
+			const winner = sameWork[0];
+			const runnerUp = sameWork[1];
+			const recommendedMatch = winner
+				&& winner.confidence >= RAG_RECOMMENDATION_CONFIDENCE
+				&& (!runnerUp || winner.confidence - runnerUp.confidence >= RAG_RECOMMENDATION_MARGIN)
+				? { workPackageId: winner.workPackageId, similarity: winner.similarity }
+				: undefined;
+			return {
+				candidates,
+				recommendedMatch,
+				latencyMs: Date.now() - started,
+				usage: reranked.usage,
+				telemetry: {
+					outcome: recommendedMatch ? "recommended" : candidates.length ? "review" : "no_commonality",
+					retrievalLatencyMs: Date.now() - started - reranked.latencyMs,
+					rerankLatencyMs: reranked.latencyMs,
+					rerankerDeployment: reranked.deployment,
+					rerankerUsage: reranked.usage,
+					results: assessed.map(({ match, retrievalRank, assessment }) => ({
+						workPackageId: match.workPackageId, retrievalRank, retrievalScore: match.similarity,
+						relationship: assessment.relationship, confidence: assessment.confidence,
+					})),
+					recommendedWorkPackageId: recommendedMatch?.workPackageId,
+				},
+			};
+		} catch (error) {
+			return { candidates: [], latencyMs: Date.now() - started, telemetry: { outcome: "error", latencyMs: Date.now() - started, error: (error as Error).message.slice(0, 300) } };
+		}
 	}
 }

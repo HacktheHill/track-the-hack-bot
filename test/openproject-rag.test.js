@@ -3,6 +3,7 @@ import test from "node:test";
 import { corpusWindowSchema, providerFailureCategory, retryableProviderFailure, runtimeProposalCandidates } from "../dist/evaluate-ai.js";
 import { OpenProjectClient, workPackageChangesApplied } from "../dist/openproject.js";
 import { explicitWorkPackageId, lexicalTitleSimilarity, OpenProjectRag, resolveProposalTarget, resolveProposedAction } from "../dist/rag.js";
+import { embeddingContentHash } from "../dist/embeddings.js";
 
 test("untracked artifact updates fall back to new work while tracked transitions retain their action", () => {
 	assert.equal(resolveProposedAction("create", false), "create");
@@ -264,6 +265,12 @@ test("RAG sync includes category projects configured in the database and records
 	assert.deepEqual(syncStates, [null]);
 });
 
+test("embedding freshness changes with the deployment and dimensions", () => {
+	const original = embeddingContentHash("Title", "Description", "embedding-v1", 1536);
+	assert.notEqual(original, embeddingContentHash("Title", "Description", "embedding-v2", 1536));
+	assert.notEqual(original, embeddingContentHash("Title", "Description", "embedding-v1", 1024));
+});
+
 test("RAG combines semantic candidates with lexical title matches", async () => {
 	const rag = new OpenProjectRag(
 		{ OPENPROJECT_RAG_MODE: "review" },
@@ -285,6 +292,59 @@ test("RAG combines semantic candidates with lexical title matches", async () => 
 		"Update sponsorship package tier table",
 		"Revise sponsorship tiers graphic layout and colors",
 	) >= 0.3);
+});
+
+test("RAG reranking recommends only a high-confidence winner with a clear margin", async () => {
+	const matches = [
+		{ workPackageId: 1, projectId: 7, lockVersion: 1, subject: "Sponsor prospectus", description: "Publish it", similarity: 0.72 },
+		{ workPackageId: 2, projectId: 7, lockVersion: 1, subject: "Sponsor outreach", description: "Email sponsors", similarity: 0.7 },
+	];
+	const rag = new OpenProjectRag(
+		{ OPENPROJECT_RAG_MODE: "review", OPENPROJECT_RAG_SIMILARITY_THRESHOLD: 0.55 },
+		{ similarEmbeddings: async () => matches, embeddingTitles: async () => matches },
+		{},
+		{ enabled: true, embed: async () => ({ embeddings: [[0.1]], model: "test", dimensions: 1 }) },
+		{ assessRagCandidates: async () => ({
+			assessments: [
+				{ candidate_index: 0, relationship: "same_work", confidence: 0.93, reason: "same" },
+				{ candidate_index: 1, relationship: "related", confidence: 0.85, reason: "related" },
+			],
+			deployment: "test", latencyMs: 5,
+		}) },
+	);
+	const result = await rag.assessSimilar(7, "Publish sponsor prospectus", "Finalize it");
+	assert.equal(result.recommendedMatch.workPackageId, 1);
+	assert.deepEqual(result.candidates.map(item => [item.workPackageId, item.relationship]), [[1, "same_work"], [2, "related"]]);
+	assert.equal(result.telemetry.outcome, "recommended");
+});
+
+test("RAG reranking abstains on ambiguous candidates and degrades on failure", async () => {
+	const matches = [
+		{ workPackageId: 1, projectId: 7, lockVersion: 1, subject: "One", description: "", similarity: 0.72 },
+		{ workPackageId: 2, projectId: 7, lockVersion: 1, subject: "Two", description: "", similarity: 0.71 },
+	];
+	const db = { similarEmbeddings: async () => matches, embeddingTitles: async () => matches };
+	const embeddings = { enabled: true, embed: async () => ({ embeddings: [[0.1]], model: "test", dimensions: 1 }) };
+	const ambiguous = new OpenProjectRag(
+		{ OPENPROJECT_RAG_MODE: "review", OPENPROJECT_RAG_SIMILARITY_THRESHOLD: 0.55 }, db, {}, embeddings,
+		{ assessRagCandidates: async () => ({
+			assessments: [
+				{ candidate_index: 0, relationship: "same_work", confidence: 0.9, reason: "possible" },
+				{ candidate_index: 1, relationship: "same_work", confidence: 0.82, reason: "possible" },
+			], deployment: "test", latencyMs: 1,
+		}) },
+	);
+	const ambiguousResult = await ambiguous.assessSimilar(7, "Work", "Description");
+	assert.equal(ambiguousResult.recommendedMatch, undefined);
+	assert.equal(ambiguousResult.candidates.length, 2);
+
+	const failed = new OpenProjectRag(
+		{ OPENPROJECT_RAG_MODE: "review", OPENPROJECT_RAG_SIMILARITY_THRESHOLD: 0.55 }, db, {}, embeddings,
+		{ assessRagCandidates: async () => { throw new Error("provider unavailable"); } },
+	);
+	const failedResult = await failed.assessSimilar(7, "Work", "Description");
+	assert.deepEqual(failedResult.candidates, []);
+	assert.equal(failedResult.telemetry.outcome, "error");
 });
 
 test("AI evaluator uses production grounding and target semantics for every action", () => {

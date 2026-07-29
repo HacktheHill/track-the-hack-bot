@@ -34,6 +34,31 @@ test("OpenProject features are restricted to the configured Organizer guild", ()
 	assert.equal(isOrganizerGuild(config, null), false);
 });
 
+test("RAG configuration requires both embedding and chat deployments", () => {
+	const previous = { ...process.env };
+	for (const key of Object.keys(process.env)) delete process.env[key];
+	Object.assign(process.env, {
+		OPENPROJECT_BASE_URL: "https://project.example",
+		OPENPROJECT_API_KEY: "test",
+		DATABASE_URL: "postgresql://localhost/test",
+		ORGANIZER_GUILD_ID: "1",
+		ORGANIZER_GUILD_MEMBER_ROLE_ID: "2",
+		ORGANIZER_GUILD_ORGANIZER_ROLE_ID: "3",
+		OPENPROJECT_RAG_MODE: "review",
+		AZURE_OPENAI_ENDPOINT: "https://azure.example",
+		AZURE_OPENAI_EMBEDDING_DEPLOYMENT: "embedding",
+		AZURE_OPENAI_EMBEDDING_DIMENSIONS: "1536",
+	});
+	try {
+		assert.equal(loadIntegrationConfig(), null);
+		process.env.AZURE_OPENAI_DEPLOYMENT = "reranker";
+		assert.equal(loadIntegrationConfig()?.OPENPROJECT_RAG_MODE, "review");
+	} finally {
+		for (const key of Object.keys(process.env)) delete process.env[key];
+		Object.assign(process.env, previous);
+	}
+});
+
 test("excluded channel configuration merges legacy blocks and category exclusions", () => {
 	const previous = { ...process.env };
 	Object.assign(process.env, {

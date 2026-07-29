@@ -3,7 +3,7 @@ import { automaticCandidateEligible, containsSensitiveContent, extractionDiagnos
 import { isOrganizerGuild, type IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient, titlesLikelyDuplicate, workPackageMarkdownLink } from "./openproject.js";
-import { AI_CONTEXT_GAP_MS, boundedDiscordContent, defaultAiDueDate, formatAiTaskDescription, inferCreationMetadata, relevantImageAttachments, teamProjectId } from "./tasks.js";
+import { AI_CONTEXT_GAP_MS, boundedDiscordContent, defaultAiDueDate, formatAiTaskDescription, inferCreationMetadata, proposalReviewComponents, relevantImageAttachments, teamProjectId } from "./tasks.js";
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
 import { describeProposalOperations, planExistingTaskOperations, sourceContentHash, taskReferencesAreValid } from "./task-proposals.js";
 
@@ -188,7 +188,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			let duplicates = 0;
 			let revisedProposals = 0;
 			const proposalIds = new Set<string>();
-			const ragEvaluations: Array<{ title: string; proposedAction: string; workPackageId?: number; similarity?: number }> = [];
+			const ragEvaluations: Array<Record<string, unknown>> = [];
 			const sourceRecords = new Map(source.map(message => [message.id, {
 				author: message.member?.displayName ?? message.author.username,
 				timestamp: message.createdAt.toISOString(),
@@ -213,8 +213,8 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				proposedAction: task.proposed_action,
 				sourceMessageIds: task.source_message_ids,
 			}));
-			const pipelineLatencyMs = extraction.latencyMs + gate.latencyMs;
-			const pipelineUsage = combinedUsage(extraction.usage, gate.usage);
+			let pipelineLatencyMs = extraction.latencyMs + gate.latencyMs;
+			let pipelineUsage = combinedUsage(extraction.usage, gate.usage);
 			for (const task of eligibleTasks) {
 				let projectId = channelProjectId;
 				const assigneeId = task.assignee_alias ? reverse.get(task.assignee_alias) : undefined;
@@ -229,12 +229,16 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				const sourceLinks = task.source_message_ids.map(id => `https://discord.com/channels/${primary.guildId}/${source.find(item => item.id === id)?.channelId ?? channelId}/${id}`);
 				const description = formatAiTaskDescription(task.description, minimized, sourceRecords, task.source_message_ids, task.relevant_attachment_ids);
 				const sourceAttachments = relevantImageAttachments(sourceRecords, task.source_message_ids, task.relevant_attachment_ids);
-				const similar = projectId && services.rag ? await services.rag.findSimilar(projectId, task.title, description) : [];
+				const ragAssessment = projectId && services.rag
+					? await services.rag.assessSimilar(projectId, task.title, description)
+					: { candidates: [], recommendedMatch: undefined, latencyMs: 0, usage: undefined, telemetry: { outcome: "disabled" } };
+				pipelineLatencyMs += ragAssessment.latencyMs;
+				pipelineUsage = combinedUsage(pipelineUsage, ragAssessment.usage);
 				ragEvaluations.push({
-					title: task.title, proposedAction: task.proposed_action,
-					workPackageId: similar[0]?.workPackageId, similarity: similar[0]?.similarity,
+					title: task.title, proposedAction: task.proposed_action, ...ragAssessment.telemetry,
 				});
-				const suggestedMatch = services.config.OPENPROJECT_RAG_MODE === "review" && similar[0]?.similarity >= services.config.OPENPROJECT_RAG_SIMILARITY_THRESHOLD ? similar[0] : undefined;
+				const suggestedMatch = services.config.OPENPROJECT_RAG_MODE === "review" ? ragAssessment.recommendedMatch : undefined;
+				const ragCandidates = services.config.OPENPROJECT_RAG_MODE === "review" ? ragAssessment.candidates : [];
 				const sourceLinkedTargets = await services.db.trackedWorkPackagesForSourceMessages(task.source_message_ids);
 				const targetResolution = await resolveProposalTarget({
 					action: task.proposed_action,
@@ -352,8 +356,8 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					createdProposals++;
 					continue;
 				}
-				const advisory = suggestedMatch
-					? `Possible existing task: #${suggestedMatch.workPackageId} (${Math.round(suggestedMatch.similarity * 100)}% similarity). This proposal will still create a new task.`
+				const advisory = ragCandidates.length
+					? `${ragCandidates.length} existing OpenProject ${ragCandidates.length === 1 ? "task may" : "tasks may"} track the same or related work. This proposal will still create a new task unless a reviewer selects one.`
 					: undefined;
 				const citedIds = new Set(task.source_message_ids);
 				const reviewers = new Set<string>(source.filter(message => citedIds.has(message.id)).map(message => message.author.id));
@@ -394,15 +398,11 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 							sourceMessageIds: task.source_message_ids, sourceLinks,
 						},
 						retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS,
+						ragCandidates,
 				});
 				const reviewPayload: ReviewCardPayload = {
 					content: boundedDiscordContent(`${ownerText}Proposed OpenProject task: **${task.title}**\n${description}${advisory ? `\n\n${advisory}` : ""}`),
-					components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
-						new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and edit").setStyle(ButtonStyle.Primary),
-						...(suggestedMatch ? [new ButtonBuilder().setCustomId(`op-use-existing:${proposal.id}:${suggestedMatch.workPackageId}`).setLabel(`Use existing #${suggestedMatch.workPackageId}`).setStyle(ButtonStyle.Secondary)] : []),
-						new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
-						new ButtonBuilder().setCustomId(`op-duplicate:${proposal.id}`).setLabel("Already tracked").setStyle(ButtonStyle.Secondary),
-					)],
+					components: proposalReviewComponents(proposal.id, "create", ragCandidates, true),
 					allowedMentions: { parse: [] },
 				};
 				proposalIds.add(proposal.id);

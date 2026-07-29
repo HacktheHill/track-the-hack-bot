@@ -55,6 +55,7 @@ export type TeamMapping = {
 export function loadIntegrationConfig() {
 	const parsed = envSchema.safeParse(process.env);
 	if (!parsed.success) return null;
+	if (parsed.data.OPENPROJECT_RAG_MODE !== "off" && (!parsed.data.AZURE_OPENAI_ENDPOINT || !parsed.data.AZURE_OPENAI_DEPLOYMENT || !parsed.data.AZURE_OPENAI_EMBEDDING_DEPLOYMENT || !parsed.data.AZURE_OPENAI_EMBEDDING_DIMENSIONS)) return null;
 	return {
 		...parsed.data,
 		userMap: jsonRecord<Record<string, number>>("OPENPROJECT_USER_MAP", {}),
