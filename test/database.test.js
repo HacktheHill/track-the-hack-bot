@@ -121,13 +121,16 @@ test("AI proposal metadata is persisted for reviewed task creation", async () =>
 		assigneeDiscordId: "user", accountableDiscordId: "accountable", priorityId: 4, sizeHref: "/api/v3/custom_options/5",
 		startDate: "2026-07-14", dueDate: "2026-07-21", estimatedHours: 6,
 		metadataInference: { priority: false, size: true, estimate: true },
-		sourceMessageIds: ["message"], classification: "direct_assignment", modelDeployment: "model",
+		sourceMessageIds: ["message"], sourceAttachments: [{ id: "image", name: "mockup.png", contentType: "image/png", url: "https://cdn.discordapp.com/image" }],
+		classification: "direct_assignment", modelDeployment: "model",
 	});
 	assert.match(inserted.sql, /priority_id, size_href, start_date, due_date, estimated_hours/);
-	assert.match(inserted.sql, /\$18,'pending_review',\$19/);
+	assert.match(inserted.sql, /source_attachments/);
+	assert.match(inserted.sql, /\$19,'pending_review',\$20/);
 	assert.deepEqual(inserted.values.slice(7, 13), ["accountable", 4, "/api/v3/custom_options/5", "2026-07-14", "2026-07-21", 6]);
 	assert.equal(inserted.values[13], '{"priority":false,"size":true,"estimate":true}');
 	assert.match(inserted.values[15], /channel:3:message:create:new:user:prepare outreach/);
+	assert.equal(inserted.values[17], '[{"id":"image","name":"mockup.png","contentType":"image/png","url":"https://cdn.discordapp.com/image"}]');
 });
 
 test("existing-task proposals persist explicit operations and independent checkpoints", async () => {
@@ -146,7 +149,7 @@ test("existing-task proposals persist explicit operations and independent checkp
 	});
 	const insert = queries.find(query => query.sql.includes("INSERT INTO task_proposals"));
 	assert.match(insert.sql, /operation_schema_version, metadata_patch, content_operation, content_markdown/);
-	assert.deepEqual(insert.values.slice(28, 32), [1, '{"dueDate":"2026-07-31"}', "postComment", "- Change wording"]);
+	assert.deepEqual(insert.values.slice(29, 33), [1, '{"dueDate":"2026-07-31"}', "postComment", "- Change wording"]);
 	await db.markProposalPatchApplied("proposal", 2);
 	await db.markProposalCommentApplied("proposal", 99);
 	assert.equal(queries.some(query => query.sql.includes("patch_applied_at")), true);

@@ -2,7 +2,7 @@ import pg from "pg";
 import type { IntegrationConfig } from "./config.js";
 import { randomUUID } from "node:crypto";
 import { proposalMetadataPatchSchema, type ContentOperation, type ProposalMetadataPatch } from "./task-proposals.js";
-import { titlesLikelyDuplicate } from "./openproject.js";
+import { titlesLikelyDuplicate, type OpenProjectAttachmentInput } from "./openproject.js";
 
 const { Pool } = pg;
 
@@ -102,6 +102,7 @@ export class Database {
 				metadata_inference JSONB NOT NULL DEFAULT '{}',
 				source_message_ids TEXT[] NOT NULL DEFAULT '{}',
 				source_links TEXT[] NOT NULL DEFAULT '{}',
+				source_attachments JSONB NOT NULL DEFAULT '[]',
 				work_item_key TEXT,
 				source_content_hash TEXT,
 				source_fingerprint TEXT UNIQUE,
@@ -238,6 +239,7 @@ export class Database {
 		await this.pool.query("ALTER TABLE task_confirmation_queue ADD COLUMN IF NOT EXISTS owner_discord_ids TEXT[] NOT NULL DEFAULT '{}'");
 		await this.pool.query("UPDATE task_confirmation_queue SET owner_discord_ids=ARRAY[assignee_discord_id] WHERE cardinality(owner_discord_ids)=0 AND assignee_discord_id IS NOT NULL");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS source_links TEXT[] NOT NULL DEFAULT '{}'");
+		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS source_attachments JSONB NOT NULL DEFAULT '[]'");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS work_item_key TEXT");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS source_content_hash TEXT");
 		await this.pool.query("CREATE INDEX IF NOT EXISTS task_proposals_source_messages_idx ON task_proposals USING GIN(source_message_ids)");
@@ -554,6 +556,7 @@ export class Database {
 		metadataInference?: { priority?: boolean; size?: boolean; estimate?: boolean };
 		sourceMessageIds: string[];
 		sourceLinks?: string[];
+		sourceAttachments?: OpenProjectAttachmentInput[];
 		workItemKey?: string;
 		sourceContentHash?: string;
 		classification?: string;
@@ -622,7 +625,7 @@ export class Database {
 				if (overlappingDuplicate.status === "pending_review" && input.sourceContentHash && input.sourceContentHash !== overlappingDuplicate.source_content_hash) {
 					const updated = await client.query<{ revision: number }>(
 						`UPDATE task_proposals SET title=$2,description=$3,source_message_ids=ARRAY(SELECT DISTINCT value FROM unnest(task_proposals.source_message_ids || $4::text[]) value),
-						 source_links=ARRAY(SELECT DISTINCT value FROM unnest(task_proposals.source_links || $5::text[]) value),evidence=$6,ambiguities=$7,
+						 source_links=ARRAY(SELECT DISTINCT value FROM unnest(task_proposals.source_links || $5::text[]) value),source_attachments=$32,evidence=$6,ambiguities=$7,
 						 work_item_key=COALESCE($8,work_item_key),source_content_hash=$9,project_id=$10,
 						 assignee_discord_id=$11,accountable_discord_id=$12,priority_id=$13,size_href=$14,start_date=$15,due_date=$16,
 						 estimated_hours=$17,metadata_inference=$18,classification=$19,model_deployment=$20,permitted_reviewer_ids=$21,
@@ -637,7 +640,8 @@ export class Database {
 							input.classification ?? null, input.modelDeployment, input.permittedReviewerIds ?? (input.requesterId ? [input.requesterId] : []),
 							input.latencyMs ?? null, input.tokenUsage ?? null, input.escalationReason ?? null, input.action ?? "create",
 							input.targetWorkPackageId ?? null, input.targetLockVersion ?? null, input.action && input.action !== "create" ? 1 : null,
-							jsonParameter(input.metadataPatch ?? {}), input.contentOperation ?? null, input.contentMarkdown ?? null],
+							jsonParameter(input.metadataPatch ?? {}), input.contentOperation ?? null, input.contentMarkdown ?? null,
+							jsonParameter(input.sourceAttachments ?? [])],
 					);
 					if (updated.rows[0]) {
 						revised = true;
@@ -653,12 +657,12 @@ export class Database {
 			`INSERT INTO task_proposals
 			(id, requester_discord_id, channel_id, project_id, title, description,
 			 assignee_discord_id, accountable_discord_id, priority_id, size_href, start_date, due_date, estimated_hours, metadata_inference,
-			 source_message_ids, source_fingerprint, source_links,
+			 source_message_ids, source_fingerprint, source_links, source_attachments,
 			 classification, status, model_deployment, permitted_reviewer_ids, action, target_work_package_id, target_lock_version,
 			 evidence, ambiguities, latency_ms, token_usage, escalation_reason,
 			 operation_schema_version, metadata_patch, content_operation, content_markdown, work_item_key, source_content_hash, expires_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'pending_review',$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,
-			 $29,$30,$31,$32,$33,$34,now() + ($35::text || ' days')::interval)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,'pending_review',$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,
+				 $30,$31,$32,$33,$34,$35,now() + ($36::text || ' days')::interval)
 			ON CONFLICT(source_fingerprint) DO UPDATE SET
 			 requester_discord_id=excluded.requester_discord_id, channel_id=excluded.channel_id,
 			 project_id=excluded.project_id, title=excluded.title, description=excluded.description,
@@ -666,7 +670,7 @@ export class Database {
 			 priority_id=excluded.priority_id,
 			 size_href=excluded.size_href, start_date=excluded.start_date, due_date=excluded.due_date,
 			 estimated_hours=excluded.estimated_hours, metadata_inference=excluded.metadata_inference,
-				 source_message_ids=excluded.source_message_ids, source_links=excluded.source_links, classification=excluded.classification,
+				 source_message_ids=excluded.source_message_ids, source_links=excluded.source_links, source_attachments=excluded.source_attachments, classification=excluded.classification,
 				action=excluded.action, target_work_package_id=excluded.target_work_package_id, target_lock_version=excluded.target_lock_version,
 			 status='pending_review', model_deployment=excluded.model_deployment,
 			 permitted_reviewer_ids=excluded.permitted_reviewer_ids, evidence=excluded.evidence,
@@ -685,7 +689,7 @@ export class Database {
 			 input.description, input.assigneeDiscordId ?? null, input.accountableDiscordId ?? null,
 			 input.priorityId ?? null, input.sizeHref ?? null,
 			 input.startDate ?? null, input.dueDate ?? null, input.estimatedHours ?? null, jsonParameter(input.metadataInference ?? {}),
-			 input.sourceMessageIds, fingerprint, input.sourceLinks ?? [], input.classification ?? null, input.modelDeployment,
+			 input.sourceMessageIds, fingerprint, input.sourceLinks ?? [], jsonParameter(input.sourceAttachments ?? []), input.classification ?? null, input.modelDeployment,
 			 input.permittedReviewerIds ?? (input.requesterId ? [input.requesterId] : []), input.action ?? "create", input.targetWorkPackageId ?? null, input.targetLockVersion ?? null,
 			 input.evidence ?? null, input.ambiguities ?? [], input.latencyMs ?? null,
 			 input.tokenUsage ?? null, input.escalationReason ?? null,
@@ -750,7 +754,7 @@ export class Database {
 			priority_id: number | null; size_href: string | null;
 			start_date: string | null; due_date: string | null; estimated_hours: number | null;
 			 metadata_inference: { priority?: boolean; size?: boolean; estimate?: boolean };
-			 source_message_ids: string[]; source_links: string[]; status: string; permitted_reviewer_ids: string[];
+			 source_message_ids: string[]; source_links: string[]; source_attachments: OpenProjectAttachmentInput[]; status: string; permitted_reviewer_ids: string[];
 			 expires_at: string; openproject_work_package_id: number | null;
 			 action: "create" | "update" | "complete" | "reopen"; target_work_package_id: number | null; target_lock_version: number | null;
 			 operation_schema_version: number | null; metadata_patch: ProposalMetadataPatch;

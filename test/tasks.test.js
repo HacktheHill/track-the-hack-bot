@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, removeProposalReviewCard, taskCommand, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
+import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, relevantImageAttachments, removeProposalReviewCard, taskCommand, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
 import { normalizeTaskTitle, OpenProjectClient, titlesLikelyDuplicate, workPackageMarkdownLink } from "../dist/openproject.js";
 
 test("task defaults start today and use the configured due offset", () => {
@@ -211,14 +211,12 @@ test("bridge language carries a delayed clarification into the same task", () =>
 	), 0);
 });
 
-test("AI task descriptions retain URLs from cited messages", () => {
+test("AI task descriptions omit URLs from cited messages", () => {
 	const description = appendRelevantUrls("Create the outreach tracker.", [
 		{ id: "primary", authorAlias: "USER_1", text: "Create a spreadsheet", timestamp: "2026-07-06T21:50:00Z" },
 		{ id: "followup", authorAlias: "USER_2", text: "Created: https://docs.google.com/spreadsheets/d/example", timestamp: "2026-07-06T21:59:00Z" },
 	], ["primary", "followup"]);
-	assert.match(description, /## References/);
-	assert.match(description, /^Create the outreach tracker\./);
-	assert.match(description, /https:\/\/docs\.google\.com\/spreadsheets\/d\/example/);
+	assert.equal(description, "Create the outreach tracker.");
 });
 
 test("ephemeral proposal controls omit Dismiss and remain actionable", () => {
@@ -227,7 +225,7 @@ test("ephemeral proposal controls omit Dismiss and remain actionable", () => {
 	assert.deepEqual(manualProposalButtons("proposal", "create", 42).map(button => button.toJSON().custom_id), ["op-review:proposal", "op-use-existing:proposal:42", "op-duplicate:proposal"]);
 });
 
-test("AI task descriptions retain attachment links without verbatim source text", () => {
+test("AI task descriptions omit Discord attachment links without verbatim source text", () => {
 	const description = appendSourceLinks("Summary", new Map([
 		["m1", {
 			author: "Daniel", timestamp: "2026-07-06T22:00:00Z", text: "These are the fields to replace.",
@@ -239,8 +237,19 @@ test("AI task descriptions retain attachment links without verbatim source text"
 	]), ["m1"], ["a1"]);
 	assert.equal(description.includes("## Source conversation"), false);
 	assert.equal(description.includes("These are the fields to replace."), false);
-	assert.match(description, /schema\.png/);
+	assert.equal(description, "Summary");
 	assert.equal(description.includes("unrelated.png"), false);
+});
+
+test("only selected image attachments are prepared for OpenProject upload", () => {
+	const records = new Map([["m1", {
+		author: "Daniel", timestamp: "2026-07-06T22:00:00Z", text: "See attached.",
+		attachments: [
+			{ id: "image", name: "schema.png", contentType: "image/png", url: "https://cdn.discordapp.com/schema.png" },
+			{ id: "document", name: "notes.pdf", contentType: "application/pdf", url: "https://cdn.discordapp.com/notes.pdf" },
+		],
+	}]]);
+	assert.deepEqual(relevantImageAttachments(records, ["m1"], ["image", "document"]), [records.get("m1").attachments[0]]);
 });
 
 test("proposal cards stay within Discord's message limit", () => {
@@ -338,6 +347,41 @@ test("OpenProject creation uses dynamic type/size metadata and appends source li
 		assert.equal(formPayload._links.type.href, "/api/v3/types/9");
 		assert.equal(commitPayload.customField2.href, "/api/v3/custom_options/7");
 		assert.match(formPayload.description.raw, /discord\.com\/channels\/1\/2\/3/);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("OpenProject creation uploads Discord images and embeds native attachment references", async () => {
+	const calls = [];
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init = {}) => {
+		calls.push({ url: String(url), init });
+		if (String(url) === "https://cdn.discordapp.com/attachments/1/2/schema.png") {
+			return new Response(new Uint8Array([1, 2, 3]), { headers: { "Content-Type": "image/png" } });
+		}
+		if (String(url).endsWith("/attachments?pageSize=100") && (init.method ?? "GET") === "GET") {
+			return Response.json({ _embedded: { elements: [] }, _links: {} });
+		}
+		if (String(url).endsWith("/attachments") && init.method === "POST") {
+			return Response.json({ id: 8, fileName: "a1-schema.png" });
+		}
+		if (String(url).endsWith("/form")) return Response.json({ _embedded: { validationErrors: {} } });
+		return Response.json({ id: 42, subject: "Ship portal", lockVersion: 1, _links: {} });
+	};
+	try {
+		const client = new OpenProjectClient({ OPENPROJECT_BASE_URL: "https://project.example", OPENPROJECT_API_KEY: "test" });
+		await client.createWorkPackage({
+			projectId: 3, subject: "Ship portal", description: "Complete it", sourceLinks: [],
+			attachments: [{ id: "a1", name: "schema.png", contentType: "image/png", url: "https://cdn.discordapp.com/attachments/1/2/schema.png" }],
+		});
+		const creationPayload = JSON.parse(calls[0].init.body);
+		assert.match(creationPayload.description.raw, /!\[schema\.png\]\(attachment:a1-schema\.png\)/);
+		assert.equal(creationPayload.description.raw.includes("cdn.discordapp.com"), false);
+		const upload = calls.find(call => call.init.body instanceof FormData);
+		assert.ok(upload);
+		assert.equal(JSON.parse(await upload.init.body.get("metadata").text()).fileName, "a1-schema.png");
+		assert.equal(upload.init.body.get("file").type, "image/png");
 	} finally {
 		globalThis.fetch = originalFetch;
 	}

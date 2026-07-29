@@ -129,8 +129,7 @@ function compactDescription(value: string) {
 	return output.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-export function formatGeneratedTaskDescription(value: string, referenceLinks: readonly string[] = []) {
-	const links = [...new Set(referenceLinks.map(link => link.trim()).filter(Boolean))];
+export function formatGeneratedTaskDescription(value: string) {
 	let cleaned = stripGeneratedReferenceSections(value);
 	cleaned = cleaned
 		.replace(/\[([^\]]+)\]\(https?:\/\/[^)]+\)/gi, "$1")
@@ -138,26 +137,22 @@ export function formatGeneratedTaskDescription(value: string, referenceLinks: re
 		.replace(/https?:\/\/[^\s<>()]+/gi, "")
 		.replace(/[ \t]+([.,;:!?])/g, "$1")
 		.replace(/[ \t]+\n/g, "\n");
-	const body = compactDescription(cleaned);
-	let references = "";
-	for (const link of links) {
-		const addition = `${references ? "" : "## References\n\n"}- ${link}\n`;
-		if (references.length + addition.length > 2000) break;
-		references += addition;
-	}
-	const separator = body && references ? "\n\n" : "";
-	const bodyLimit = Math.max(0, 4000 - separator.length - references.trimEnd().length);
-	return `${body.slice(0, bodyLimit).trimEnd()}${separator}${references.trimEnd()}`;
+	return compactDescription(cleaned).slice(0, 4000).trimEnd();
 }
 
-export function composeOpenProjectMarkdown(body: string, sourceLinks: string[], marker?: string) {
+export function composeOpenProjectMarkdown(
+	body: string,
+	sourceLinks: string[],
+	marker?: string,
+	images: readonly { name: string; fileName: string }[] = [],
+) {
 	const links = [...new Set(sourceLinks.map(link => link.trim()).filter(Boolean))];
 	const source = links.length ? `## Source\n\n${links.map(link => `- ${link}`).join("\n")}` : "";
-	const withoutSource = body.replace(
-		/(?:^|\n)\s*(?:#{1,6}\s*)?source(?:\s+conversation)?\s*:?\s*\n(?:\s*[-*]\s+https?:\/\/\S+\s*\n?)*/gi,
-		"\n",
-	).trim();
-	return [withoutSource, source, marker ? `<!-- ${marker} -->` : ""].filter(Boolean).join("\n\n");
+	const imageSection = images.length
+		? `## Images\n\n${images.map(image => `![${image.name.replace(/[\[\]]/g, "")}](attachment:${image.fileName})`).join("\n\n")}`
+		: "";
+	const withoutSource = stripGeneratedReferenceSections(body);
+	return [withoutSource, imageSection, source, marker ? `<!-- ${marker} -->` : ""].filter(Boolean).join("\n\n");
 }
 
 export function planExistingTaskOperations(input: ExistingTaskPlanInput) {

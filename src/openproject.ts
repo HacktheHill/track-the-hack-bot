@@ -20,6 +20,13 @@ export type WorkPackage = {
 	_links: Record<string, HalLink>;
 };
 export type Activity = { id: number; comment?: { raw?: string } | null; _links?: Record<string, HalLink> };
+export type OpenProjectAttachmentInput = { id: string; name: string; contentType?: string; url: string };
+type Attachment = { id: number; fileName: string };
+
+export function openProjectAttachmentFileName(attachment: OpenProjectAttachmentInput) {
+	const safeName = attachment.name.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+/, "") || "image";
+	return `${attachment.id}-${safeName}`;
+}
 
 export class OpenProjectRequestError extends Error {
 	constructor(message: string, readonly ambiguous = false) {
@@ -38,6 +45,7 @@ export type WorkPackageInput = {
 	dueDate?: string;
 	estimatedHours?: number;
 	sourceLinks: string[];
+	attachments?: OpenProjectAttachmentInput[];
 	typeId?: number;
 	correlationId?: string;
 };
@@ -107,7 +115,7 @@ export class OpenProjectClient {
 					headers: {
 						Authorization: this.authorization,
 						Accept: "application/hal+json",
-						...(init?.body ? { "Content-Type": "application/json" } : {}),
+						...(init?.body && !(init.body instanceof FormData) ? { "Content-Type": "application/json" } : {}),
 						...init?.headers,
 					},
 				});
@@ -129,6 +137,37 @@ export class OpenProjectClient {
 			}
 		}
 		throw new OpenProjectRequestError("OpenProject request failed.");
+	}
+
+	private attachmentFileName(attachment: OpenProjectAttachmentInput) {
+		return openProjectAttachmentFileName(attachment);
+	}
+
+	private attachmentMarkdown(attachments: readonly OpenProjectAttachmentInput[]) {
+		return attachments.map(attachment => ({ name: attachment.name, fileName: this.attachmentFileName(attachment) }));
+	}
+
+	private async uploadAttachments(containerPath: string, attachments: readonly OpenProjectAttachmentInput[]) {
+		if (!attachments.length) return;
+		const existing = await this.collection<Attachment>(`${containerPath}/attachments?pageSize=100`);
+		const existingNames = new Set(existing.map(attachment => attachment.fileName));
+		for (const attachment of attachments) {
+			const fileName = this.attachmentFileName(attachment);
+			if (existingNames.has(fileName)) continue;
+			const sourceUrl = new URL(attachment.url);
+			if (!new Set(["cdn.discordapp.com", "media.discordapp.net"]).has(sourceUrl.hostname)) {
+				throw new OpenProjectRequestError(`Refusing to download an attachment from ${sourceUrl.hostname}.`);
+			}
+			const response = await fetch(sourceUrl, { signal: AbortSignal.timeout(30000) });
+			if (!response.ok) throw new OpenProjectRequestError(`Discord attachment download failed with ${response.status}.`);
+			const contentType = attachment.contentType ?? response.headers.get("content-type") ?? "application/octet-stream";
+			if (!contentType.startsWith("image/")) continue;
+			const form = new FormData();
+			form.append("metadata", new Blob([JSON.stringify({ fileName })], { type: "application/json" }));
+			form.append("file", new Blob([await response.arrayBuffer()], { type: contentType }), fileName);
+			await this.request<Attachment>(`${containerPath}/attachments`, { method: "POST", body: form });
+			existingNames.add(fileName);
+		}
 	}
 
 	private async cached<T>(key: string, loader: () => Promise<T>) {
@@ -242,10 +281,12 @@ export class OpenProjectClient {
 	}
 
 	async createWorkPackage(input: WorkPackageInput) {
+		const attachments = input.attachments ?? [];
 		const description = composeOpenProjectMarkdown(
 			input.description,
 			input.sourceLinks,
 			input.correlationId ? `track-the-hack-correlation:${input.correlationId}` : undefined,
+			this.attachmentMarkdown(attachments),
 		);
 		const payload: Record<string, unknown> = {
 			subject: input.subject,
@@ -275,10 +316,19 @@ export class OpenProjectClient {
 			...(form._embedded.payload ?? payload),
 			...(input.sizeHref ? { [this.config.OPENPROJECT_SIZE_CUSTOM_FIELD]: { href: input.sizeHref } } : {}),
 		};
-		return this.request<WorkPackage>(
+		const workPackage = await this.request<WorkPackage>(
 			form._links?.commit?.href ?? `/api/v3/projects/${input.projectId}/work_packages`,
 			{ method: "POST", body: JSON.stringify(commitPayload) },
 		);
+		try {
+			await this.uploadAttachments(`/api/v3/work_packages/${workPackage.id}`, attachments);
+		} catch (error) {
+			throw new OpenProjectRequestError(
+				`OpenProject task ${workPackage.id} was created, but its images could not be uploaded: ${(error as Error).message}`,
+				true,
+			);
+		}
+		return workPackage;
 	}
 
 	async workPackage(id: number) {
@@ -310,20 +360,32 @@ export class OpenProjectClient {
 		return this.collection<Activity>(`/api/v3/work_packages/${id}/activities?pageSize=100`);
 	}
 
-	async commentWorkPackage(id: number, markdown: string, sourceLinks: string[], correlationId: string) {
+	async attachWorkPackageImages(id: number, attachments: OpenProjectAttachmentInput[]) {
+		await this.uploadAttachments(`/api/v3/work_packages/${id}`, attachments);
+	}
+
+	async commentWorkPackage(id: number, markdown: string, sourceLinks: string[], correlationId: string, attachments: OpenProjectAttachmentInput[] = []) {
 		const marker = `track-the-hack-proposal:${correlationId}:comment`;
-		const body = composeOpenProjectMarkdown(markdown, sourceLinks, marker);
+		const body = composeOpenProjectMarkdown(markdown, sourceLinks, marker, this.attachmentMarkdown(attachments));
 		const existing = (await this.workPackageActivities(id)).find(activity => activity.comment?.raw?.includes(`<!-- ${marker} -->`));
-		if (existing) return existing;
+		if (existing) {
+			await this.uploadAttachments(`/api/v3/activities/${existing.id}`, attachments);
+			return existing;
+		}
 		try {
-			return await this.request<Activity>(`/api/v3/work_packages/${id}/activities`, {
+			const activity = await this.request<Activity>(`/api/v3/work_packages/${id}/activities`, {
 				method: "POST",
 				body: JSON.stringify({ comment: { raw: body } }),
 			});
+			await this.uploadAttachments(`/api/v3/activities/${activity.id}`, attachments);
+			return activity;
 		} catch (error) {
 			if (!(error instanceof OpenProjectRequestError) || !error.ambiguous) throw error;
 			const recovered = (await this.workPackageActivities(id)).find(activity => activity.comment?.raw?.includes(`<!-- ${marker} -->`));
-			if (recovered) return recovered;
+			if (recovered) {
+				await this.uploadAttachments(`/api/v3/activities/${recovered.id}`, attachments);
+				return recovered;
+			}
 			throw error;
 		}
 	}

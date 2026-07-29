@@ -3,7 +3,7 @@ import { automaticCandidateEligible, containsSensitiveContent, extractionDiagnos
 import { isOrganizerGuild, type IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient, titlesLikelyDuplicate, workPackageMarkdownLink } from "./openproject.js";
-import { AI_CONTEXT_GAP_MS, boundedDiscordContent, defaultAiDueDate, formatAiTaskDescription, inferCreationMetadata, teamProjectId } from "./tasks.js";
+import { AI_CONTEXT_GAP_MS, boundedDiscordContent, defaultAiDueDate, formatAiTaskDescription, inferCreationMetadata, relevantImageAttachments, teamProjectId } from "./tasks.js";
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
 import { describeProposalOperations, planExistingTaskOperations, sourceContentHash, taskReferencesAreValid } from "./task-proposals.js";
 
@@ -228,6 +228,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				let estimatedHours = task.estimated_hours ?? undefined;
 				const sourceLinks = task.source_message_ids.map(id => `https://discord.com/channels/${primary.guildId}/${source.find(item => item.id === id)?.channelId ?? channelId}/${id}`);
 				const description = formatAiTaskDescription(task.description, minimized, sourceRecords, task.source_message_ids, task.relevant_attachment_ids);
+				const sourceAttachments = relevantImageAttachments(sourceRecords, task.source_message_ids, task.relevant_attachment_ids);
 				const similar = projectId && services.rag ? await services.rag.findSimilar(projectId, task.title, description) : [];
 				ragEvaluations.push({
 					title: task.title, proposedAction: task.proposed_action,
@@ -302,6 +303,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						priorityId: priority?.id, sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined,
 						startDate: task.start_date ?? undefined, dueDate, estimatedHours, metadataInference,
 						sourceMessageIds: task.source_message_ids, sourceLinks,
+						sourceAttachments,
 						modelDeployment: deployment, permittedReviewerIds: [...reviewers], evidence: task.evidence,
 						ambiguities: [...result.ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: pipelineLatencyMs, tokenUsage: pipelineUsage,
 						action, targetWorkPackageId: match.workPackageId, targetLockVersion: target!.lockVersion,
@@ -375,6 +377,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						priorityId: priority?.id, sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined,
 						startDate: task.start_date ?? undefined, dueDate, estimatedHours, metadataInference,
 						sourceMessageIds: task.source_message_ids, sourceLinks,
+						sourceAttachments,
 					modelDeployment: deployment,
 					permittedReviewerIds: [...reviewers],
 					evidence: task.evidence, ambiguities: [...result.ambiguities, ...(advisory ? [advisory] : [])],

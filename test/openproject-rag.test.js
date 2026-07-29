@@ -217,6 +217,33 @@ test("OpenProject comments reuse an existing correlated activity", async () => {
 	}
 });
 
+test("OpenProject comments upload images to the created activity", async () => {
+	const originalFetch = globalThis.fetch;
+	const requests = [];
+	globalThis.fetch = async (url, init = {}) => {
+		requests.push({ url: String(url), init });
+		if (String(url) === "https://cdn.discordapp.com/attachments/1/2/update.png") {
+			return new Response(new Uint8Array([1]), { headers: { "Content-Type": "image/png" } });
+		}
+		if (String(url).endsWith("/activities?pageSize=100")) return Response.json({ _embedded: { elements: [] }, _links: {} });
+		if (String(url).endsWith("/activities") && init.method === "POST") return Response.json({ id: 9, comment: { raw: "" } });
+		if (String(url).endsWith("/attachments?pageSize=100") && (init.method ?? "GET") === "GET") return Response.json({ _embedded: { elements: [] }, _links: {} });
+		if (String(url).endsWith("/attachments") && init.method === "POST") return Response.json({ id: 10, fileName: "a1-update.png" });
+		throw new Error(`Unexpected request: ${url}`);
+	};
+	try {
+		const client = new OpenProjectClient({ OPENPROJECT_BASE_URL: "https://openproject.example", OPENPROJECT_API_KEY: "secret", OPENPROJECT_CACHE_TTL_MS: 1000 });
+		await client.commentWorkPackage(42, "Updated design", [], "proposal", [
+			{ id: "a1", name: "update.png", contentType: "image/png", url: "https://cdn.discordapp.com/attachments/1/2/update.png" },
+		]);
+		const activityRequest = requests.find(request => request.url.endsWith("/activities") && request.init.method === "POST");
+		assert.match(JSON.parse(activityRequest.init.body).comment.raw, /!\[update\.png\]\(attachment:a1-update\.png\)/);
+		assert.equal(requests.some(request => request.url.endsWith("/api/v3/activities/9/attachments") && request.init.method === "POST"), true);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
 test("RAG sync includes category projects configured in the database and records success", async () => {
 	const requestedProjects = [];
 	const syncStates = [];

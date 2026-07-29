@@ -29,7 +29,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { isOrganizerGuild, type IntegrationConfig, type TeamMapping } from "./config.js";
 import { correctionFields, Database, proposalDismissalReasons, type CorrectionFlags, type ProposalDismissalReason, type ProposalMetrics } from "./database.js";
-import { OpenProjectClient, OpenProjectRequestError, workPackageChangesApplied, workPackageMarkdownLink } from "./openproject.js";
+import { OpenProjectClient, OpenProjectRequestError, openProjectAttachmentFileName, workPackageChangesApplied, workPackageMarkdownLink, type OpenProjectAttachmentInput } from "./openproject.js";
 import { attachExtractionDiagnostics, automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, StructuredOutputError, type ExtractedTasks, type ExtractionResult, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
 import { composeOpenProjectMarkdown, describeProposalOperations, formatGeneratedTaskDescription, planExistingTaskOperations, sourceContentHash, taskReferencesAreValid, type ProposalMetadataPatch } from "./task-proposals.js";
@@ -115,7 +115,7 @@ type Services = { config: IntegrationConfig; db: Database; openProject: OpenProj
 type TaskInteraction = ChatInputCommandInteraction | ModalSubmitInteraction | ButtonInteraction;
 type ContextDraft = {
 	userId: string; channelId: string; targetId: string; title: string; description: string;
-	projectId?: number; assigneeId?: string; defaultDueDate?: string; expiresAt: number;
+	projectId?: number; assigneeId?: string; defaultDueDate?: string; attachments?: OpenProjectAttachmentInput[]; expiresAt: number;
 };
 type CreationDraft = {
 	userId: string; channelId: string; expiresAt: number; proposalId?: string;
@@ -123,7 +123,7 @@ type CreationDraft = {
 	assigneeId?: string; accountableId?: string; priorityId?: number; sizeHref?: string;
 	startDate?: string; dueDate?: string; inferenceDueDate?: string; estimatedHours?: number;
 	priorityInferred?: boolean; sizeInferred?: boolean; estimateInferred?: boolean;
-	sourceLinks: string[]; allowDuplicate?: boolean;
+	sourceLinks: string[]; sourceAttachments?: OpenProjectAttachmentInput[]; allowDuplicate?: boolean;
 };
 type CollectedContext = {
 	messages: MinimizedMessage[];
@@ -136,6 +136,10 @@ type CollectedContext = {
 	explicitAssigneeId?: string;
 };
 const sensitiveOverrides = new Map<string, { userId: string; context: CollectedContext; expiresAt: number }>();
+
+function isImageAttachment(attachment: { name: string; contentType?: string }) {
+	return attachment.contentType?.startsWith("image/") === true || /\.(?:avif|bmp|gif|jpe?g|png|tiff?|webp)$/i.test(attachment.name);
+}
 
 function normalizedMetricValue(value?: string | null) {
 	return (value ?? "").trim().replace(/\s+/g, " ").toLocaleLowerCase();
@@ -655,6 +659,7 @@ async function createAndAnnounce(args: {
 	sizeInferred?: boolean;
 	estimateInferred?: boolean;
 	sourceLinks: string[];
+	sourceAttachments?: OpenProjectAttachmentInput[];
 	allowDuplicate?: boolean;
 }) {
 	const { interaction, services } = args;
@@ -712,6 +717,7 @@ async function createAndAnnounce(args: {
 		sourceLinks: args.sourceLinks,
 		typeId: type?.id,
 		correlationId: args.correlationId ?? args.draftId,
+		attachments: args.sourceAttachments,
 	});
 	// Persist completion immediately after the non-idempotent OpenProject POST.
 	// Discord response/announcement failures must never make a successful POST
@@ -1014,6 +1020,14 @@ async function handleContext(interaction: MessageContextMenuCommandInteraction, 
 		userId: interaction.user.id, channelId: interaction.channelId, targetId: interaction.targetId,
 		title: interaction.targetMessage.content.split("\n")[0].slice(0, 255) || "Discord follow-up",
 		description: interaction.targetMessage.content.slice(0, 4000), projectId: defaultProject,
+		attachments: [...interaction.targetMessage.attachments.values()]
+			.filter(attachment => isImageAttachment({ name: attachment.name ?? "", contentType: attachment.contentType ?? undefined }))
+			.map(attachment => ({
+				id: attachment.id,
+				name: attachment.name ?? "image",
+				contentType: attachment.contentType ?? undefined,
+				url: attachment.url,
+			})),
 		expiresAt: Date.now() + 15 * 60_000,
 	};
 	const id = await services.db.createDraft("context", interaction.user.id, interaction.channelId, payload);
@@ -1130,15 +1144,9 @@ export function continuationScore(
 }
 
 export function appendRelevantUrls(description: string, messages: MinimizedMessage[], sourceIds: string[]) {
-	const urls = new Set<string>();
-	for (const message of messages) {
-		if (!sourceIds.includes(message.id)) continue;
-		for (const match of message.text.matchAll(/https?:\/\/[^\s<>()]+/gi)) {
-			const url = match[0].replace(/[.,;:!?]+$/, "");
-			if (!/^https?:\/\/(?:www\.)?discord(?:app)?\.com\//i.test(url) && !description.includes(url)) urls.add(url);
-		}
-	}
-	return formatGeneratedTaskDescription(sanitizeGeneratedDescription(description), [...urls]);
+	void messages;
+	void sourceIds;
+	return formatGeneratedTaskDescription(sanitizeGeneratedDescription(description));
 }
 
 export function appendSourceLinks(
@@ -1147,11 +1155,21 @@ export function appendSourceLinks(
 	sourceIds: string[],
 	relevantAttachmentIds?: string[],
 ) {
-	const relevant = relevantAttachmentIds ? new Set(relevantAttachmentIds) : null;
-	const links = [...new Set(sourceIds.flatMap(id => records.get(id)?.attachments
-		.filter(attachment => !relevant || relevant.has(attachment.id))
-		.map(attachment => attachment.url) ?? []))];
-	return formatGeneratedTaskDescription(sanitizeGeneratedDescription(description), links);
+	void records;
+	void sourceIds;
+	void relevantAttachmentIds;
+	return formatGeneratedTaskDescription(sanitizeGeneratedDescription(description));
+}
+
+export function relevantImageAttachments(
+	records: CollectedContext["sourceRecords"],
+	sourceIds: string[],
+	relevantAttachmentIds: string[],
+) {
+	const relevant = new Set(relevantAttachmentIds);
+	return [...new Map(sourceIds.flatMap(id => records.get(id)?.attachments ?? [])
+		.filter(attachment => relevant.has(attachment.id) && isImageAttachment(attachment))
+		.map(attachment => [attachment.id, attachment])).values()];
 }
 
 export function formatAiTaskDescription(
@@ -1161,21 +1179,11 @@ export function formatAiTaskDescription(
 	sourceIds: string[],
 	relevantAttachmentIds?: string[],
 ) {
-	const references = new Set<string>();
-	for (const message of messages) {
-		if (!sourceIds.includes(message.id)) continue;
-		for (const match of message.text.matchAll(/https?:\/\/[^\s<>()]+/gi)) {
-			const url = match[0].replace(/[.,;:!?]+$/, "");
-			if (!/^https?:\/\/(?:www\.)?discord(?:app)?\.com\//i.test(url)) references.add(url);
-		}
-	}
-	const relevant = relevantAttachmentIds ? new Set(relevantAttachmentIds) : null;
-	for (const id of sourceIds) {
-		for (const attachment of records.get(id)?.attachments ?? []) {
-			if (!relevant || relevant.has(attachment.id)) references.add(attachment.url);
-		}
-	}
-	return formatGeneratedTaskDescription(sanitizeGeneratedDescription(description), [...references]);
+	void messages;
+	void records;
+	void sourceIds;
+	void relevantAttachmentIds;
+	return formatGeneratedTaskDescription(sanitizeGeneratedDescription(description));
 }
 
 type ContextRole = NonNullable<MinimizedMessage["contextRole"]>;
@@ -1597,6 +1605,7 @@ async function completeAiCandidate(
 		candidate.source_message_ids,
 		candidate.relevant_attachment_ids,
 	);
+	const sourceAttachments = relevantImageAttachments(context.sourceRecords, candidate.source_message_ids, candidate.relevant_attachment_ids);
 	const sourceLinks = candidate.source_message_ids.map(id => {
 		const source = context.messages.find(message => message.id === id);
 		return messageUrl(interaction.guildId!, source?.channelId ?? interaction.channelId!, id);
@@ -1672,6 +1681,7 @@ async function completeAiCandidate(
 			priorityId: priority?.id, sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate, dueDate,
 			estimatedHours, metadataInference, sourceMessageIds: candidate.source_message_ids,
 			sourceLinks,
+			sourceAttachments,
 			modelDeployment: deployment, evidence: candidate.evidence,
 			ambiguities: [...result.ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: extraction.latencyMs,
 			tokenUsage: extraction.usage, escalationReason: extraction.escalationReason,
@@ -1747,6 +1757,7 @@ async function completeAiCandidate(
 		metadataInference,
 		sourceMessageIds: candidate.source_message_ids,
 		modelDeployment: deployment,
+		sourceAttachments,
 		evidence: candidate.evidence, ambiguities: [...result.ambiguities, ...(advisory ? [advisory] : [])],
 		workItemKey: candidate.work_item_key,
 		sourceContentHash: sourceContentHash(candidate.source_message_ids.map(id => ({
@@ -2104,6 +2115,7 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 			sizeInferred: proposal.metadata_inference.size,
 			estimateInferred: proposal.metadata_inference.estimate,
 			sourceLinks: proposal.source_links,
+			sourceAttachments: proposal.source_attachments,
 		};
 		if (!await services.db.claimProposal(proposal.id, interaction.user.id)) throw new Error("This proposal is already being handled.");
 		try {
@@ -2150,7 +2162,12 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 				if (Object.hasOwn(metadataPatch, "estimatedHours")) changes.estimatedTime = metadataPatch.estimatedHours == null ? null : `PT${metadataPatch.estimatedHours}H`;
 				if (Object.hasOwn(metadataPatch, "sizeHref")) changes[services.config.OPENPROJECT_SIZE_CUSTOM_FIELD] = metadataPatch.sizeHref ? { href: metadataPatch.sizeHref } : null;
 				if (proposal.content_operation === "descriptionReplacement") {
-					changes.description = { format: "markdown", raw: composeOpenProjectMarkdown(args.description, args.sourceLinks, `track-the-hack-proposal:${proposal.id}:description`) };
+					changes.description = { format: "markdown", raw: composeOpenProjectMarkdown(
+						args.description,
+						args.sourceLinks,
+						`track-the-hack-proposal:${proposal.id}:description`,
+						(args.sourceAttachments ?? []).map(attachment => ({ name: attachment.name, fileName: openProjectAttachmentFileName(attachment) })),
+					) };
 				}
 
 				let updated = await services.openProject.workPackage(proposal.target_work_package_id);
@@ -2160,12 +2177,15 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 					} else {
 						updated = await services.openProject.updateWorkPackage(proposal.target_work_package_id, changes, proposal.target_lock_version ?? undefined);
 					}
+					if (proposal.content_operation === "descriptionReplacement") {
+						await services.openProject.attachWorkPackageImages(proposal.target_work_package_id, args.sourceAttachments ?? []);
+					}
 					await services.db.markProposalPatchApplied(proposal.id, updated.lockVersion);
 				} else if (!proposal.patch_applied_at && proposal.target_lock_version !== null && updated.lockVersion !== proposal.target_lock_version) {
 					throw new Error(`OpenProject task ${proposal.target_work_package_id} changed since this proposal was created. Review it again before applying the update.`);
 				}
 				if (proposal.content_operation === "postComment" && !proposal.comment_activity_id) {
-					const activity = await services.openProject.commentWorkPackage(proposal.target_work_package_id, args.description, args.sourceLinks, proposal.id);
+					const activity = await services.openProject.commentWorkPackage(proposal.target_work_package_id, args.description, args.sourceLinks, proposal.id, args.sourceAttachments);
 					await services.db.markProposalCommentApplied(proposal.id, activity.id);
 				}
 				const corrections = proposalCorrections({
@@ -2258,6 +2278,7 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 		dueDate,
 		inferenceDueDate: dueDate !== draft.defaultDueDate ? dueDate : undefined,
 		sourceLinks: [messageUrl(interaction.guildId!, interaction.channelId!, draft.targetId)],
+		sourceAttachments: draft.attachments,
 	});
 	await services.db.failDraft(entityId, "context-complete");
 }

@@ -58,9 +58,10 @@ test("unresolved metadata is preserved instead of being cleared", () => {
 });
 
 test("Markdown composition deduplicates source links and appends its marker", () => {
-	const markdown = composeOpenProjectMarkdown("## Objective\n\nShip it.\n\n## Source\n\n- https://stale.test/source", ["https://example.test/source", "https://example.test/source"], "marker");
+	const markdown = composeOpenProjectMarkdown("## Objective\n\nShip it.\n\n## References\n\n- https://stale.test/reference\n\n## Source\n\n- https://stale.test/source", ["https://example.test/source", "https://example.test/source"], "marker");
 	assert.equal(markdown.match(/https:\/\/example\.test\/source/g)?.length, 1);
 	assert.equal(markdown.includes("https://stale.test/source"), false);
+	assert.equal(markdown.includes("https://stale.test/reference"), false);
 	assert.match(markdown, /## Source/);
 	assert.ok(markdown.endsWith("<!-- marker -->"));
 });
@@ -75,16 +76,14 @@ test("task references require valid IDs and at least one focal message", () => {
 	assert.equal(taskReferencesAreValid({ source_message_ids: ["recent"], relevant_attachment_ids: ["missing"] }, validMessages, focalMessages, validAttachments), false);
 });
 
-test("generated descriptions preserve genuine lists and one verified references section", () => {
+test("generated descriptions preserve genuine lists and remove reference URLs", () => {
 	const description = formatGeneratedTaskDescription(
 		"## Requirements\n\n- Update the sponsor graphic colors using the [mockup](https://verified.test/mockup).\n- Reorganize the tier layout.\n- Preserve the sponsor logos.\n\nAdd mobile spacing. Ignore https://hallucinated.test.\n\nRelated references:\n- https://unverified.test\n\nRelated links:\n- https://duplicate.test",
-		["https://verified.test/mockup", "https://verified.test/mockup"],
 	);
 	assert.match(description, /^## Requirements\n\n- Update the sponsor graphic colors using the mockup\.\n- Reorganize the tier layout\./);
 	assert.match(description, /- Preserve the sponsor logos\.[\s\S]*Add mobile spacing\./);
-	assert.equal((description.match(/## References/g) ?? []).length, 1);
-	assert.equal((description.match(/https:\/\/verified\.test\/mockup/g) ?? []).length, 1);
-	assert.match(description, /https:\/\/verified\.test\/mockup/);
+	assert.equal(description.includes("## References"), false);
+	assert.equal(description.includes("verified.test"), false);
 	assert.equal(description.includes("unverified.test"), false);
 	assert.equal(description.includes("hallucinated.test"), false);
 	assert.equal(description.includes("[mockup]()"), false);
