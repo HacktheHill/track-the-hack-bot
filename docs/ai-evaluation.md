@@ -69,6 +69,10 @@ ambiguous ground truth, sensitive content, duplicates, malformed captures,
 out-of-scope cases, and `other`. Multiple reasons may apply; `other` requires an
 explanation. Reviewer notes remain human-only audit context and are never written
 to evaluation snapshots.
+Review-derived cases also retain validated Discord guild, channel, and message
+references outside the evaluation window. The local desk links pseudonymous
+message labels back to Discord for authorized reviewers; these identifiers and
+URLs are never written to evaluation snapshots.
 Start `tth-bot-ai-evaluate` manually before release decisions; reports are
 written under `reports/<run-id>/` and corpus text is not printed to logs.
 

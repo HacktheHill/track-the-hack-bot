@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { contentHash, corpusCaseSchema, corpusJsonl, parseCorpusJsonl } from "../dist/ai-corpus.js";
 import { createCorpusApp } from "../dist/ai-corpus-server.js";
-import { noTaskEventIsSafe } from "../dist/sync-ai-corpus.js";
+import { discordReviewContext, noTaskEventIsSafe, reconcileCase } from "../dist/sync-ai-corpus.js";
 
 function sampleCase(status = "pending") {
 	const now = "2026-07-29T12:00:00.000Z";
@@ -42,6 +42,40 @@ test("corpus exclusions require structured reasons and notes for other", () => {
 	assert.equal(corpusCaseSchema.parse({ ...sampleCase(), adjudication: { status: "excluded", exclusionReasons: ["missing_context", "missing_attachment"], notes: "" } }).adjudication.status, "excluded");
 	assert.throws(() => corpusCaseSchema.parse({ ...sampleCase(), schemaVersion: "v1" }));
 	assert.throws(() => corpusCaseSchema.parse({ ...sampleCase(), adjudication: { status: "approved", exclusionReasons: [], notes: "" } }));
+});
+
+test("Discord references remain review-only and use canonical message links", () => {
+	const value = sampleCase();
+	value.window.messages[0].channelId = "222";
+	value.reviewContext = discordReviewContext([{ id: "111", channelId: "222" }], value.window, "333");
+	const parsed = corpusCaseSchema.parse(value);
+	assert.deepEqual(parsed.reviewContext.discordMessages.m1, {
+		guildId: "333", channelId: "222", messageId: "111", url: "https://discord.com/channels/333/222/111",
+	});
+	assert.equal(parsed.window.messages[0].channelId, undefined);
+	assert.equal(corpusJsonl([parsed.window]).includes("discord.com"), false);
+	assert.equal(corpusJsonl([parsed.window]).includes("channelId"), false);
+	parsed.reviewContext.discordMessages.m1.url = "https://example.com/not-discord";
+	assert.throws(() => corpusCaseSchema.parse(parsed), /invalid URL/);
+});
+
+test("Discord reference backfills preserve reviewed dispositions", async () => {
+	const existing = sampleCase("excluded");
+	existing.origin = { type: "reviewed_proposal", fingerprint: "same" };
+	const next = sampleCase();
+	next.origin = { type: "reviewed_proposal", fingerprint: "same" };
+	next.window.expected.proposals[0].titleIncludes = ["source", "version"];
+	next.reviewContext = discordReviewContext([{ id: "111", channelId: "222" }], next.window, "333");
+	let written;
+	const result = await reconcileCase({
+		async getCase() { return { case: existing, etag: '"one"' }; },
+		async putCase(value, etag) { written = { value, etag }; return { etag: '"two"' }; },
+	}, next);
+	assert.equal(result, "updated");
+	assert.deepEqual(written.value.adjudication, existing.adjudication);
+	assert.deepEqual(written.value.window, existing.window);
+	assert.equal(written.value.reviewContext.discordMessages.m1.messageId, "111");
+	assert.equal(written.etag, '"one"');
 });
 
 test("no-task sampling excludes contextual sensitivity and manual overrides", () => {

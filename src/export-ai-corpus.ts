@@ -17,6 +17,7 @@ export const exportRowSchema = z.object({
 	source: z.enum(["manual", "automatic"]),
 	input_snapshot: z.array(z.object({
 		id: z.string(),
+		channelId: z.string().optional(),
 		authorAlias: z.string(),
 		text: z.string(),
 		timestamp: z.string(),

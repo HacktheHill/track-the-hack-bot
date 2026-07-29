@@ -8,7 +8,6 @@ export interface CorpusMessage {
 	authorAlias: string;
 	text: string;
 	timestamp: string;
-	channelId?: string;
 	replyTo?: string;
 	contextRole?: ContextRole;
 	priority?: boolean;
@@ -34,6 +33,9 @@ export interface CorpusCase {
 		metadata?: Record<string, unknown>;
 		routing?: { availableTargetSourceMessageIds?: string[][]; [key: string]: unknown };
 		expected: { proposals: ExpectedProposal[] };
+	};
+	reviewContext?: {
+		discordMessages: Record<string, { guildId: string; channelId: string; messageId: string; url: string }>;
 	};
 	adjudication: {
 		status: ReviewStatus;

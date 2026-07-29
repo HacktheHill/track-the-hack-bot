@@ -9,19 +9,36 @@ import { loadAiCorpusConfig } from "./ai-corpus-config.js";
 import { buildCorpusWindow, loadReviewedExtractionRows } from "./export-ai-corpus.js";
 
 const { Pool } = pg;
-const databaseConfigSchema = z.object({ DATABASE_URL: z.string().min(1) });
+const databaseConfigSchema = z.object({ DATABASE_URL: z.string().min(1), ORGANIZER_GUILD_ID: z.string().regex(/^\d+$/) });
+const discordSnapshotSchema = z.array(z.object({ id: z.string(), channelId: z.string().optional() }));
 
-function caseFromWindow(window: CorpusWindow, origin: CorpusCase["origin"]): CorpusCase {
+function caseFromWindow(window: CorpusWindow, origin: CorpusCase["origin"], reviewContext?: CorpusCase["reviewContext"]): CorpusCase {
 	const now = new Date().toISOString();
 	return corpusCaseSchema.parse({
 		schemaVersion: "v2",
 		id: window.id,
 		origin,
 		window,
+		...(reviewContext ? { reviewContext } : {}),
 		adjudication: { status: "pending", exclusionReasons: [], notes: "" },
 		createdAt: now,
 		updatedAt: now,
 	});
+}
+
+export function discordReviewContext(inputSnapshot: Array<{ id: string; channelId?: string }>, window: CorpusWindow, guildId: string): CorpusCase["reviewContext"] | undefined {
+	const visibleIds = new Set(window.messages.map(message => message.id));
+	const discordMessages = Object.fromEntries(inputSnapshot.flatMap((message, index) => {
+		const id = `m${index + 1}`;
+		if (!visibleIds.has(id) || !message.channelId) return [];
+		return [[id, {
+			guildId,
+			channelId: message.channelId,
+			messageId: message.id,
+			url: `https://discord.com/channels/${guildId}/${message.channelId}/${message.id}`,
+		}]];
+	}));
+	return Object.keys(discordMessages).length ? { discordMessages } : undefined;
 }
 
 function noTaskWindow(row: { id: string; input_snapshot: unknown }) {
@@ -45,14 +62,20 @@ function noTaskWindow(row: { id: string; input_snapshot: unknown }) {
 	return window ? sanitizeCorpusWindow(window) : undefined;
 }
 
-async function reconcileCase(store: AzureBlobCorpusStore, value: CorpusCase) {
+export async function reconcileCase(store: Pick<AzureBlobCorpusStore, "getCase" | "putCase">, value: CorpusCase) {
 	try {
 		const existing = await store.getCase(value.id);
-		if (existing.case.origin.fingerprint === value.origin.fingerprint) return "unchanged" as const;
-		await store.putCase({
+		const sourceChanged = existing.case.origin.fingerprint !== value.origin.fingerprint;
+		const reviewContextChanged = JSON.stringify(existing.case.reviewContext) !== JSON.stringify(value.reviewContext);
+		if (!sourceChanged && !reviewContextChanged) return "unchanged" as const;
+		await store.putCase(sourceChanged ? {
 			...value,
 			adjudication: { status: "pending", exclusionReasons: [], notes: existing.case.adjudication.notes },
 			createdAt: existing.case.createdAt,
+			updatedAt: new Date().toISOString(),
+		} : {
+			...existing.case,
+			reviewContext: value.reviewContext,
 			updatedAt: new Date().toISOString(),
 		}, existing.etag);
 		return "updated" as const;
@@ -131,7 +154,7 @@ async function main() {
 		}
 		for (const { row, window } of reviewed) {
 			if (!window) { excluded++; continue; }
-			const value = caseFromWindow(window, { type: "reviewed_proposal", extractionEventId: row.id, fingerprint: contentHash(window) });
+			const value = caseFromWindow(window, { type: "reviewed_proposal", extractionEventId: row.id, fingerprint: contentHash(window) }, discordReviewContext(row.input_snapshot, window, databaseConfig.ORGANIZER_GUILD_ID));
 			const result = await reconcileCase(store, value);
 			if (result === "imported") imported++; else if (result === "updated") updated++; else unchanged++;
 		}
@@ -151,7 +174,8 @@ async function main() {
 				}
 				const window = noTaskWindow(row);
 				if (!window) { excluded++; continue; }
-				const value = caseFromWindow(window, { type: "sampled_no_task", extractionEventId: String(row.id), fingerprint: contentHash(window) });
+				const snapshot = discordSnapshotSchema.safeParse(row.input_snapshot).data ?? [];
+				const value = caseFromWindow(window, { type: "sampled_no_task", extractionEventId: String(row.id), fingerprint: contentHash(window) }, discordReviewContext(snapshot, window, databaseConfig.ORGANIZER_GUILD_ID));
 				const result = await reconcileCase(store, value);
 				if (result === "imported") imported++; else if (result === "updated") updated++; else unchanged++;
 			}

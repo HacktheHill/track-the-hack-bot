@@ -174,7 +174,7 @@ export default function App() {
 				{draft ? <>
 					<div className="case-main" aria-busy={busy}>
 						<div className="case-title"><div><span className={`status-chip ${draft.adjudication.status}`}>{draft.adjudication.status}</span><h2 ref={caseHeading} tabIndex={-1}>{draft.id}</h2><p>{draft.origin.type} origin · {draft.window.mode} mode · updated {formatDate(draft.updatedAt)}{dirty ? " · unsaved changes" : ""}</p></div><div className="case-mark">#{draft.schemaVersion}</div></div>
-						<Timeline messages={draft.window.messages} invalidEvidence={invalidFields.some(field => field.startsWith("role-"))} onChange={messages => {
+						<Timeline messages={draft.window.messages} discordMessages={draft.reviewContext?.discordMessages} invalidEvidence={invalidFields.some(field => field.startsWith("role-"))} onChange={messages => {
 							const next = { ...draft, window: { ...draft.window, messages } };
 							if (invalidFields.length) setInvalidFields(validate(next).flatMap(error => error.field ? [error.field] : []));
 							setDraft(next);
@@ -186,8 +186,7 @@ export default function App() {
 							if (invalidFields.length) setInvalidFields(validate(next).flatMap(error => error.field ? [error.field] : []));
 							setDraft(next);
 						}} />
-						<label className="notes-label">Reviewer notes<textarea rows={5} value={draft.adjudication.notes} onChange={event => setDraft({ ...draft, adjudication: { ...draft.adjudication, notes: event.target.value } })} placeholder="Optional audit details; notes are never sent to evaluation…" /></label>
-						<span className="field-help">Use expected proposals as ground truth. Notes remain human-only audit context.</span>
+						<label className="notes-label">Reviewer notes<textarea rows={5} value={draft.adjudication.notes} onChange={event => setDraft({ ...draft, adjudication: { ...draft.adjudication, notes: event.target.value } })} placeholder="Human-only context for this dashboard…" /></label>
 						<div className="review-actions"><button type="button" className="secondary" disabled={busy} onClick={() => void saveCase()}>Save draft</button><button type="button" className="exclude" disabled={busy} onClick={() => setExcludeOpen(true)}>Exclude & next</button><button type="button" className="include" disabled={busy} onClick={() => void saveCase("included", true)}>Include & next</button></div>
 					</aside>
 				</> : <section className="empty-desk"><img src="/hth-mark.svg" alt="" /><h2 ref={emptyHeading} tabIndex={-1}>{loading ? "Opening the desk…" : "No case selected"}</h2><p>{loading ? "Fetching conversation evidence and adjudication details." : "Choose a case from the queue or create a new scenario."}</p></section>}

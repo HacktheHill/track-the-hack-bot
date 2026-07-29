@@ -7,7 +7,7 @@ function reviewedRow(overrides = {}) {
 		id: "42",
 		source: "manual",
 		input_snapshot: [{
-			id: "discord-message", authorAlias: "Person A", text: "I will revise the sponsor deck.",
+			id: "discord-message", channelId: "discord-channel", authorAlias: "Person A", text: "I will revise the sponsor deck.",
 			timestamp: "2026-07-20T13:00:00.000Z", contextRole: "primary",
 			attachments: [{ id: "discord-attachment", name: "draft.png", contentType: "image/png", url: "https://cdn.discordapp.com/private" }],
 		}],
@@ -32,6 +32,7 @@ test("reviewed proposals export as pseudonymized evaluation windows", () => {
 	assert.equal(window.id, "review-42");
 	assert.equal(window.mode, "automatic");
 	assert.equal(window.messages[0].id, "m1");
+	assert.equal(window.messages[0].channelId, undefined);
 	assert.equal(window.messages[0].attachments[0].id, "a1");
 	assert.equal(window.messages[0].attachments[0].url, "https://example.invalid/attachment/a1");
 	assert.deepEqual(window.expected.proposals[0], {

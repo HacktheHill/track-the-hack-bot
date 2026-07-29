@@ -2,6 +2,7 @@ import type { ContextRole, CorpusMessage } from "../types";
 
 interface TimelineProps {
 	messages: CorpusMessage[];
+	discordMessages?: Record<string, { url: string }>;
 	invalidEvidence: boolean;
 	onChange: (messages: CorpusMessage[]) => void;
 }
@@ -16,7 +17,7 @@ const roles: Array<{ value: ContextRole | ""; label: string }> = [
 	{ value: "referenced_history", label: "Referenced history" },
 ];
 
-export function Timeline({ messages, invalidEvidence, onChange }: TimelineProps) {
+export function Timeline({ messages, discordMessages, invalidEvidence, onChange }: TimelineProps) {
 	function setRole(index: number, role: string) {
 		onChange(messages.map((message, messageIndex) => messageIndex === index
 			? { ...message, contextRole: role ? role as ContextRole : undefined, priority: role === "primary" ? true : undefined }
@@ -34,7 +35,9 @@ export function Timeline({ messages, invalidEvidence, onChange }: TimelineProps)
 				<div className="message-rail" aria-hidden="true"><span>{index + 1}</span></div>
 				<div className="message-body">
 					<header>
-						<div><strong>{message.authorAlias}</strong><span className="message-id">{message.id}</span></div>
+						<div><strong>{message.authorAlias}</strong>{discordMessages?.[message.id]
+							? <a className="message-id message-link" href={discordMessages[message.id].url} target="_blank" rel="noreferrer" aria-label={`Open ${message.id} in Discord in a new tab`}>{message.id}<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3h7v7M13 3 7 9M11 9v4H3V5h4" /></svg></a>
+							: <span className="message-id">{message.id}</span>}</div>
 						<time dateTime={message.timestamp}>{formatTimestamp(message.timestamp)}</time>
 					</header>
 					<p>{message.text || <em>No message text</em>}</p>

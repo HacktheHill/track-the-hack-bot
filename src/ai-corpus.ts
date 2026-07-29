@@ -19,7 +19,6 @@ export const corpusExclusionReasonSchema = z.enum([
 
 export const corpusMessageSchema = z.object({
 	id: z.string().min(1),
-	channelId: z.string().optional(),
 	authorAlias: z.string().min(1),
 	text: z.string(),
 	timestamp: z.iso.datetime(),
@@ -87,9 +86,24 @@ export const corpusCaseSchema = z.object({
 		fingerprint: z.string().optional(),
 	}),
 	window: corpusWindowSchema,
+	reviewContext: z.object({
+		discordMessages: z.record(z.string(), z.object({
+			guildId: z.string().regex(/^\d+$/),
+			channelId: z.string().regex(/^\d+$/),
+			messageId: z.string().regex(/^\d+$/),
+			url: z.url(),
+		})),
+	}).optional(),
 	adjudication: corpusAdjudicationSchema,
 	createdAt: z.iso.datetime(),
 	updatedAt: z.iso.datetime(),
+}).superRefine((value, context) => {
+	const messageIds = new Set(value.window.messages.map(message => message.id));
+	for (const [id, reference] of Object.entries(value.reviewContext?.discordMessages ?? {})) {
+		if (!messageIds.has(id)) context.addIssue({ code: "custom", message: `Discord reference points to unknown corpus message ${id}.` });
+		const expectedUrl = `https://discord.com/channels/${reference.guildId}/${reference.channelId}/${reference.messageId}`;
+		if (reference.url !== expectedUrl) context.addIssue({ code: "custom", message: `Discord reference for ${id} has an invalid URL.` });
+	}
 });
 
 export type CorpusWindow = z.infer<typeof corpusWindowSchema>;
