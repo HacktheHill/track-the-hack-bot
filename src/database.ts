@@ -21,6 +21,7 @@ function embeddingTableSql(dimensions: number) {
 		lock_version INTEGER NOT NULL,
 		subject TEXT NOT NULL,
 		description TEXT NOT NULL,
+		is_closed BOOLEAN NOT NULL DEFAULT FALSE,
 		content_hash TEXT NOT NULL,
 		embedding_model TEXT NOT NULL,
 		embedding_dimensions INTEGER NOT NULL,
@@ -72,6 +73,7 @@ export type SimilarWorkPackage = {
 	lockVersion: number;
 	subject: string;
 	description: string;
+	isClosed: boolean;
 	similarity: number;
 };
 export type ProposalRagCandidate = {
@@ -351,6 +353,7 @@ export class Database {
 			if (!dimensions) throw new Error("AZURE_OPENAI_EMBEDDING_DIMENSIONS is required when OPENPROJECT_RAG_MODE is enabled.");
 			await this.pool.query("CREATE EXTENSION IF NOT EXISTS vector");
 			await this.pool.query(embeddingTableSql(dimensions));
+			await this.pool.query("ALTER TABLE openproject_embeddings ADD COLUMN IF NOT EXISTS is_closed BOOLEAN NOT NULL DEFAULT FALSE");
 			const vectorType = await this.pool.query<{ database_type: string }>(
 				`SELECT format_type(attribute.atttypid, attribute.atttypmod) AS database_type
 				 FROM pg_attribute attribute
@@ -1148,24 +1151,24 @@ export class Database {
 
 	async upsertEmbedding(input: {
 		workPackageId: number; projectId: number; lockVersion: number; subject: string; description: string;
-		contentHash: string; model: string; dimensions: number; embedding: number[];
+		isClosed: boolean; contentHash: string; model: string; dimensions: number; embedding: number[];
 	}) {
 		const vector = `[${input.embedding.join(",")}]`;
 		await this.pool.query(
-			`INSERT INTO openproject_embeddings(work_package_id,project_id,lock_version,subject,description,content_hash,embedding_model,embedding_dimensions,embedding,updated_at,indexed_at)
-			 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::vector,now(),now())
+			`INSERT INTO openproject_embeddings(work_package_id,project_id,lock_version,subject,description,is_closed,content_hash,embedding_model,embedding_dimensions,embedding,updated_at,indexed_at)
+			 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::vector,now(),now())
 			 ON CONFLICT(work_package_id) DO UPDATE SET project_id=excluded.project_id, lock_version=excluded.lock_version,
-			 subject=excluded.subject, description=excluded.description, content_hash=excluded.content_hash,
+			 subject=excluded.subject, description=excluded.description, is_closed=excluded.is_closed, content_hash=excluded.content_hash,
 			 embedding_model=excluded.embedding_model, embedding_dimensions=excluded.embedding_dimensions, embedding=excluded.embedding,
 			 updated_at=now(), indexed_at=now()`,
-			[input.workPackageId, input.projectId, input.lockVersion, input.subject, input.description, input.contentHash, input.model, input.dimensions, vector],
+			[input.workPackageId, input.projectId, input.lockVersion, input.subject, input.description, input.isClosed, input.contentHash, input.model, input.dimensions, vector],
 		);
 	}
 
-	async embeddingIsCurrent(workPackageId: number, contentHash: string, lockVersion: number) {
+	async embeddingIsCurrent(workPackageId: number, contentHash: string, lockVersion: number, isClosed: boolean) {
 		const result = await this.pool.query(
-			"SELECT 1 FROM openproject_embeddings WHERE work_package_id=$1 AND content_hash=$2 AND lock_version=$3",
-			[workPackageId, contentHash, lockVersion],
+			"SELECT 1 FROM openproject_embeddings WHERE work_package_id=$1 AND content_hash=$2 AND lock_version=$3 AND is_closed=$4",
+			[workPackageId, contentHash, lockVersion, isClosed],
 		);
 		return result.rowCount === 1;
 	}
@@ -1181,23 +1184,23 @@ export class Database {
 		);
 	}
 
-	async similarEmbeddings(projectId: number, embedding: number[], model: string, dimensions: number, limit = 5): Promise<SimilarWorkPackage[]> {
+	async similarEmbeddings(projectId: number, embedding: number[], model: string, dimensions: number, isClosed: boolean, limit = 5): Promise<SimilarWorkPackage[]> {
 		const vector = `[${embedding.join(",")}]`;
 		const result = await this.pool.query<SimilarWorkPackage & { distance: number }>(
-			`SELECT work_package_id AS "workPackageId", project_id AS "projectId", lock_version AS "lockVersion", subject, description,
+			`SELECT work_package_id AS "workPackageId", project_id AS "projectId", lock_version AS "lockVersion", subject, description, is_closed AS "isClosed",
 				1 - (embedding <=> $2::vector) AS similarity, embedding <=> $2::vector AS distance
-			 FROM openproject_embeddings WHERE project_id=$1 AND embedding IS NOT NULL AND embedding_model=$3 AND embedding_dimensions=$4
-			 ORDER BY embedding <=> $2::vector LIMIT $5`,
-			[projectId, vector, model, dimensions, limit],
+			 FROM openproject_embeddings WHERE project_id=$1 AND embedding IS NOT NULL AND embedding_model=$3 AND embedding_dimensions=$4 AND is_closed=$5
+			 ORDER BY embedding <=> $2::vector LIMIT $6`,
+			[projectId, vector, model, dimensions, isClosed, limit],
 		);
 		return result.rows;
 	}
 
-	async embeddingTitles(projectId: number, model: string, dimensions: number): Promise<Omit<SimilarWorkPackage, "similarity">[]> {
+	async embeddingTitles(projectId: number, model: string, dimensions: number, isClosed: boolean): Promise<Omit<SimilarWorkPackage, "similarity">[]> {
 		const result = await this.pool.query<Omit<SimilarWorkPackage, "similarity">>(
-			`SELECT work_package_id AS "workPackageId", project_id AS "projectId", lock_version AS "lockVersion", subject, description
-			 FROM openproject_embeddings WHERE project_id=$1 AND embedding_model=$2 AND embedding_dimensions=$3`,
-			[projectId, model, dimensions],
+			`SELECT work_package_id AS "workPackageId", project_id AS "projectId", lock_version AS "lockVersion", subject, description, is_closed AS "isClosed"
+			 FROM openproject_embeddings WHERE project_id=$1 AND embedding_model=$2 AND embedding_dimensions=$3 AND is_closed=$4`,
+			[projectId, model, dimensions, isClosed],
 		);
 		return result.rows;
 	}

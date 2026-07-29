@@ -1637,7 +1637,7 @@ async function completeAiCandidate(
 		return messageUrl(interaction.guildId!, source?.channelId ?? interaction.channelId!, id);
 	});
 	const ragAssessment = projectId && services.rag
-		? await services.rag.assessSimilar(projectId, candidate.title, description)
+		? await services.rag.assessSimilar(projectId, candidate.title, description, candidate.proposed_action)
 		: { candidates: [], recommendedMatch: undefined, latencyMs: 0, usage: undefined, telemetry: { outcome: "disabled" } };
 	const suggestedMatch = services.config.OPENPROJECT_RAG_MODE === "review" ? ragAssessment.recommendedMatch : undefined;
 	const ragCandidates = services.config.OPENPROJECT_RAG_MODE === "review" ? ragAssessment.candidates : [];

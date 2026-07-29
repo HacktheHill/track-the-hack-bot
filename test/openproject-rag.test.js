@@ -114,6 +114,28 @@ test("OpenProject work packages follow HAL pagination beyond the first page", as
 	}
 });
 
+test("OpenProject can load both open and closed work packages for indexing", async () => {
+	const originalFetch = globalThis.fetch;
+	const states = [];
+	globalThis.fetch = async url => {
+		const decoded = decodeURIComponent(String(url));
+		const closed = decoded.includes('"operator":"c"');
+		states.push(closed ? "closed" : "open");
+		return Response.json({
+			_embedded: { elements: [{ id: closed ? 2 : 1, subject: closed ? "Closed" : "Open", lockVersion: 1, _links: {} }] },
+			_links: {},
+		});
+	};
+	try {
+		const client = new OpenProjectClient({ OPENPROJECT_BASE_URL: "https://openproject.example", OPENPROJECT_API_KEY: "secret", OPENPROJECT_CACHE_TTL_MS: 1000 });
+		const packages = await client.workPackages(9, "all");
+		assert.deepEqual(states.sort(), ["closed", "open"]);
+		assert.deepEqual(packages.map(item => [item.id, item.isClosed]), [[1, false], [2, true]]);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
 test("manual user linking includes invited users but excludes locked accounts and groups", async () => {
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async () => Response.json({
@@ -292,6 +314,22 @@ test("RAG combines semantic candidates with lexical title matches", async () => 
 		"Update sponsorship package tier table",
 		"Revise sponsorship tiers graphic layout and colors",
 	) >= 0.3);
+});
+
+test("RAG searches closed tasks only for reopen actions", async () => {
+	const requestedStates = [];
+	const rag = new OpenProjectRag(
+		{ OPENPROJECT_RAG_MODE: "review", AZURE_OPENAI_EMBEDDING_DEPLOYMENT: "embedding" },
+		{
+			similarEmbeddings: async (_project, _embedding, _model, _dimensions, isClosed) => { requestedStates.push(isClosed); return []; },
+			embeddingTitles: async (_project, _model, _dimensions, isClosed) => { requestedStates.push(isClosed); return []; },
+		},
+		{},
+		{ enabled: true, embed: async () => ({ embeddings: [[0.1]], model: "embedding", dimensions: 1 }) },
+	);
+	await rag.findSimilar(7, "Resume planning", "Continue it", "update");
+	await rag.findSimilar(7, "Resume planning", "Continue it", "reopen");
+	assert.deepEqual(requestedStates, [false, false, true, true]);
 });
 
 test("RAG reranking recommends only a high-confidence winner with a clear margin", async () => {

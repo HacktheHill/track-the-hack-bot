@@ -17,6 +17,7 @@ export type WorkPackage = {
 	startDate?: string | null;
 	dueDate?: string | null;
 	estimatedTime?: string | null;
+	isClosed?: boolean;
 	_links: Record<string, HalLink>;
 };
 export type Activity = { id: number; comment?: { raw?: string } | null; _links?: Record<string, HalLink> };
@@ -355,14 +356,23 @@ export class OpenProjectClient {
 		return this.request<WorkPackage>(`/api/v3/work_packages/${id}`);
 	}
 
-	async workPackages(projectId: number) {
+	private async workPackagesByState(projectId: number, state: "open" | "closed") {
 		const filters = encodeURIComponent(JSON.stringify([
 			{ project: { operator: "=", values: [String(projectId)] } },
-			{ status: { operator: "o", values: [] } },
+			{ status: { operator: state === "open" ? "o" : "c", values: [] } },
 		]));
-		return this.collection<WorkPackage>(
+		return (await this.collection<WorkPackage>(
 			`/api/v3/work_packages?filters=${filters}&pageSize=500&sortBy=${encodeURIComponent('[["updatedAt","desc"]]')}`,
-		);
+		)).map(workPackage => ({ ...workPackage, isClosed: state === "closed" }));
+	}
+
+	async workPackages(projectId: number, state: "open" | "closed" | "all" = "open") {
+		if (state !== "all") return this.workPackagesByState(projectId, state);
+		const [open, closed] = await Promise.all([
+			this.workPackagesByState(projectId, "open"),
+			this.workPackagesByState(projectId, "closed"),
+		]);
+		return [...open, ...closed];
 	}
 
 	async updateWorkPackage(id: number, changes: Record<string, unknown>, expectedLockVersion?: number) {

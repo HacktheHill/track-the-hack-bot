@@ -230,7 +230,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				const description = formatAiTaskDescription(task.description, minimized, sourceRecords, task.source_message_ids, task.relevant_attachment_ids);
 				const sourceAttachments = relevantImageAttachments(sourceRecords, task.source_message_ids, task.relevant_attachment_ids);
 				const ragAssessment = projectId && services.rag
-					? await services.rag.assessSimilar(projectId, task.title, description)
+					? await services.rag.assessSimilar(projectId, task.title, description, task.proposed_action)
 					: { candidates: [], recommendedMatch: undefined, latencyMs: 0, usage: undefined, telemetry: { outcome: "disabled" } };
 				pipelineLatencyMs += ragAssessment.latencyMs;
 				pipelineUsage = combinedUsage(pipelineUsage, ragAssessment.usage);

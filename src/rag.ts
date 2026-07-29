@@ -152,13 +152,13 @@ export class OpenProjectRag {
 			]);
 			let indexed = 0;
 			for (const projectId of projectIds) {
-				const workPackages = await this.openProject.workPackages(projectId);
+				const workPackages = await this.openProject.workPackages(projectId, "all");
 				const pending: Array<{ workPackage: WorkPackage; description: string; subject: string; contentHash: string }> = [];
 				for (const workPackage of workPackages) {
 					const description = descriptionOf(workPackage);
 					const subject = workPackage.subject;
 					const contentHash = embeddingContentHash(subject, description, this.config.AZURE_OPENAI_EMBEDDING_DEPLOYMENT, this.config.AZURE_OPENAI_EMBEDDING_DIMENSIONS);
-					if (await this.db.embeddingIsCurrent(workPackage.id, contentHash, workPackage.lockVersion)) continue;
+					if (await this.db.embeddingIsCurrent(workPackage.id, contentHash, workPackage.lockVersion, Boolean(workPackage.isClosed))) continue;
 					pending.push({ workPackage, description, subject, contentHash });
 				}
 				for (let offset = 0; offset < pending.length; offset += 16) {
@@ -168,6 +168,7 @@ export class OpenProjectRag {
 					await this.db.upsertEmbedding({
 						workPackageId: item.workPackage.id, projectId, lockVersion: item.workPackage.lockVersion,
 						subject: item.subject, description: item.description, contentHash: item.contentHash,
+						isClosed: Boolean(item.workPackage.isClosed),
 						model: this.config.AZURE_OPENAI_EMBEDDING_DEPLOYMENT!, dimensions: result.dimensions, embedding: result.embeddings[index],
 						});
 						indexed++;
@@ -183,12 +184,13 @@ export class OpenProjectRag {
 		}
 	}
 
-	async findSimilar(projectId: number, title: string, description: string) {
+	async findSimilar(projectId: number, title: string, description: string, action: "create" | "update" | "complete" | "reopen" = "create") {
 		if (!this.enabled) return [];
 		const result = await this.embeddings.embed([`${title}\n\n${description}`]);
+		const isClosed = action === "reopen";
 		const [semantic, lexicalPool] = await Promise.all([
-			this.db.similarEmbeddings(projectId, result.embeddings[0], this.config.AZURE_OPENAI_EMBEDDING_DEPLOYMENT!, result.dimensions, 20),
-			this.db.embeddingTitles(projectId, this.config.AZURE_OPENAI_EMBEDDING_DEPLOYMENT!, result.dimensions),
+			this.db.similarEmbeddings(projectId, result.embeddings[0], this.config.AZURE_OPENAI_EMBEDDING_DEPLOYMENT!, result.dimensions, isClosed, 20),
+			this.db.embeddingTitles(projectId, this.config.AZURE_OPENAI_EMBEDDING_DEPLOYMENT!, result.dimensions, isClosed),
 		]);
 		const candidates = new Map(semantic.map(item => [item.workPackageId, item]));
 		for (const item of lexicalPool) {
@@ -202,10 +204,10 @@ export class OpenProjectRag {
 		return [...candidates.values()].sort((left, right) => right.similarity - left.similarity).slice(0, 5);
 	}
 
-	async assessSimilar(projectId: number, title: string, description: string): Promise<RagAssessment> {
+	async assessSimilar(projectId: number, title: string, description: string, action: "create" | "update" | "complete" | "reopen" = "create"): Promise<RagAssessment> {
 		const started = Date.now();
 		try {
-			const matches = await this.findSimilar(projectId, title, description);
+			const matches = await this.findSimilar(projectId, title, description, action);
 			if (!matches.length || !this.reranker) {
 				return { candidates: [], latencyMs: Date.now() - started, telemetry: { outcome: matches.length ? "reranker_unavailable" : "no_candidates", retrievalLatencyMs: Date.now() - started } };
 			}
