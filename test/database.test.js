@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { Database } from "../dist/database.js";
+import { Database, embeddingVectorTypeMatches } from "../dist/database.js";
 
 function databaseWithPool(pool) {
 	if (!pool.connect) pool.connect = async () => ({ ...pool, release() {} });
@@ -8,6 +8,12 @@ function databaseWithPool(pool) {
 	Object.defineProperty(db, "pool", { value: pool });
 	return db;
 }
+
+test("embedding vector dimensions must match the configured column type", () => {
+	assert.equal(embeddingVectorTypeMatches("vector(1536)", 1536), true);
+	assert.equal(embeddingVectorTypeMatches("vector(1024)", 1536), false);
+	assert.equal(embeddingVectorTypeMatches(undefined, 1536), false);
+});
 
 test("failed task confirmations retain every owner for retry", async () => {
 	let queuedOwners;

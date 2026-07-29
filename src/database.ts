@@ -10,6 +10,26 @@ function jsonParameter(value: unknown) {
 	return value == null ? null : JSON.stringify(value);
 }
 
+export function embeddingVectorTypeMatches(databaseType: string | undefined, dimensions: number) {
+	return databaseType?.replace(/\s+/g, "").toLowerCase() === `vector(${dimensions})`;
+}
+
+function embeddingTableSql(dimensions: number) {
+	return `CREATE TABLE IF NOT EXISTS openproject_embeddings (
+		work_package_id INTEGER PRIMARY KEY,
+		project_id INTEGER NOT NULL,
+		lock_version INTEGER NOT NULL,
+		subject TEXT NOT NULL,
+		description TEXT NOT NULL,
+		content_hash TEXT NOT NULL,
+		embedding_model TEXT NOT NULL,
+		embedding_dimensions INTEGER NOT NULL,
+		embedding vector(${dimensions}),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+		indexed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+	)`;
+}
+
 export const correctionFields = [
 	"title", "description", "project", "assignee", "accountable",
 	"priority", "size", "startDate", "dueDate", "estimate",
@@ -327,21 +347,20 @@ export class Database {
 		)`);
 		await this.pool.query("CREATE INDEX IF NOT EXISTS task_proposal_extractions_event_idx ON task_proposal_extractions(extraction_event_id)");
 		if (config.OPENPROJECT_RAG_MODE !== "off") {
-			if (!config.AZURE_OPENAI_EMBEDDING_DIMENSIONS) throw new Error("AZURE_OPENAI_EMBEDDING_DIMENSIONS is required when OPENPROJECT_RAG_MODE is enabled.");
+			const dimensions = config.AZURE_OPENAI_EMBEDDING_DIMENSIONS;
+			if (!dimensions) throw new Error("AZURE_OPENAI_EMBEDDING_DIMENSIONS is required when OPENPROJECT_RAG_MODE is enabled.");
 			await this.pool.query("CREATE EXTENSION IF NOT EXISTS vector");
-			await this.pool.query(`CREATE TABLE IF NOT EXISTS openproject_embeddings (
-				work_package_id INTEGER PRIMARY KEY,
-				project_id INTEGER NOT NULL,
-				lock_version INTEGER NOT NULL,
-				subject TEXT NOT NULL,
-				description TEXT NOT NULL,
-				content_hash TEXT NOT NULL,
-				embedding_model TEXT NOT NULL,
-				embedding_dimensions INTEGER NOT NULL,
-				embedding vector(${config.AZURE_OPENAI_EMBEDDING_DIMENSIONS}),
-				updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-				indexed_at TIMESTAMPTZ NOT NULL DEFAULT now()
-			)`);
+			await this.pool.query(embeddingTableSql(dimensions));
+			const vectorType = await this.pool.query<{ database_type: string }>(
+				`SELECT format_type(attribute.atttypid, attribute.atttypmod) AS database_type
+				 FROM pg_attribute attribute
+				 WHERE attribute.attrelid='openproject_embeddings'::regclass AND attribute.attname='embedding' AND NOT attribute.attisdropped`,
+			);
+			if (!vectorType.rows[0]?.database_type) throw new Error("Could not determine the OpenProject embedding vector dimensions.");
+			if (!embeddingVectorTypeMatches(vectorType.rows[0].database_type, dimensions)) {
+				await this.pool.query("DROP TABLE openproject_embeddings");
+				await this.pool.query(embeddingTableSql(dimensions));
+			}
 			await this.pool.query("CREATE INDEX IF NOT EXISTS openproject_embeddings_project_idx ON openproject_embeddings(project_id)");
 			await this.pool.query("CREATE TABLE IF NOT EXISTS openproject_embedding_sync (id BOOLEAN PRIMARY KEY DEFAULT TRUE, last_run_at TIMESTAMPTZ, last_error TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())");
 		}
