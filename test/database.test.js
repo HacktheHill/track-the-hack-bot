@@ -346,8 +346,12 @@ test("existing-task proposal finalization commits status, audit, and revision to
 	assert.equal(queries[0].sql, "BEGIN");
 	assert.match(queries[1].sql, /revision=revision \+ 1/);
 	assert.match(queries[2].sql, /task_audit_log/);
-	assert.match(queries[3].sql, /task_proposal_revisions/);
-	assert.equal(queries[4].sql, "COMMIT");
+	assert.match(queries[3].sql, /rag_target_selected/);
+	assert.match(queries[3].sql, /implicitApproval/);
+	assert.match(queries[3].sql, /NOT EXISTS/);
+	assert.deepEqual(queries[3].values, ["proposal", "reviewer", 42]);
+	assert.match(queries[4].sql, /task_proposal_revisions/);
+	assert.equal(queries[5].sql, "COMMIT");
 });
 
 test("extraction events retain structured metrics but no message content", async () => {

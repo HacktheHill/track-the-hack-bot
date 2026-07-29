@@ -1068,6 +1068,23 @@ export class Database {
 				[input.id, input.action, input.reviewerId, { workPackageId: input.workPackageId }],
 			);
 			await client.query(
+				`INSERT INTO task_audit_log(proposal_id,openproject_work_package_id,event,actor_discord_id,metadata)
+				 SELECT proposal.id,$3,'rag_target_selected',$2,jsonb_build_object(
+					'proposalId',proposal.id,'retrievalRank',(candidate->>'retrievalRank')::integer,
+					'relationship',candidate->>'relationship','confidence',(candidate->>'confidence')::numeric,
+					'retrievalScore',(candidate->>'similarity')::numeric,'recommended',TRUE,'implicitApproval',TRUE
+				 )
+				 FROM task_proposals AS proposal
+				 CROSS JOIN LATERAL jsonb_array_elements(proposal.rag_candidates) AS candidate
+				 WHERE proposal.id=$1 AND proposal.target_work_package_id=$3
+				 AND (candidate->>'workPackageId')::integer=$3 AND candidate->>'recommended'='true'
+				 AND NOT EXISTS (
+					SELECT 1 FROM task_audit_log AS audit WHERE audit.event='rag_target_selected'
+					AND (audit.proposal_id=proposal.id OR audit.metadata->>'proposalId'=proposal.id::text)
+				 ) LIMIT 1`,
+				[input.id, input.reviewerId, input.workPackageId],
+			);
+			await client.query(
 				"INSERT INTO task_proposal_revisions(proposal_id,revision,phase,payload) VALUES($1,$2,'final',$3)",
 				[input.id, result.rows[0].revision, jsonParameter(input.finalSnapshot)],
 			);

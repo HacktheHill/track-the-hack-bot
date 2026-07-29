@@ -2032,7 +2032,7 @@ async function applyExistingProposalTarget(
 		});
 	}
 	if (selectedCandidate) {
-		void services.db.logTaskEvent(target.id, "rag_target_selected", interaction.user.id, {
+		await services.db.logTaskEvent(target.id, "rag_target_selected", interaction.user.id, {
 			proposalId: proposal.id,
 			retrievalRank: selectedCandidate.retrievalRank,
 			relationship: selectedCandidate.relationship,
