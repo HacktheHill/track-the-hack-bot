@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, removeProposalReviewCard, taskCommand, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
-import { normalizeTaskTitle, OpenProjectClient, titlesLikelyDuplicate } from "../dist/openproject.js";
+import { normalizeTaskTitle, OpenProjectClient, titlesLikelyDuplicate, workPackageMarkdownLink } from "../dist/openproject.js";
 
 test("task defaults start today and use the configured due offset", () => {
 	assert.deepEqual(defaultTaskDates(new Date("2026-07-13T23:30:00Z"), true, 7), {
@@ -247,6 +247,13 @@ test("proposal cards stay within Discord's message limit", () => {
 	const content = boundedDiscordContent("x".repeat(4000));
 	assert.equal(content.length <= 2000, true);
 	assert.match(content, /Preview truncated/);
+});
+
+test("work package proposal links include the ID and title", () => {
+	assert.equal(
+		workPackageMarkdownLink(42, "Ship [updated] schedule", "https://openproject.test/work_packages/42"),
+		"[#42 Ship \\[updated\\] schedule](https://openproject.test/work_packages/42)",
+	);
 });
 
 test("task creation exposes selectable fields and keeps description optional", () => {

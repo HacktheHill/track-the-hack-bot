@@ -2,7 +2,7 @@ import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, Client, Mess
 import { automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, SensitiveContentError, StructuredOutputError, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 import { isOrganizerGuild, type IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
-import { OpenProjectClient, titlesLikelyDuplicate } from "./openproject.js";
+import { OpenProjectClient, titlesLikelyDuplicate, workPackageMarkdownLink } from "./openproject.js";
 import { AI_CONTEXT_GAP_MS, boundedDiscordContent, defaultAiDueDate, formatAiTaskDescription, inferCreationMetadata, teamProjectId } from "./tasks.js";
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
 import { describeProposalOperations, planExistingTaskOperations, sourceContentHash, taskReferencesAreValid } from "./task-proposals.js";
@@ -320,7 +320,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS,
 					});
 					const reviewPayload: ReviewCardPayload = {
-						content: boundedDiscordContent(`${ownerText}Proposed ${action} for OpenProject task #${match.workPackageId}: **${task.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch).map(item => `- ${item}`).join("\n")}${operations.contentOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : ""}`),
+						content: boundedDiscordContent(`${ownerText}Proposed ${action} for OpenProject task ${workPackageMarkdownLink(target!.id, target!.subject, services.openProject.workPackageUrl(target!.id))}\nProposed title: **${task.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch).map(item => `- ${item}`).join("\n")}${operations.contentOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : ""}`),
 						components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
 							new ButtonBuilder().setCustomId(`op-review:${proposal.id}`).setLabel("Review and apply").setStyle(ButtonStyle.Primary),
 							new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),

@@ -62,6 +62,11 @@ export function titlesLikelyDuplicate(left: string, right: string) {
 	return intersection >= 2 && intersection / Math.min(leftWords.size, rightWords.size) >= 0.8;
 }
 
+export function workPackageMarkdownLink(id: number, subject: string, url: string) {
+	const label = `#${id} ${subject}`.replace(/([\\\[\]])/g, "\\$1");
+	return `[${label}](${url})`;
+}
+
 export function workPackageChangesApplied(workPackage: WorkPackage, changes: Record<string, unknown>) {
 	return Object.entries(changes).every(([field, expected]) => {
 		if (field === "_links") {

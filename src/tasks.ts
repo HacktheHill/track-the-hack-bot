@@ -29,7 +29,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { isOrganizerGuild, type IntegrationConfig, type TeamMapping } from "./config.js";
 import { correctionFields, Database, proposalDismissalReasons, type CorrectionFlags, type ProposalDismissalReason, type ProposalMetrics } from "./database.js";
-import { OpenProjectClient, OpenProjectRequestError, workPackageChangesApplied } from "./openproject.js";
+import { OpenProjectClient, OpenProjectRequestError, workPackageChangesApplied, workPackageMarkdownLink } from "./openproject.js";
 import { attachExtractionDiagnostics, automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, StructuredOutputError, type ExtractedTasks, type ExtractionResult, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
 import { composeOpenProjectMarkdown, describeProposalOperations, formatGeneratedTaskDescription, planExistingTaskOperations, sourceContentHash, taskReferencesAreValid, type ProposalMetadataPatch } from "./task-proposals.js";
@@ -1725,10 +1725,12 @@ async function completeAiCandidate(
 		const displayedPatch = redisplayed?.metadata_patch ?? operations.metadataPatch;
 		const displayedAction = redisplayed?.action ?? action;
 		const displayedTarget = redisplayed?.target_work_package_id ?? match.workPackageId;
+		const displayedWorkPackage = displayedTarget === target!.id ? target! : await services.openProject.workPackage(displayedTarget);
+		const displayedWorkPackageLink = workPackageMarkdownLink(displayedWorkPackage.id, displayedWorkPackage.subject, services.openProject.workPackageUrl(displayedWorkPackage.id));
 		const operationSummary = describeProposalOperations(displayedOperation, displayedPatch);
 		const warning = displayedOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : "";
 		await deliverProposalReply(interaction, services, proposal.id, {
-			content: boundedDiscordContent(`**Possible ${displayedAction} for #${displayedTarget}**\n${operationSummary.map(item => `- ${item}`).join("\n")}${warning}\n\n${redisplayed?.title ?? candidate.title}\n${redisplayed?.description ?? description}${redisplayed ? "" : `\n\nSimilarity: ${Math.round(match.similarity * 100)}%`}`),
+			content: boundedDiscordContent(`**Possible ${displayedAction} for ${displayedWorkPackageLink}**\n${operationSummary.map(item => `- ${item}`).join("\n")}${warning}\n\n${redisplayed?.title ?? candidate.title}\n${redisplayed?.description ?? description}${redisplayed ? "" : `\n\nSimilarity: ${Math.round(match.similarity * 100)}%`}`),
 			components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...manualProposalButtons(proposal.id, displayedAction))],
 		}, !proposal.reused, replaceReply);
 		return;
@@ -1796,9 +1798,11 @@ async function completeAiCandidate(
 		`Estimate: ${estimatedHours !== undefined ? `${estimatedHours}h` : "Not inferred"}`,
 	].join("\n");
 	const displayedAction = redisplayed?.action ?? "create";
-	const displayedTarget = displayedAction !== "create" && redisplayed?.target_work_package_id
-		? `Possible ${displayedAction} for #${redisplayed.target_work_package_id}\n\n`
-		: "";
+	let displayedTarget = "";
+	if (displayedAction !== "create" && redisplayed?.target_work_package_id) {
+		const workPackage = await services.openProject.workPackage(redisplayed.target_work_package_id);
+		displayedTarget = `Possible ${displayedAction} for ${workPackageMarkdownLink(workPackage.id, workPackage.subject, services.openProject.workPackageUrl(workPackage.id))}\n\n`;
+	}
 	await deliverProposalReply(interaction, services, proposal.id, {
 		content: boundedDiscordContent(`${displayedTarget}**${redisplayed?.title ?? candidate.title}**\n${redisplayed?.description ?? description}${details ? `\n\n${details}` : ""}${redisplayed ? "" : `${advisory ? `\n\n${advisory}` : ""}${result.ambiguities.length ? `\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`}`),
 		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...manualProposalButtons(proposal.id, displayedAction, displayedAction === "create" ? suggestedMatch?.workPackageId : undefined))],
@@ -1863,7 +1867,7 @@ async function handleProposalButton(interaction: ButtonInteraction, services: Se
 		const buttons = manualProposalButtons(proposal.id, "update");
 		if (!interaction.message.flags.has(MessageFlags.Ephemeral)) buttons.push(new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary));
 		await interaction.update({
-			content: boundedDiscordContent(`Proposal will update OpenProject task #${target.id}: **${proposal.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch).map(item => `- ${item}`).join("\n")}`),
+			content: boundedDiscordContent(`Proposal will update OpenProject task ${workPackageMarkdownLink(target.id, target.subject, services.openProject.workPackageUrl(target.id))}\nProposed title: **${proposal.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch).map(item => `- ${item}`).join("\n")}`),
 			components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons)],
 		});
 		return;
