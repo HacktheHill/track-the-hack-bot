@@ -22,10 +22,26 @@ export type WorkPackage = {
 export type Activity = { id: number; comment?: { raw?: string } | null; _links?: Record<string, HalLink> };
 export type OpenProjectAttachmentInput = { id: string; name: string; contentType?: string; url: string };
 type Attachment = { id: number; fileName: string };
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 
 export function openProjectAttachmentFileName(attachment: OpenProjectAttachmentInput) {
 	const safeName = attachment.name.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+/, "") || "image";
-	return `${attachment.id}-${safeName}`;
+	const extensionMatch = /(?:\.[a-zA-Z0-9]{1,10})$/.exec(safeName);
+	const extension = extensionMatch?.[0] ?? "";
+	const stem = safeName.slice(0, safeName.length - extension.length).slice(0, Math.max(1, 120 - attachment.id.length - extension.length - 1));
+	return `${attachment.id}-${stem}${extension}`;
+}
+
+function detectedImageType(bytes: Uint8Array) {
+	const startsWith = (...values: number[]) => values.every((value, index) => bytes[index] === value);
+	if (startsWith(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) return "image/png";
+	if (startsWith(0xff, 0xd8, 0xff)) return "image/jpeg";
+	if (startsWith(0x47, 0x49, 0x46, 0x38) && (bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61) return "image/gif";
+	if (startsWith(0x52, 0x49, 0x46, 0x46) && String.fromCharCode(...bytes.slice(8, 12)) === "WEBP") return "image/webp";
+	if (startsWith(0x42, 0x4d)) return "image/bmp";
+	if (startsWith(0x49, 0x49, 0x2a, 0x00) || startsWith(0x4d, 0x4d, 0x00, 0x2a)) return "image/tiff";
+	if (bytes.length >= 12 && String.fromCharCode(...bytes.slice(4, 12)).match(/^ftyp(?:avif|avis)$/)) return "image/avif";
+	return undefined;
 }
 
 export class OpenProjectRequestError extends Error {
@@ -159,11 +175,17 @@ export class OpenProjectClient {
 			}
 			const response = await fetch(sourceUrl, { signal: AbortSignal.timeout(30000) });
 			if (!response.ok) throw new OpenProjectRequestError(`Discord attachment download failed with ${response.status}.`);
-			const contentType = attachment.contentType ?? response.headers.get("content-type") ?? "application/octet-stream";
-			if (!contentType.startsWith("image/")) continue;
+			const declaredSize = Number(response.headers.get("content-length"));
+			if (Number.isFinite(declaredSize) && declaredSize > MAX_ATTACHMENT_BYTES) {
+				throw new OpenProjectRequestError(`Discord image ${attachment.name} exceeds the 20 MiB upload limit.`);
+			}
+			const bytes = new Uint8Array(await response.arrayBuffer());
+			if (bytes.byteLength > MAX_ATTACHMENT_BYTES) throw new OpenProjectRequestError(`Discord image ${attachment.name} exceeds the 20 MiB upload limit.`);
+			const contentType = detectedImageType(bytes);
+			if (!contentType) throw new OpenProjectRequestError(`Discord attachment ${attachment.name} is not a supported image.`);
 			const form = new FormData();
 			form.append("metadata", new Blob([JSON.stringify({ fileName })], { type: "application/json" }));
-			form.append("file", new Blob([await response.arrayBuffer()], { type: contentType }), fileName);
+			form.append("file", new Blob([bytes], { type: contentType }), fileName);
 			await this.request<Attachment>(`${containerPath}/attachments`, { method: "POST", body: form });
 			existingNames.add(fileName);
 		}

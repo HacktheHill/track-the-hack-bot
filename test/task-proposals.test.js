@@ -66,6 +66,12 @@ test("Markdown composition preserves body sections without rendering source link
 	assert.ok(markdown.endsWith("<!-- marker -->"));
 });
 
+test("Markdown composition normalizes image alt text", () => {
+	const markdown = composeOpenProjectMarkdown("Summary", undefined, [{ name: "[draft]\n*image*`<>.png", fileName: "a1-image.png" }]);
+	assert.match(markdown, /!\[draft image\.png\]\(attachment:a1-image\.png\)/);
+	assert.equal(markdown.includes("\n*image*"), false);
+});
+
 test("task references require valid IDs and at least one focal message", () => {
 	const validMessages = new Set(["recent", "detail"]);
 	const focalMessages = new Set(["recent"]);

@@ -224,7 +224,7 @@ test("OpenProject comments upload images to the created activity", async () => {
 	globalThis.fetch = async (url, init = {}) => {
 		requests.push({ url: String(url), init });
 		if (String(url) === "https://cdn.discordapp.com/attachments/1/2/update.png") {
-			return new Response(new Uint8Array([1]), { headers: { "Content-Type": "image/png" } });
+			return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), { headers: { "Content-Type": "image/png" } });
 		}
 		if (String(url).endsWith("/activities?pageSize=100")) return Response.json({ _embedded: { elements: [] }, _links: {} });
 		if (String(url).endsWith("/activities") && init.method === "POST") return Response.json({ id: 9, comment: { raw: "" } });

@@ -146,7 +146,10 @@ export function composeOpenProjectMarkdown(
 	images: readonly { name: string; fileName: string }[] = [],
 ) {
 	const imageSection = images.length
-		? `## Images\n\n${images.map(image => `![${image.name.replace(/[\[\]]/g, "")}](attachment:${image.fileName})`).join("\n\n")}`
+		? `## Images\n\n${images.map(image => {
+			const alt = image.name.replace(/[\r\n]+/g, " ").replace(/[\\[\]()`*_<>]/g, "").replace(/\s+/g, " ").trim().slice(0, 200) || "Image";
+			return `![${alt}](attachment:${image.fileName})`;
+		}).join("\n\n")}`
 		: "";
 	return [body.trim(), imageSection, marker ? `<!-- ${marker} -->` : ""].filter(Boolean).join("\n\n");
 }

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, proposalReviewComponents, relevantImageAttachments, removeProposalReviewCard, taskCommand, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
-import { normalizeTaskTitle, OpenProjectClient, titlesLikelyDuplicate, workPackageMarkdownLink } from "../dist/openproject.js";
+import { normalizeTaskTitle, OpenProjectClient, openProjectAttachmentFileName, titlesLikelyDuplicate, workPackageMarkdownLink } from "../dist/openproject.js";
 
 test("task defaults start today and use the configured due offset", () => {
 	assert.deepEqual(defaultTaskDates(new Date("2026-07-13T23:30:00Z"), true, 7), {
@@ -372,7 +372,7 @@ test("OpenProject creation uploads Discord images and embeds native attachment r
 	globalThis.fetch = async (url, init = {}) => {
 		calls.push({ url: String(url), init });
 		if (String(url) === "https://cdn.discordapp.com/attachments/1/2/schema.png") {
-			return new Response(new Uint8Array([1, 2, 3]), { headers: { "Content-Type": "image/png" } });
+			return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), { headers: { "Content-Type": "application/octet-stream" } });
 		}
 		if (String(url).endsWith("/attachments?pageSize=100") && (init.method ?? "GET") === "GET") {
 			return Response.json({ _embedded: { elements: [] }, _links: {} });
@@ -399,6 +399,14 @@ test("OpenProject creation uploads Discord images and embeds native attachment r
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
+});
+
+test("OpenProject attachment filenames are safe and bounded", () => {
+	const fileName = openProjectAttachmentFileName({ id: "123", name: `${"sponsor ".repeat(30)}mockup.png`, url: "https://cdn.discordapp.com/image" });
+	assert.equal(fileName.length <= 120, true);
+	assert.match(fileName, /^123-sponsor-/);
+	assert.match(fileName, /\.png$/);
+	assert.equal(fileName.includes(" "), false);
 });
 
 test("OpenProject project membership checks the mapped principal", async () => {
