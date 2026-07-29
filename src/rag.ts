@@ -109,6 +109,27 @@ function descriptionOf(workPackage: WorkPackage) {
 	return typeof workPackage.description === "string" ? workPackage.description : workPackage.description?.raw ?? "";
 }
 
+export function cleanRetrievalText(value: string) {
+	return value
+		.replace(/<!--\s*track-the-hack[^>]*-->/gi, "")
+		.replace(/^#{1,6}[ \t]+(?:sources?|source conversation|related links?|related references?)[ \t]*\n[\s\S]*?(?=^#{1,6}[ \t]+|(?![\s\S]))/gim, "")
+		.replace(/!?\[([^\]]*)\]\((?:https?:\/\/|attachment:)[^)]+\)/gi, "$1")
+		.replace(/https?:\/\/[^\s<>)]+/gi, "")
+		.replace(/^[ \t]*(?:sources?|related links?|related references?):[ \t]*$/gim, "")
+		.replace(/[ \t]+$/gm, "")
+		.replace(/\n{3,}/g, "\n\n")
+		.trim();
+}
+
+export function workPackageRetrievalDescription(workPackage: WorkPackage) {
+	const metadata = [
+		workPackage._links.type?.title ? `Type: ${workPackage._links.type.title}` : undefined,
+		workPackage._links.status?.title ? `Status: ${workPackage._links.status.title}` : `Status: ${workPackage.isClosed ? "Closed" : "Open"}`,
+	].filter((value): value is string => Boolean(value));
+	const body = cleanRetrievalText(descriptionOf(workPackage));
+	return [...metadata, body].filter(Boolean).join("\n\n");
+}
+
 export function lexicalTitleSimilarity(left: string, right: string) {
 	const stopWords = new Set(["and", "for", "the", "with"]);
 	const editWords = new Set(["change", "changed", "edit", "modify", "modified", "revise", "revised", "revision", "update", "updated"]);
@@ -155,7 +176,7 @@ export class OpenProjectRag {
 				const workPackages = await this.openProject.workPackages(projectId, "all");
 				const pending: Array<{ workPackage: WorkPackage; description: string; subject: string; contentHash: string }> = [];
 				for (const workPackage of workPackages) {
-					const description = descriptionOf(workPackage);
+					const description = workPackageRetrievalDescription(workPackage);
 					const subject = workPackage.subject;
 					const contentHash = embeddingContentHash(subject, description, this.config.AZURE_OPENAI_EMBEDDING_DEPLOYMENT, this.config.AZURE_OPENAI_EMBEDDING_DIMENSIONS);
 					if (await this.db.embeddingIsCurrent(workPackage.id, contentHash, workPackage.lockVersion, Boolean(workPackage.isClosed))) continue;
