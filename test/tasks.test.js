@@ -326,6 +326,19 @@ test("proposal cards stay within Discord's message limit", () => {
 	assert.match(content, /Preview truncated/);
 });
 
+test("proposal card truncation preserves Markdown boundaries", () => {
+	const fenced = boundedDiscordContent(`Summary\n\n\`\`\`js\n${"const value = 1; ".repeat(20)}`, 120);
+	assert.equal((fenced.match(/```/g) ?? []).length % 2, 0);
+	assert.match(fenced, /```\n\n\[Preview truncated\]$/);
+
+	const linked = boundedDiscordContent(`${"Context ".repeat(10)}[documentation](https://example.test/${"path/".repeat(20)})`, 120);
+	assert.equal(/\[[^\]]*(?:$|\]\([^)]*$)/.test(linked.replace(/\n\n\[Preview truncated\]$/, "")), false);
+	assert.equal(linked.length <= 120, true);
+
+	const emphasized = boundedDiscordContent(`${"Context ".repeat(10)}**important ${"detail ".repeat(20)}`, 120);
+	assert.equal((emphasized.match(/\*\*/g) ?? []).length % 2, 0);
+});
+
 test("work package proposal links include the ID and title", () => {
 	assert.equal(
 		workPackageMarkdownLink(42, "Ship [updated] schedule", "https://openproject.test/work_packages/42"),

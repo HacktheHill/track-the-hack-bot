@@ -202,7 +202,32 @@ export function formatProposalMetrics(metrics: ProposalMetrics) {
 
 export function boundedDiscordContent(value: string, limit = 2000) {
 	if (value.length <= limit) return value;
-	return `${value.slice(0, Math.max(0, limit - 24)).trimEnd()}\n\n[Preview truncated]`;
+	const suffix = "\n\n[Preview truncated]";
+	const closureBudget = 16;
+	const bodyLimit = Math.max(0, limit - suffix.length - closureBudget);
+	let body = value.slice(0, bodyLimit);
+	const preferredBreaks = [body.lastIndexOf("\n\n"), body.lastIndexOf("\n"), body.lastIndexOf(" ")];
+	const breakAt = preferredBreaks.find(index => index >= bodyLimit * 0.6);
+	if (breakAt !== undefined) body = body.slice(0, breakAt);
+	body = body.trimEnd();
+
+	const openBracket = body.lastIndexOf("[");
+	if (openBracket >= 0) {
+		const closeBracket = body.indexOf("]", openBracket + 1);
+		const incompleteLink = closeBracket < 0 || (body[closeBracket + 1] === "(" && body.indexOf(")", closeBracket + 2) < 0);
+		if (incompleteLink) body = body.slice(0, openBracket > 0 && body[openBracket - 1] === "!" ? openBracket - 1 : openBracket).trimEnd();
+	}
+
+	const unescapedCount = (token: string) => [...body.matchAll(new RegExp(`(?<!\\\\)${token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "g"))].length;
+	const fenceOpen = unescapedCount("```") % 2 === 1;
+	let closers = fenceOpen ? "\n```" : "";
+	if (!fenceOpen) {
+		if (unescapedCount("`") % 2 === 1) closers += "`";
+		if (unescapedCount("**") % 2 === 1) closers += "**";
+		if (unescapedCount("__") % 2 === 1) closers += "__";
+		if (unescapedCount("~~") % 2 === 1) closers += "~~";
+	}
+	return `${body}${closers}${suffix}`.slice(0, limit);
 }
 
 type ProposalReviewMessage = { id: string; channel_id: string; review_message_id: string | null };
