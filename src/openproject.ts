@@ -44,7 +44,6 @@ export type WorkPackageInput = {
 	startDate?: string;
 	dueDate?: string;
 	estimatedHours?: number;
-	sourceLinks: string[];
 	attachments?: OpenProjectAttachmentInput[];
 	typeId?: number;
 	correlationId?: string;
@@ -284,7 +283,6 @@ export class OpenProjectClient {
 		const attachments = input.attachments ?? [];
 		const description = composeOpenProjectMarkdown(
 			input.description,
-			input.sourceLinks,
 			input.correlationId ? `track-the-hack-correlation:${input.correlationId}` : undefined,
 			this.attachmentMarkdown(attachments),
 		);
@@ -364,9 +362,9 @@ export class OpenProjectClient {
 		await this.uploadAttachments(`/api/v3/work_packages/${id}`, attachments);
 	}
 
-	async commentWorkPackage(id: number, markdown: string, sourceLinks: string[], correlationId: string, attachments: OpenProjectAttachmentInput[] = []) {
+	async commentWorkPackage(id: number, markdown: string, correlationId: string, attachments: OpenProjectAttachmentInput[] = []) {
 		const marker = `track-the-hack-proposal:${correlationId}:comment`;
-		const body = composeOpenProjectMarkdown(markdown, sourceLinks, marker, this.attachmentMarkdown(attachments));
+		const body = composeOpenProjectMarkdown(markdown, marker, this.attachmentMarkdown(attachments));
 		const existing = (await this.workPackageActivities(id)).find(activity => activity.comment?.raw?.includes(`<!-- ${marker} -->`));
 		if (existing) {
 			await this.uploadAttachments(`/api/v3/activities/${existing.id}`, attachments);

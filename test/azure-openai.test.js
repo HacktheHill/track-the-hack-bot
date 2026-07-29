@@ -67,7 +67,8 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 		assert.match(request.body.messages[0].content, /do not invent missing objectives/i);
 		assert.match(request.body.messages[0].content, /Keep one cohesive sentence or paragraph as prose/);
 		assert.match(request.body.messages[0].content, /two or more independently actionable requirements/);
-		assert.match(request.body.messages[0].content, /application adds verified links separately/);
+		assert.match(request.body.messages[0].content, /source URLs are retained internally.*intentionally omitted from OpenProject content/);
+		assert.equal(request.body.messages[0].content.includes("application adds verified links"), false);
 		assert.match(request.body.messages[0].content, /human review decides whether any candidate is applied/i);
 		assert.ok(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("content_intent"));
 		assert.equal(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("automatic_eligibility"), false);

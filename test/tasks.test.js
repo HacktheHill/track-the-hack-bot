@@ -337,7 +337,7 @@ test("duplicate detection normalizes punctuation and compares meaningful words",
 	assert.equal(titlesLikelyDuplicate("Book venue", "Update Discord roles"), false);
 });
 
-test("OpenProject creation uses dynamic type/size metadata and appends source links", async () => {
+test("OpenProject creation uses dynamic type/size metadata without rendering source links", async () => {
 	const calls = [];
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (url, init = {}) => {
@@ -354,13 +354,13 @@ test("OpenProject creation uses dynamic type/size metadata and appends source li
 		});
 		await client.createWorkPackage({
 			projectId: 3, subject: "Ship portal", description: "Complete it", typeId: 9,
-			sizeHref: "/api/v3/custom_options/7", sourceLinks: ["https://discord.com/channels/1/2/3"],
+			sizeHref: "/api/v3/custom_options/7",
 		});
 		const formPayload = JSON.parse(calls[0].init.body);
 		const commitPayload = JSON.parse(calls[1].init.body);
 		assert.equal(formPayload._links.type.href, "/api/v3/types/9");
 		assert.equal(commitPayload.customField2.href, "/api/v3/custom_options/7");
-		assert.match(formPayload.description.raw, /discord\.com\/channels\/1\/2\/3/);
+		assert.equal(formPayload.description.raw, "Complete it");
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
@@ -386,7 +386,7 @@ test("OpenProject creation uploads Discord images and embeds native attachment r
 	try {
 		const client = new OpenProjectClient({ OPENPROJECT_BASE_URL: "https://project.example", OPENPROJECT_API_KEY: "test" });
 		await client.createWorkPackage({
-			projectId: 3, subject: "Ship portal", description: "Complete it", sourceLinks: [],
+			projectId: 3, subject: "Ship portal", description: "Complete it",
 			attachments: [{ id: "a1", name: "schema.png", contentType: "image/png", url: "https://cdn.discordapp.com/attachments/1/2/schema.png" }],
 		});
 		const creationPayload = JSON.parse(calls[0].init.body);

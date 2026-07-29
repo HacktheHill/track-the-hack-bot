@@ -741,7 +741,6 @@ async function createAndAnnounce(args: {
 		startDate: validIsoDate(args.startDate),
 		dueDate: validIsoDate(args.dueDate),
 		estimatedHours: metadata.estimatedHours,
-		sourceLinks: args.sourceLinks,
 		typeId: type?.id,
 		correlationId: args.correlationId ?? args.draftId,
 		attachments: args.sourceAttachments,
@@ -2242,7 +2241,6 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 				if (proposal.content_operation === "descriptionReplacement") {
 					changes.description = { format: "markdown", raw: composeOpenProjectMarkdown(
 						args.description,
-						args.sourceLinks,
 						`track-the-hack-proposal:${proposal.id}:description`,
 						(args.sourceAttachments ?? []).map(attachment => ({ name: attachment.name, fileName: openProjectAttachmentFileName(attachment) })),
 					) };
@@ -2263,7 +2261,7 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 					throw new Error(`OpenProject task ${proposal.target_work_package_id} changed since this proposal was created. Review it again before applying the update.`);
 				}
 				if (proposal.content_operation === "postComment" && !proposal.comment_activity_id) {
-					const activity = await services.openProject.commentWorkPackage(proposal.target_work_package_id, args.description, args.sourceLinks, proposal.id, args.sourceAttachments);
+					const activity = await services.openProject.commentWorkPackage(proposal.target_work_package_id, args.description, proposal.id, args.sourceAttachments);
 					await services.db.markProposalCommentApplied(proposal.id, activity.id);
 				}
 				const corrections = proposalCorrections({

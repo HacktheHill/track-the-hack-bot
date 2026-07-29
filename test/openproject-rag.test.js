@@ -191,12 +191,12 @@ test("OpenProject comments are Markdown activities and deduplicate by proposal m
 	};
 	try {
 		const client = new OpenProjectClient({ OPENPROJECT_BASE_URL: "https://openproject.example", OPENPROJECT_API_KEY: "secret", OPENPROJECT_CACHE_TTL_MS: 1000 });
-		const activity = await client.commentWorkPackage(42, "## Update\n\n- Ship it", ["https://discord.com/channels/1/2/3"], "proposal");
+		const activity = await client.commentWorkPackage(42, "## Update\n\n- Ship it", "proposal");
 		assert.equal(activity.id, 9);
 		assert.equal(requests[1].url, "https://openproject.example/api/v3/work_packages/42/activities");
 		assert.equal(requests[1].method, "POST");
 		assert.match(requests[1].body.comment.raw, /track-the-hack-proposal:proposal:comment/);
-		assert.match(requests[1].body.comment.raw, /## Source/);
+		assert.equal(requests[1].body.comment.raw.includes("discord.com/channels"), false);
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
@@ -211,7 +211,7 @@ test("OpenProject comments reuse an existing correlated activity", async () => {
 	};
 	try {
 		const client = new OpenProjectClient({ OPENPROJECT_BASE_URL: "https://openproject.example", OPENPROJECT_API_KEY: "secret", OPENPROJECT_CACHE_TTL_MS: 1000 });
-		assert.equal((await client.commentWorkPackage(42, "Update", [], "proposal")).id, 7);
+		assert.equal((await client.commentWorkPackage(42, "Update", "proposal")).id, 7);
 		assert.equal(calls, 1);
 	} finally {
 		globalThis.fetch = originalFetch;
@@ -234,7 +234,7 @@ test("OpenProject comments upload images to the created activity", async () => {
 	};
 	try {
 		const client = new OpenProjectClient({ OPENPROJECT_BASE_URL: "https://openproject.example", OPENPROJECT_API_KEY: "secret", OPENPROJECT_CACHE_TTL_MS: 1000 });
-		await client.commentWorkPackage(42, "Updated design", [], "proposal", [
+		await client.commentWorkPackage(42, "Updated design", "proposal", [
 			{ id: "a1", name: "update.png", contentType: "image/png", url: "https://cdn.discordapp.com/attachments/1/2/update.png" },
 		]);
 		const activityRequest = requests.find(request => request.url.endsWith("/activities") && request.init.method === "POST");

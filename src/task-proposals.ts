@@ -142,17 +142,13 @@ export function formatGeneratedTaskDescription(value: string) {
 
 export function composeOpenProjectMarkdown(
 	body: string,
-	sourceLinks: string[],
 	marker?: string,
 	images: readonly { name: string; fileName: string }[] = [],
 ) {
-	const links = [...new Set(sourceLinks.map(link => link.trim()).filter(Boolean))];
-	const source = links.length ? `## Source\n\n${links.map(link => `- ${link}`).join("\n")}` : "";
 	const imageSection = images.length
 		? `## Images\n\n${images.map(image => `![${image.name.replace(/[\[\]]/g, "")}](attachment:${image.fileName})`).join("\n\n")}`
 		: "";
-	const withoutSource = stripGeneratedReferenceSections(body);
-	return [withoutSource, imageSection, source, marker ? `<!-- ${marker} -->` : ""].filter(Boolean).join("\n\n");
+	return [body.trim(), imageSection, marker ? `<!-- ${marker} -->` : ""].filter(Boolean).join("\n\n");
 }
 
 export function planExistingTaskOperations(input: ExistingTaskPlanInput) {

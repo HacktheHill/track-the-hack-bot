@@ -57,12 +57,12 @@ test("unresolved metadata is preserved instead of being cleared", () => {
 	assert.deepEqual(planned.metadataPatch, {});
 });
 
-test("Markdown composition deduplicates source links and appends its marker", () => {
-	const markdown = composeOpenProjectMarkdown("## Objective\n\nShip it.\n\n## References\n\n- https://stale.test/reference\n\n## Source\n\n- https://stale.test/source", ["https://example.test/source", "https://example.test/source"], "marker");
-	assert.equal(markdown.match(/https:\/\/example\.test\/source/g)?.length, 1);
-	assert.equal(markdown.includes("https://stale.test/source"), false);
-	assert.equal(markdown.includes("https://stale.test/reference"), false);
-	assert.match(markdown, /## Source/);
+test("Markdown composition preserves body sections without rendering source links", () => {
+	const body = "## Objective\n\nShip it.\n\n## References\n\n- https://example.test/reference\n\n## Related links\n\n- https://example.test/related\n\n## Source\n\nHuman-authored source details";
+	const markdown = composeOpenProjectMarkdown(body, "marker");
+	assert.match(markdown, /## References[\s\S]*https:\/\/example\.test\/reference/);
+	assert.match(markdown, /## Related links[\s\S]*https:\/\/example\.test\/related/);
+	assert.match(markdown, /## Source[\s\S]*Human-authored source details/);
 	assert.ok(markdown.endsWith("<!-- marker -->"));
 });
 
