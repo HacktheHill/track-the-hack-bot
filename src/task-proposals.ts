@@ -114,15 +114,26 @@ function stripGeneratedReferenceSections(value: string) {
 
 function compactDescription(value: string) {
 	const output: string[] = [];
-	const seenStructuredLines = new Set<string>();
+	const seenHeadings = new Set<string>();
+	const seenItemsBySection = new Map<string, Set<string>>();
+	let section = "";
 	for (const rawLine of value.split(/\r?\n/)) {
 		const line = rawLine.trimEnd();
-		const structured = /^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)/.test(line);
-		if (structured) {
+		const heading = /^\s*#{1,6}\s+/.test(line);
+		const item = /^\s*(?:[-*+]\s+|\d+[.)]\s+)/.test(line);
+		if (heading || item) {
 			const normalized = line.replace(/^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)/, "")
 				.replace(/\s+/g, " ").trim().toLocaleLowerCase();
-			if (seenStructuredLines.has(normalized)) continue;
-			seenStructuredLines.add(normalized);
+			if (heading) {
+				section = normalized;
+				if (seenHeadings.has(normalized)) continue;
+				seenHeadings.add(normalized);
+			} else {
+				const seenItems = seenItemsBySection.get(section) ?? new Set<string>();
+				if (seenItems.has(normalized)) continue;
+				seenItems.add(normalized);
+				seenItemsBySection.set(section, seenItems);
+			}
 		}
 		output.push(line);
 	}

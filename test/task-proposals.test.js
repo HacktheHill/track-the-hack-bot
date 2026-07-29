@@ -109,3 +109,10 @@ test("generated descriptions deduplicate normalized bullets and headings", () =>
 		"## Requirements\n\n- Ship the update.\n\n- Add tests.",
 	);
 });
+
+test("generated descriptions retain repeated instructions under different headings", () => {
+	assert.equal(
+		formatGeneratedTaskDescription("## Mobile\n\n- Verify navigation.\n- Verify navigation.\n\n## Desktop\n\n- Verify navigation."),
+		"## Mobile\n\n- Verify navigation.\n\n## Desktop\n\n- Verify navigation.",
+	);
+});
