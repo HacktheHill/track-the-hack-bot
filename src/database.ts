@@ -80,6 +80,10 @@ export class Database {
 		await this.pool.query("SELECT pg_advisory_lock(hashtext('track-the-hack-bot-schema'))");
 		try {
 		await this.pool.query(`
+			CREATE TABLE IF NOT EXISTS bot_migrations (
+				name TEXT PRIMARY KEY,
+				applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+			);
 			CREATE TABLE IF NOT EXISTS discord_openproject_users (
 				discord_user_id TEXT PRIMARY KEY,
 				openproject_user_id INTEGER NOT NULL,
@@ -233,6 +237,21 @@ export class Database {
 			CREATE INDEX IF NOT EXISTS scheduled_messages_due_idx
 				ON scheduled_messages(status, send_at, next_attempt_at)
 		`);
+		if (Object.keys(config.userMap).length === 0 && Object.keys(config.categoryProjects).length === 0) {
+			await this.pool.query(`
+				WITH applied AS (
+					INSERT INTO bot_migrations(name)
+					VALUES ('2026-07-29-clear-openproject-mappings')
+					ON CONFLICT DO NOTHING
+					RETURNING name
+				), deleted_users AS (
+					DELETE FROM discord_openproject_users
+					WHERE EXISTS (SELECT 1 FROM applied)
+				)
+				DELETE FROM discord_category_projects
+				WHERE EXISTS (SELECT 1 FROM applied)
+			`);
+		}
 		await this.pool.query("DROP TABLE IF EXISTS discord_channel_projects");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS permitted_reviewer_ids TEXT[] NOT NULL DEFAULT '{}'");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS metadata_inference JSONB NOT NULL DEFAULT '{}'");
