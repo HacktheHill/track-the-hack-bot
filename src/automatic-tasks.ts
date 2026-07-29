@@ -5,7 +5,7 @@ import { Database } from "./database.js";
 import { OpenProjectClient, titlesLikelyDuplicate, workPackageMarkdownLink } from "./openproject.js";
 import { AI_CONTEXT_GAP_MS, boundedDiscordContent, defaultAiDueDate, formatAiTaskDescription, inferCreationMetadata, proposalReviewComponents, relevantImageAttachments, teamProjectId } from "./tasks.js";
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
-import { describeProposalOperations, planExistingTaskOperations, sourceContentHash, taskReferencesAreValid } from "./task-proposals.js";
+import { describeProposalOperations, formatProposalContent, planExistingTaskOperations, sourceContentHash, taskReferencesAreValid } from "./task-proposals.js";
 
 type AutomaticServices = { config: IntegrationConfig; db: Database; extractor: TaskExtractor; openProject: OpenProjectClient; rag?: OpenProjectRag };
 type Batch = { messages: Message[]; timer: NodeJS.Timeout };
@@ -327,7 +327,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS,
 					});
 					const reviewPayload: ReviewCardPayload = {
-						content: boundedDiscordContent(`${ownerText}Proposed ${action} for OpenProject task ${workPackageMarkdownLink(target!.id, target!.subject, services.openProject.workPackageUrl(target!.id))}\nProposed title: **${task.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch).map(item => `- ${item}`).join("\n")}${operations.contentOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : ""}`),
+						content: boundedDiscordContent(`${ownerText}Proposed ${action} for OpenProject task ${workPackageMarkdownLink(target!.id, target!.subject, services.openProject.workPackageUrl(target!.id))}\nProposed title: **${task.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch).map(item => `- ${item}`).join("\n")}${operations.contentOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : ""}${formatProposalContent(operations.contentOperation, operations.contentMarkdown)}${result.ambiguities.length ? `\n\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`),
 						components: proposalReviewComponents(proposal.id, action, ragCandidates, true),
 						allowedMentions: { parse: [] },
 					};
@@ -399,7 +399,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						ragCandidates,
 				});
 				const reviewPayload: ReviewCardPayload = {
-					content: boundedDiscordContent(`${ownerText}Proposed OpenProject task: **${task.title}**\n${description}${advisory ? `\n\n${advisory}` : ""}`),
+					content: boundedDiscordContent(`${ownerText}Proposed OpenProject task: **${task.title}**\n${description}${advisory ? `\n\n${advisory}` : ""}${result.ambiguities.length ? `\n\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`),
 					components: proposalReviewComponents(proposal.id, "create", ragCandidates, true),
 					allowedMentions: { parse: [] },
 				};

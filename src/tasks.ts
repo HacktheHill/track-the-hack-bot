@@ -32,7 +32,7 @@ import { correctionFields, Database, proposalDismissalReasons, type CorrectionFl
 import { OpenProjectClient, OpenProjectRequestError, openProjectAttachmentFileName, workPackageChangesApplied, workPackageMarkdownLink, type OpenProjectAttachmentInput } from "./openproject.js";
 import { attachExtractionDiagnostics, automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, StructuredOutputError, type ExtractedTasks, type ExtractionResult, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
-import { composeOpenProjectMarkdown, describeProposalOperations, formatGeneratedTaskDescription, planExistingTaskOperations, sourceContentHash, taskReferencesAreValid, type MetadataFieldName, type ProposalMetadataPatch } from "./task-proposals.js";
+import { composeOpenProjectMarkdown, describeProposalOperations, formatGeneratedTaskDescription, formatProposalContent, planExistingTaskOperations, sourceContentHash, taskReferencesAreValid, type MetadataFieldName, type ProposalMetadataPatch } from "./task-proposals.js";
 
 export const taskCommand = new SlashCommandBuilder()
 	.setName("task")
@@ -1770,9 +1770,10 @@ async function completeAiCandidate(
 		const displayedWorkPackage = displayedTarget === target!.id ? target! : await services.openProject.workPackage(displayedTarget);
 		const displayedWorkPackageLink = workPackageMarkdownLink(displayedWorkPackage.id, displayedWorkPackage.subject, services.openProject.workPackageUrl(displayedWorkPackage.id));
 		const operationSummary = describeProposalOperations(displayedOperation, displayedPatch);
+		const displayedContent = redisplayed?.content_markdown ?? operations.contentMarkdown;
 		const warning = displayedOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : "";
 		await deliverProposalReply(interaction, services, proposal.id, {
-			content: boundedDiscordContent(`**Possible ${displayedAction} for ${displayedWorkPackageLink}**\n${operationSummary.map(item => `- ${item}`).join("\n")}${warning}\n\n${redisplayed?.title ?? candidate.title}\n${redisplayed?.description ?? description}${redisplayed ? "" : `\n\nSimilarity: ${Math.round(match.similarity * 100)}%`}`),
+			content: boundedDiscordContent(`**Possible ${displayedAction} for ${displayedWorkPackageLink}**\n${operationSummary.map(item => `- ${item}`).join("\n")}${warning}${formatProposalContent(displayedOperation, displayedContent)}${redisplayed ? "" : `\n\nSimilarity: ${Math.round(match.similarity * 100)}%`}${result.ambiguities.length ? `\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`),
 			components: proposalReviewComponents(proposal.id, displayedAction, redisplayed?.rag_candidates ?? ragCandidates),
 		}, !proposal.reused, replaceReply);
 		return;
@@ -1936,7 +1937,7 @@ async function applyExistingProposalTarget(
 	const buttons = manualProposalButtons(proposal.id, resultingAction);
 	if (!interaction.message.flags.has(MessageFlags.Ephemeral)) buttons.push(new ButtonBuilder().setCustomId(`op-dismiss:${proposal.id}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary));
 	await interaction.editReply({
-		content: boundedDiscordContent(`Proposal will ${resultingAction} OpenProject task ${workPackageMarkdownLink(target.id, target.subject, services.openProject.workPackageUrl(target.id))}\nProposed title: **${proposal.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch).map(item => `- ${item}`).join("\n")}`),
+		content: boundedDiscordContent(`Proposal will ${resultingAction} OpenProject task ${workPackageMarkdownLink(target.id, target.subject, services.openProject.workPackageUrl(target.id))}\nProposed title: **${proposal.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch).map(item => `- ${item}`).join("\n")}${formatProposalContent(operations.contentOperation, operations.contentMarkdown)}`),
 		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons)],
 		allowedMentions: { parse: [] },
 	});

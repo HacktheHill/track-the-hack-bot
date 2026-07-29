@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, handleProposalTargetSelect, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, proposalReviewComponents, relevantImageAttachments, removeProposalReviewCard, taskCommand, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
+import { formatProposalContent } from "../dist/task-proposals.js";
 import { normalizeTaskTitle, OpenProjectClient, openProjectAttachmentFileName, titlesLikelyDuplicate, workPackageMarkdownLink } from "../dist/openproject.js";
 
 test("task defaults start today and use the configured due offset", () => {
@@ -283,6 +284,13 @@ test("reviewers can retarget a nominated update through its allowlisted menu", a
 	assert.equal(retargeted.targetWorkPackageId, 42);
 	assert.deepEqual(retargeted.metadataPatch, { dueDate: "2026-08-01" });
 	assert.deepEqual(edited.allowedMentions, { parse: [] });
+	assert.match(edited.content, /\*\*Proposed comment\*\*\nApply the revisions/);
+});
+
+test("proposal content identifies comments and replacement descriptions", () => {
+	assert.equal(formatProposalContent("postComment", "Post this update"), "\n\n**Proposed comment**\nPost this update");
+	assert.equal(formatProposalContent("descriptionReplacement", "New canonical scope"), "\n\n**Proposed replacement description**\nNew canonical scope");
+	assert.equal(formatProposalContent("none", "Ignored"), "");
 });
 
 test("AI task descriptions omit Discord attachment links without verbatim source text", () => {

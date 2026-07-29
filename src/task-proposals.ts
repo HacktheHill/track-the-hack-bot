@@ -10,6 +10,12 @@ export type MetadataFieldName = typeof metadataFieldNames[number];
 export type ContentIntent = "none" | "update_note" | "replace_description";
 export type ContentOperation = "none" | "descriptionReplacement" | "postComment";
 
+export function formatProposalContent(contentOperation: ContentOperation, contentMarkdown?: string | null) {
+	if (contentOperation === "none") return "";
+	const label = contentOperation === "postComment" ? "Proposed comment" : "Proposed replacement description";
+	return `\n\n**${label}**\n${contentMarkdown?.trim() || "_No content provided._"}`;
+}
+
 export function sourceContentHash(messages: Array<{ id: string; text: string; attachments?: Array<{ id: string; url: string }> }>) {
 	const content = [...messages].sort((left, right) => left.id.localeCompare(right.id))
 		.map(message => {
