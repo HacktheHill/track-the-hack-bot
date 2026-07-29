@@ -94,7 +94,10 @@ authorization disabled. Entra RBAC is required for local reviewers and the jobs
 identity. Keep Blob versioning and 30-day soft deletion enabled.
 
 `tth-bot-corpus-sync` runs daily with 0.25 vCPU/0.5 GiB and writes only safe,
-pseudonymized pending cases. `tth-bot-ai-evaluate` is manual, uses the same
+pseudonymized pending cases. Bind `ORGANIZER_GUILD_ID` from the existing
+`organizer-guild-id` Key Vault secret so sync can create review-only Discord
+message links; those references remain outside evaluation windows.
+`tth-bot-ai-evaluate` is manual, uses the same
 low-cost resources, reaches Azure OpenAI through the existing private network,
 and persists cache/report blobs. Neither job prints corpus content. The
 localhost UI is not deployed and adds no always-on compute cost.
