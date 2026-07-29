@@ -23,6 +23,7 @@ const taskSchema = z.object({
 		due_date: z.string().nullable().transform(normalizeExtractedDate),
 		priority_name: z.string().nullable(),
 		size_name: z.string().nullable(),
+		project_name: z.string().max(255).nullable().default(null),
 		estimated_hours: z.number().min(0).nullable(),
 		source_message_ids: z.array(z.string()).min(1),
 		relevant_attachment_ids: z.array(z.string()),
@@ -40,12 +41,13 @@ const taskJsonSchema = {
 	properties: {
 			ambiguities: { type: "array", items: { type: "string", maxLength: 300 } },
 		tasks: { type: "array", maxItems: 5, items: { type: "object", additionalProperties: false,
-			required: ["title", "work_item_key", "description", "assignee_alias", "start_date", "due_date", "priority_name", "size_name", "estimated_hours", "source_message_ids", "relevant_attachment_ids", "evidence", "proposed_action", "content_intent", "metadata_change_fields"],
+			required: ["title", "work_item_key", "description", "assignee_alias", "start_date", "due_date", "priority_name", "size_name", "project_name", "estimated_hours", "source_message_ids", "relevant_attachment_ids", "evidence", "proposed_action", "content_intent", "metadata_change_fields"],
 			properties: {
 				title: { type: "string", maxLength: 255 }, work_item_key: { type: "string", minLength: 1, maxLength: 100 }, description: { type: "string", maxLength: 4000 },
 				assignee_alias: { type: ["string", "null"] },
 				start_date: { type: ["string", "null"] }, due_date: { type: ["string", "null"] },
 				priority_name: { type: ["string", "null"] }, size_name: { type: ["string", "null"] },
+				project_name: { type: ["string", "null"], maxLength: 255 },
 				estimated_hours: { type: ["number", "null"], minimum: 0 },
 				source_message_ids: { type: "array", items: { type: "string" }, minItems: 1 },
 				relevant_attachment_ids: { type: "array", items: { type: "string" } },
@@ -71,10 +73,11 @@ const automaticAssessmentSchema = z.object({
 	supporting_source_message_ids: z.array(z.string()).min(1),
 });
 
-const automaticGateSchema = z.object({ assessments: z.array(automaticAssessmentSchema).max(5) });
+const automaticGateSchema = z.object({ window_sensitivity: z.enum(["safe", "sensitive", "uncertain"]), assessments: z.array(automaticAssessmentSchema).max(5) });
 
 const automaticGateJsonSchema = {
-	type: "object", additionalProperties: false, required: ["assessments"], properties: {
+	type: "object", additionalProperties: false, required: ["window_sensitivity", "assessments"], properties: {
+		window_sensitivity: { type: "string", enum: ["safe", "sensitive", "uncertain"] },
 		assessments: { type: "array", maxItems: 5, items: { type: "object", additionalProperties: false,
 			required: ["candidate_index", "has_activated_specific_work", "has_remaining_work_or_trackable_transition", "is_durable", "is_decision_ready", "sensitivity", "supporting_source_message_ids"],
 			properties: {
@@ -114,6 +117,7 @@ const ragRerankJsonSchema = {
 
 export type AutomaticCandidateAssessment = z.infer<typeof automaticAssessmentSchema>;
 export type AutomaticGateResult = {
+	windowSensitivity: "safe" | "sensitive" | "uncertain";
 	assessments: AutomaticCandidateAssessment[];
 	deployment: string;
 	latencyMs: number;
@@ -154,6 +158,7 @@ export function mergeRelatedTaskCandidates(tasks: ExtractedTask[]) {
 				&& compatibleValue(existing.due_date, task.due_date)
 				&& compatibleValue(existing.priority_name, task.priority_name)
 				&& compatibleValue(existing.size_name, task.size_name)
+				&& compatibleValue(existing.project_name, task.project_name)
 				&& compatibleValue(existing.estimated_hours, task.estimated_hours);
 		});
 		const existing = grouped[existingIndex];
@@ -170,6 +175,7 @@ export function mergeRelatedTaskCandidates(tasks: ExtractedTask[]) {
 			due_date: existing.due_date ?? task.due_date,
 			priority_name: existing.priority_name ?? task.priority_name,
 			size_name: existing.size_name ?? task.size_name,
+			project_name: existing.project_name ?? task.project_name,
 			estimated_hours: existing.estimated_hours ?? task.estimated_hours,
 			source_message_ids: [...new Set([...existing.source_message_ids, ...task.source_message_ids])],
 			relevant_attachment_ids: [...new Set([...existing.relevant_attachment_ids, ...task.relevant_attachment_ids])],
@@ -206,7 +212,7 @@ export type ExtractionResult = {
 export type ExtractionOptions = {
 	allowSensitiveContent?: boolean;
 	mode?: "manual" | "automatic";
-	metadata?: { priorities?: string[]; sizes?: string[] };
+	metadata?: { priorities?: string[]; sizes?: string[]; projects?: string[] };
 };
 export interface TaskExtractor {
 	readonly enabled: boolean;
@@ -215,7 +221,9 @@ export interface TaskExtractor {
 	assessRagCandidates(query: { title: string; description: string }, candidates: RagRerankCandidate[]): Promise<RagRerankResult>;
 }
 
-const credentialAssignmentPattern = /(["']?\b(?:credential|password|passwd|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|application[_ -]?id|client[_ -]?secret|private[_ -]?key|seed phrase|recovery phrase|token|secret)["']?\s*(?::|=|\bis\b)\s*)(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s,;}\]\r\n]+))/gi;
+const credentialAssignmentPattern = /(["']?\b(?:user(?:name| name)|credential|password|passwd|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|application[_ -]?id|client[_ -]?secret|private[_ -]?key|seed phrase|recovery phrase|token|secret)["']?\s*(?::|=|\b(?:is|was|should be|will be|must be)\b)\s*)(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^,;}\]\r\n]+))/gi;
+const credentialPairPattern = /(\buser(?:name| name)\s*(?::|=|\bis\b)?\s*)([^\s,;}\]\r\n]+)(\s+and\s+password\s*(?::|=|\bis\b)?\s*)([^,;}\]\r\n]+)/gi;
+const conversationalCredentialPattern = /(\b(?:with|using)\s+(?:password|passwd|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|client[_ -]?secret)\s+)([^,;}\]\r\n]+)/gi;
 const bearerPattern = /(\bauthorization\s*[:=]\s*bearer\s+)([^\s,;}\]\r\n]+)/gi;
 const jwtPattern = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
 const pemPrivateKeyPattern = /-----BEGIN (?:(?:RSA|EC|OPENSSH|ENCRYPTED) )?PRIVATE KEY-----[\s\S]*?-----END (?:(?:RSA|EC|OPENSSH|ENCRYPTED) )?PRIVATE KEY-----/g;
@@ -228,15 +236,25 @@ function isSchemaCredentialValue(value: string) {
 	return /^(?:string|number|boolean|object|unknown|any|null|undefined|true|false|string\[\]|z\.[\w.]+(?:\([^)]*\))?|\{(?:\}|\.\.\.\})|<[^>]+>)$/i.test(value.trim());
 }
 
+function isCredentialDiscussionValue(value: string) {
+	return /^(?:field|reset|rotation|management|requirements?|policy|policies|format|form|authentication\b|stored\b|managed\b|rotated\b|configured\b|required\b|available\b|kept\b|saved\b|handled\b|used\b)/i.test(value.trim());
+}
+
 function redactSecretValues(text: string) {
 	return text
 		.replace(pemPrivateKeyPattern, "[REDACTED_CREDENTIAL]")
 		.replace(bearerPattern, (match, prefix: string, value: string) =>
 			value.startsWith("[REDACTED_") ? match : `${prefix}[REDACTED_CREDENTIAL]`)
+		.replace(credentialPairPattern, (_match, userPrefix: string, username: string, passwordPrefix: string, password: string) =>
+			isCredentialDiscussionValue(username) && isCredentialDiscussionValue(password)
+				? _match
+				: `${userPrefix}${username.startsWith("[REDACTED_") ? username : "[REDACTED_CREDENTIAL]"}${passwordPrefix}${password.startsWith("[REDACTED_") ? password : "[REDACTED_CREDENTIAL]"}`)
 		.replace(credentialAssignmentPattern, (match, prefix: string, doubleQuoted?: string, singleQuoted?: string, bare?: string) => {
 			const value = doubleQuoted ?? singleQuoted ?? bare ?? "";
-			return value.startsWith("[REDACTED_") || isSchemaCredentialValue(value) ? match : `${prefix}[REDACTED_CREDENTIAL]`;
+			return value.startsWith("[REDACTED_") || isSchemaCredentialValue(value) || isCredentialDiscussionValue(value) ? match : `${prefix}[REDACTED_CREDENTIAL]`;
 		})
+		.replace(conversationalCredentialPattern, (match, prefix: string, value: string) =>
+			value.startsWith("[REDACTED_") || isSchemaCredentialValue(value) || isCredentialDiscussionValue(value) ? match : `${prefix}[REDACTED_CREDENTIAL]`)
 		.replace(jwtPattern, "[REDACTED_CREDENTIAL]");
 }
 
@@ -342,6 +360,7 @@ function parseAutomaticGateResponse(
 		}
 		const usage = (json as { usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } }).usage;
 		return {
+			windowSensitivity: parsed.window_sensitivity,
 			assessments: parsed.assessments.sort((left, right) => left.candidate_index - right.candidate_index),
 			deployment: provider,
 			latencyMs,
@@ -450,6 +469,7 @@ async function invokeCompatible(options: {
 		const started = Date.now();
 		const priorities = options.metadata?.priorities ?? [];
 		const sizes = options.metadata?.sizes ?? [];
+		const projects = options.metadata?.projects ?? [];
 		const selectedMessages = options.messages.map(({ containedSensitiveData: _, redactionStatus: __, ...message }) => message);
 		const imageParts = selectedMessages.flatMap(message => (message.attachments ?? [])
 			.filter(attachment => attachment.contentType?.startsWith("image/") && /^https:\/\/(?:cdn\.discordapp\.com|media\.discordapp\.net)\//i.test(attachment.url))
@@ -493,6 +513,7 @@ async function invokeCompatible(options: {
 						"Extract explicitly stated absolute or relative dates, using message timestamps to resolve relative timing. Dates must be YYYY-MM-DD. Use null when timing is unspecified; the application applies its scheduling defaults. Infer estimated_hours only when clearly supported.",
 						priorities.length ? `priority_name must exactly match one of: ${priorities.join(", ")}; otherwise use null.` : "Use null for priority_name because no allowed priorities were supplied.",
 						sizes.length ? `size_name must exactly match one of: ${sizes.join(", ")}; otherwise use null.` : "Use null for size_name because no allowed sizes were supplied.",
+						projects.length ? `project_name must exactly match one of: ${projects.join(", ")}. Choose a project only when the cited discussion clearly identifies its team or scope; otherwise use null.` : "Use null for project_name because no active projects were supplied.",
 						"Use supplied aliases only for assignee_alias resolution. Never put aliases, context-message wording, model-input wording, or verbatim transcripts in title, description, evidence, or ambiguities.",
 					].join(" ") },
 				{ role: "user", content: userContent },
@@ -561,6 +582,7 @@ async function invokeAutomaticGateCompatible(options: {
 						"Set is_durable=true only when an asynchronous tracker remains useful after the live exchange. Invitations to join a meeting, access-code and login assistance, immediate help already being handled, and other synchronous coordination are false.",
 						"Set is_decision_ready=true only when the desired outcome is sufficiently decided. Questions about how a process works, who should perform it, whether to proceed, or which mutually exclusive method to use are false until the discussion resolves the choice. A request to review a concrete artifact is decision-ready.",
 						"Classify sensitivity from context, not keywords. Schema fields, account-access logistics, Notion links, and ordinary project planning are safe. Mark sensitive for substantive private medical, personnel/conduct, privileged legal, or personal financial content. Use uncertain only when the cited work cannot be assessed safely from the supplied context.",
+						"Set window_sensitivity for the entire supplied message window, including messages unrelated to a candidate. Any substantive sensitive or uncertain context makes the whole window sensitive or uncertain.",
 						"Cite supporting_source_message_ids from the raw messages. Include at least one source used by the candidate and consider subsequent messages that cancel, complete, clarify, or supersede it.",
 						"Examples: 'Can you publish this reel?' passes activation; 'How does Instagram access work?' fails decision readiness; 'Alice will publish tomorrow' passes; 'Reach out if you need tasks or support' fails activation; 'Join the meeting now' fails durability.",
 					].join(" ") },
@@ -708,7 +730,7 @@ export class AzureTaskExtractor implements TaskExtractor {
 	}
 
 	async assessAutomaticCandidates(messages: MinimizedMessage[], candidates: ExtractedTask[]) {
-		if (!candidates.length) return { assessments: [], deployment: `azure:${this.config.AZURE_OPENAI_DEPLOYMENT}`, latencyMs: 0 };
+		if (!candidates.length) return { windowSensitivity: "uncertain" as const, assessments: [], deployment: `azure:${this.config.AZURE_OPENAI_DEPLOYMENT}`, latencyMs: 0 };
 		const deployment = this.config.AZURE_OPENAI_DEPLOYMENT;
 		if (!this.config.AZURE_OPENAI_ENDPOINT || !deployment) throw new Error("Azure OpenAI extraction is not configured.");
 		const selectedMessages = boundedExtractionMessages(messages, this.config.OPENPROJECT_AI_MAX_CONTEXT_CHARS).map(message => ({

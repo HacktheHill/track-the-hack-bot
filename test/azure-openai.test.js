@@ -45,7 +45,7 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 		const extractor = new AzureTaskExtractor(config, async () => "managed-identity-token");
 		const extraction = await extractor.extract(
 			[{ id: "m1", authorAlias: "USER_1", text: "Ship it", timestamp: "2026-07-13T00:00:00Z", contextRole: "primary" }],
-			{ mode: "manual", metadata: { priorities: ["High"], sizes: ["Small"] } },
+			{ mode: "manual", metadata: { priorities: ["High"], sizes: ["Small"], projects: ["Communications Team"] } },
 		);
 		assert.equal(request.url, "https://azure.example/openai/v1/chat/completions");
 		assert.equal(request.body.model, "task-extractor");
@@ -62,6 +62,7 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 		assert.match(request.body.messages[0].content, /timestamps/);
 		assert.match(request.body.messages[0].content, /priority_name must exactly match one of: High/);
 		assert.match(request.body.messages[0].content, /size_name must exactly match one of: Small/);
+		assert.match(request.body.messages[0].content, /project_name must exactly match one of: Communications Team/);
 		assert.match(request.body.messages[0].content, /content_intent=update_note/);
 		assert.match(request.body.messages[0].content, /only explicitly requested existing-task metadata changes/);
 		assert.match(request.body.messages[0].content, /do not invent missing objectives/i);
@@ -73,6 +74,7 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 		assert.ok(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("content_intent"));
 		assert.equal(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("automatic_eligibility"), false);
 		assert.ok(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("work_item_key"));
+		assert.ok(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("project_name"));
 		assert.equal(request.body.response_format.json_schema.schema.properties.tasks.items.properties.work_item_key.minLength, 1);
 		assert.equal(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("trigger_kind"), false);
 		assert.equal(request.body.response_format.json_schema.schema.properties.tasks.items.required.includes("lifecycle"), false);
@@ -88,7 +90,7 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 			id: "m1", authorAlias: "USER_1", text: "Ship it",
 			timestamp: "2026-07-13T00:00:00Z", contextRole: "primary",
 		}]);
-		assert.deepEqual(extraction.metadata, { priorities: ["High"], sizes: ["Small"] });
+		assert.deepEqual(extraction.metadata, { priorities: ["High"], sizes: ["Small"], projects: ["Communications Team"] });
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
@@ -139,7 +141,7 @@ test("automatic precision gate judges raw evidence and validates complete candid
 	globalThis.fetch = async (_url, init) => {
 		request = JSON.parse(init.body);
 		return new Response(JSON.stringify({
-			choices: [{ message: { content: JSON.stringify({ assessments: [{
+			choices: [{ message: { content: JSON.stringify({ window_sensitivity: "safe", assessments: [{
 				candidate_index: 0,
 				has_activated_specific_work: true,
 				has_remaining_work_or_trackable_transition: true,
@@ -162,6 +164,7 @@ test("automatic precision gate judges raw evidence and validates complete candid
 			{ id: "m1", authorAlias: "USER_1", text: "I have a reel ready. How does Instagram access work?", timestamp: "2026-07-13T00:00:00Z", contextRole: "primary" },
 		], [candidate]);
 		assert.equal(automaticCandidateEligible(gate.assessments[0]), false);
+		assert.equal(gate.windowSensitivity, "safe");
 		assert.equal(gate.usage.totalTokens, 42);
 		assert.equal(request.response_format.json_schema.name, "discord_automatic_precision_gate_v1");
 		assert.match(request.messages[0].content, /untrusted hypothesis/);
@@ -315,6 +318,28 @@ test("natural-language credential assignments and encrypted private keys are red
 	assert.equal(text.includes("hunter2"), false);
 	assert.equal(text.includes("private-material"), false);
 	assert.equal((text.match(/\[REDACTED_CREDENTIAL\]/g) ?? []).length, 2);
+});
+
+test("conversational username and password values are redacted", () => {
+	const input = "Log in with username logistics1 and password letava to view the orders.";
+	const minimized = minimizeText(input);
+	assert.equal(minimized.includes("logistics1"), false);
+	assert.equal(minimized.includes("letava"), false);
+	assert.match(minimized, /username \[REDACTED_CREDENTIAL\].*password \[REDACTED_CREDENTIAL\]/);
+	for (const assignment of ["password was hunter2", "password should be hunter2", "username is alice", "username: alice"]) {
+		assert.equal(minimizeText(assignment).includes(assignment.split(/\s|: /).at(-1)), false);
+	}
+	for (const pair of ["username alice and password is hunter2", "username alice and password: hunter2", "username alice and password correct horse battery staple"]) {
+		const minimizedPair = minimizeText(pair);
+		assert.equal(minimizedPair.includes("alice"), false);
+		assert.equal(minimizedPair.includes("hunter2"), false);
+		assert.equal(minimizedPair.includes("correct horse"), false);
+	}
+	const ordinary = "Plan the password reset, username field, API key rotation, and client secret management.";
+	assert.equal(minimizeText(ordinary), ordinary);
+	assert.equal(minimizeText("The password is stored in Key Vault."), "The password is stored in Key Vault.");
+	assert.equal(minimizeText("Use password authentication to access staging."), "Use password authentication to access staging.");
+	assert.equal(minimizeText("Use the service using password correct horse battery staple."), "Use the service using password [REDACTED_CREDENTIAL]");
 });
 
 test("Azure bounds before sensitivity decisions and sends only redacted values", async () => {

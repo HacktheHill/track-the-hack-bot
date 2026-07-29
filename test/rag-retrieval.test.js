@@ -22,9 +22,9 @@ test("RAG sync embeds and stores cleaned retrieval documents", async () => {
 	const embedded = [];
 	const stored = [];
 	const rag = new OpenProjectRag(
-		{ OPENPROJECT_RAG_MODE: "shadow", categoryProjects: {}, teamRoles: {}, AZURE_OPENAI_EMBEDDING_DEPLOYMENT: "embedding", AZURE_OPENAI_EMBEDDING_DIMENSIONS: 1 },
+		{ OPENPROJECT_RAG_MODE: "shadow", AZURE_OPENAI_EMBEDDING_DEPLOYMENT: "embedding", AZURE_OPENAI_EMBEDDING_DIMENSIONS: 1 },
 		{
-			categoryProjectIds: async () => [], embeddingIsCurrent: async () => false,
+			embeddingIsCurrent: async () => false,
 			upsertEmbedding: async item => stored.push(item), deleteEmbeddingsExcept: async () => {}, recordEmbeddingSync: async () => {},
 		},
 		{

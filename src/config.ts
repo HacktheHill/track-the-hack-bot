@@ -28,7 +28,6 @@ const envSchema = z.object({
 	OPENPROJECT_AUTOMATION_MODE: z.enum(["off", "shadow", "review"]).default("off"),
 	OPENPROJECT_RAG_MODE: z.enum(["off", "shadow", "review"]).default("off"),
 	OPENPROJECT_AI_EVALUATION_RETENTION_DAYS: z.coerce.number().int().min(1).max(365).default(90),
-	OPENPROJECT_EXTERNAL_CATEGORY_ID: z.string().optional(),
 	OPENPROJECT_RAG_SYNC_INTERVAL_SECONDS: z.coerce.number().int().min(60).default(600),
 	OPENPROJECT_RAG_SIMILARITY_THRESHOLD: z.coerce.number().min(0).max(1).default(0.55),
 	OPENPROJECT_RUN_MIGRATIONS: z.string().default("false").transform(value => value.toLowerCase() === "true"),
@@ -59,10 +58,6 @@ export function loadIntegrationConfig() {
 	return {
 		...parsed.data,
 		userMap: jsonRecord<Record<string, number>>("OPENPROJECT_USER_MAP", {}),
-		categoryProjects: jsonRecord<Record<string, number>>(
-			"OPENPROJECT_CATEGORY_PROJECT_MAP",
-			{},
-		),
 		teamRoles: jsonRecord<Record<string, TeamMapping>>(
 			"OPENPROJECT_TEAM_ROLE_MAP",
 			{},
@@ -71,7 +66,6 @@ export function loadIntegrationConfig() {
 		excludedChannelIds: new Set([
 			...jsonRecord<string[]>("OPENPROJECT_BLOCKED_CHANNEL_IDS", []),
 			...jsonRecord<string[]>("OPENPROJECT_EXCLUDED_CHANNEL_IDS", []),
-			...(parsed.data.OPENPROJECT_EXTERNAL_CATEGORY_ID ? [parsed.data.OPENPROJECT_EXTERNAL_CATEGORY_ID] : []),
 		]),
 	};
 }

@@ -99,12 +99,14 @@ jobs:
               --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
               --name track-the-hack-bot \
               --image "$image"
-            if az containerapp job show --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" --name track-the-hack-bot-embeddings >/dev/null 2>&1; then
-              az containerapp job update \
-                --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-                --name track-the-hack-bot-embeddings \
-                --image "$image"
-            fi
+            for job in track-the-hack-bot-embeddings tth-bot-corpus-sync tth-bot-ai-evaluate; do
+              if az containerapp job show --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" --name "$job" >/dev/null 2>&1; then
+                az containerapp job update \
+                  --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+                  --name "$job" \
+                  --image "$image"
+              fi
+            done
             for attempt in $(seq 1 20); do
               revision="$(az containerapp show \
                 --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \

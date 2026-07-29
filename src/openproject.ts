@@ -264,10 +264,7 @@ export class OpenProjectClient {
 
 	async users() {
 		return this.cached("users", async () => {
-			const projectIds = new Set([
-				...Object.values(this.config.teamRoles ?? {}).map(mapping => mapping.projectId),
-				...Object.values(this.config.categoryProjects ?? {}),
-			]);
+			const projectIds = new Set(Object.values(this.config.teamRoles ?? {}).map(mapping => mapping.projectId));
 			const users = (await Promise.all([...projectIds].map(projectId => this.availableAssignees(projectId)))).flat();
 			return [...new Map(users.filter(user => user._type === "User" || !user._type).map(user => [user.id, user])).values()];
 		});

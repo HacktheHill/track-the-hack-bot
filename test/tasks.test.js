@@ -363,7 +363,7 @@ test("task creation exposes selectable fields and keeps description optional", (
 	assert.equal(options.find(option => option.name === "start_date").autocomplete, true);
 	assert.equal(options.find(option => option.name === "due_date").autocomplete, true);
 	assert.equal(options.some(option => option.name === "story_points"), false);
-	assert.equal(taskCommand.toJSON().options.some(option => option.name === "configure-category"), true);
+	assert.equal(taskCommand.toJSON().options.some(option => option.name === "configure-category"), false);
 	const metrics = taskCommand.toJSON().options.find(option => option.name === "metrics");
 	assert.deepEqual(metrics.options[0].choices.map(choice => choice.value), [7, 30, 90]);
 });

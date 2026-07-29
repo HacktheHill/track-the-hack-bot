@@ -202,12 +202,6 @@ export class Database {
 				metadata JSONB NOT NULL DEFAULT '{}',
 				created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 			);
-			CREATE TABLE IF NOT EXISTS discord_category_projects (
-				category_id TEXT PRIMARY KEY,
-				openproject_project_id INTEGER NOT NULL,
-				updated_by_discord_id TEXT NOT NULL,
-				updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-			);
 			CREATE TABLE IF NOT EXISTS task_drafts (
 				id UUID PRIMARY KEY,
 				kind TEXT NOT NULL,
@@ -286,21 +280,6 @@ export class Database {
 			CREATE INDEX IF NOT EXISTS scheduled_messages_due_idx
 				ON scheduled_messages(status, send_at, next_attempt_at)
 		`);
-		if (Object.keys(config.userMap).length === 0 && Object.keys(config.categoryProjects).length === 0) {
-			await this.pool.query(`
-				WITH applied AS (
-					INSERT INTO bot_migrations(name)
-					VALUES ('2026-07-29-clear-openproject-mappings')
-					ON CONFLICT DO NOTHING
-					RETURNING name
-				), deleted_users AS (
-					DELETE FROM discord_openproject_users
-					WHERE EXISTS (SELECT 1 FROM applied)
-				)
-				DELETE FROM discord_category_projects
-				WHERE EXISTS (SELECT 1 FROM applied)
-			`);
-		}
 		await this.pool.query("DROP TABLE IF EXISTS discord_channel_projects");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS permitted_reviewer_ids TEXT[] NOT NULL DEFAULT '{}'");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS metadata_inference JSONB NOT NULL DEFAULT '{}'");
@@ -389,14 +368,6 @@ export class Database {
 				 VALUES ($1,$2) ON CONFLICT(discord_user_id) DO UPDATE
 				 SET openproject_user_id=excluded.openproject_user_id, updated_at=now()`,
 				[discordId, openProjectId],
-			);
-		}
-		for (const [categoryId, projectId] of Object.entries(config.categoryProjects)) {
-			await this.pool.query(
-				`INSERT INTO discord_category_projects(category_id,openproject_project_id,updated_by_discord_id)
-				 VALUES($1,$2,'environment') ON CONFLICT(category_id) DO UPDATE SET
-				 openproject_project_id=excluded.openproject_project_id, updated_at=now()`,
-				[categoryId, projectId],
 			);
 		}
 		} finally {
@@ -511,31 +482,6 @@ export class Database {
 			 next_attempt_at=CASE WHEN $4::integer IS NULL THEN NULL ELSE now() + ($4::text || ' seconds')::interval END,
 			 updated_at=now() WHERE id=$1 AND status='processing'`,
 			[id, retryAfterSeconds ? "pending" : "failed", error.slice(0, 1000), retryAfterSeconds ?? null],
-		);
-	}
-
-	async categoryProject(categoryId: string) {
-		const result = await this.pool.query<{ openproject_project_id: number }>(
-			"SELECT openproject_project_id FROM discord_category_projects WHERE category_id=$1",
-			[categoryId],
-		);
-		return result.rows[0]?.openproject_project_id;
-	}
-
-	async categoryProjectIds() {
-		const result = await this.pool.query<{ openproject_project_id: number }>(
-			"SELECT DISTINCT openproject_project_id FROM discord_category_projects",
-		);
-		return result.rows.map(row => row.openproject_project_id);
-	}
-
-	async setCategoryProject(categoryId: string, projectId: number, actorId: string) {
-		await this.pool.query(
-			`INSERT INTO discord_category_projects(category_id,openproject_project_id,updated_by_discord_id)
-			 VALUES($1,$2,$3) ON CONFLICT(category_id) DO UPDATE SET
-			 openproject_project_id=excluded.openproject_project_id,
-			 updated_by_discord_id=excluded.updated_by_discord_id, updated_at=now()`,
-			[categoryId, projectId, actorId],
 		);
 	}
 

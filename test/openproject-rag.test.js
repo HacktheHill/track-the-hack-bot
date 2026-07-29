@@ -317,23 +317,22 @@ test("OpenProject comments upload images to the created activity", async () => {
 	}
 });
 
-test("RAG sync includes category projects configured in the database and records success", async () => {
+test("RAG sync includes every active project and records success", async () => {
 	const requestedProjects = [];
 	const syncStates = [];
 	const db = {
-		categoryProjectIds: async () => [30],
 		embeddingIsCurrent: async () => true,
 		deleteEmbeddingsExcept: async () => {},
 		recordEmbeddingSync: async error => syncStates.push(error ?? null),
 	};
 	const rag = new OpenProjectRag(
-		{ OPENPROJECT_RAG_MODE: "shadow", categoryProjects: { a: 10 }, teamRoles: { role: { projectId: 20 } } },
+		{ OPENPROJECT_RAG_MODE: "shadow" },
 		db,
-		{ projects: async () => [{ id: 40 }], workPackages: async projectId => { requestedProjects.push(projectId); return []; } },
+		{ projects: async () => [{ id: 20 }, { id: 40 }], workPackages: async projectId => { requestedProjects.push(projectId); return []; } },
 		{ enabled: true },
 	);
-	assert.deepEqual(await rag.sync(), { indexed: 0, projects: 4 });
-	assert.deepEqual(requestedProjects.sort((a, b) => a - b), [10, 20, 30, 40]);
+	assert.deepEqual(await rag.sync(), { indexed: 0, projects: 2 });
+	assert.deepEqual(requestedProjects.sort((a, b) => a - b), [20, 40]);
 	assert.deepEqual(syncStates, [null]);
 });
 

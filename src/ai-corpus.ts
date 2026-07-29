@@ -1,0 +1,141 @@
+import { createHash } from "node:crypto";
+import { z } from "zod";
+import { minimizeText } from "./azure-openai.js";
+
+export const CORPUS_SCHEMA_VERSION = "v1" as const;
+export const CORPUS_CASE_SCHEMA_VERSION = "v1" as const;
+
+export const corpusMessageSchema = z.object({
+	id: z.string().min(1),
+	channelId: z.string().optional(),
+	authorAlias: z.string().min(1),
+	text: z.string(),
+	timestamp: z.iso.datetime(),
+	replyTo: z.string().optional(),
+	contextRole: z.enum(["primary", "preceding", "subsequent", "thread_root", "reply_target", "referenced_history"]).optional(),
+	priority: z.boolean().optional(),
+	attachments: z.array(z.object({ id: z.string(), name: z.string(), contentType: z.string().optional(), url: z.url() })).optional(),
+});
+
+export const expectedProposalSchema = z.object({
+	action: z.enum(["create", "update", "complete", "reopen"]),
+	titleIncludes: z.array(z.string().trim().min(1)).min(1),
+	projectName: z.string().trim().min(1).nullable().optional(),
+	assigneeAlias: z.string().nullable().optional(),
+	dueDate: z.iso.date().nullable().optional(),
+	sourceMessageIds: z.array(z.string().min(1)).min(1),
+});
+
+export const corpusWindowSchema = z.object({
+	id: z.string().min(1),
+	mode: z.enum(["manual", "automatic"]),
+	messages: z.array(corpusMessageSchema).min(1),
+	metadata: z.object({ priorities: z.array(z.string()).optional(), sizes: z.array(z.string()).optional(), projects: z.array(z.string()).optional() }).optional(),
+	routing: z.object({ availableTargetSourceMessageIds: z.array(z.array(z.string()).min(1)).default([]) }).optional(),
+	expected: z.object({ proposals: z.array(expectedProposalSchema).max(5) }),
+}).superRefine((window, context) => {
+	const ids = new Set(window.messages.map(message => message.id));
+	if (ids.size !== window.messages.length) context.addIssue({ code: "custom", message: "Corpus message IDs must be unique." });
+	const focal = window.messages.filter(message => message.contextRole === "primary" || message.priority);
+	if (window.mode === "automatic" && focal.length !== 1) {
+		context.addIssue({ code: "custom", message: "Automatic evaluation windows require exactly one primary or priority focal message." });
+	}
+	if (window.mode === "manual" && !focal.length) {
+		context.addIssue({ code: "custom", message: "Manual evaluation windows require at least one primary or priority focal message." });
+	}
+	for (const proposal of window.expected.proposals) {
+		for (const id of proposal.sourceMessageIds) if (!ids.has(id)) context.addIssue({ code: "custom", message: `Expected proposal cites unknown message ${id}.` });
+	}
+});
+
+export const corpusCaseSchema = z.object({
+	schemaVersion: z.literal(CORPUS_CASE_SCHEMA_VERSION),
+	id: z.string().min(1).max(160).regex(/^[a-zA-Z0-9._-]+$/),
+	origin: z.object({
+		type: z.enum(["reviewed_proposal", "sampled_no_task", "manual_scenario"]),
+		extractionEventId: z.string().optional(),
+		fingerprint: z.string().optional(),
+	}),
+	window: corpusWindowSchema,
+	adjudication: z.object({
+		status: z.enum(["pending", "approved", "rejected"]),
+		notes: z.string().max(4000).default(""),
+		reviewedAt: z.iso.datetime().optional(),
+		reviewedBy: z.string().max(200).optional(),
+	}),
+	createdAt: z.iso.datetime(),
+	updatedAt: z.iso.datetime(),
+});
+
+export type CorpusWindow = z.infer<typeof corpusWindowSchema>;
+export type CorpusCase = z.infer<typeof corpusCaseSchema>;
+
+function sanitizeMetadata(value: unknown): unknown {
+	if (typeof value === "string") return minimizeText(value);
+	if (Array.isArray(value)) return value.map(sanitizeMetadata);
+	if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, sanitizeMetadata(item)]));
+	return value;
+}
+
+export function sanitizeCorpusWindow(value: CorpusWindow) {
+	const parsed = corpusWindowSchema.parse(value);
+	return corpusWindowSchema.parse({
+		...parsed,
+		messages: parsed.messages.map(message => ({
+			...message,
+			authorAlias: minimizeText(message.authorAlias),
+			text: minimizeText(message.text),
+			...(message.attachments ? { attachments: message.attachments.map(attachment => ({
+				...attachment,
+				name: minimizeText(attachment.name),
+				url: `https://example.invalid/attachment/${encodeURIComponent(attachment.id)}`,
+			})) } : {}),
+		})),
+		...(parsed.metadata ? { metadata: sanitizeMetadata(parsed.metadata) } : {}),
+			expected: { proposals: parsed.expected.proposals.map(proposal => ({
+			...proposal,
+			titleIncludes: proposal.titleIncludes.map(minimizeText),
+			...(proposal.projectName ? { projectName: minimizeText(proposal.projectName) } : {}),
+			...(proposal.assigneeAlias ? { assigneeAlias: minimizeText(proposal.assigneeAlias) } : {}),
+		})) },
+	});
+}
+
+export function sanitizeCorpusCase(value: CorpusCase) {
+	const parsed = corpusCaseSchema.parse(value);
+	return corpusCaseSchema.parse({
+		...parsed,
+		window: sanitizeCorpusWindow(parsed.window),
+		adjudication: { ...parsed.adjudication, notes: minimizeText(parsed.adjudication.notes) },
+	});
+}
+
+function canonicalValue(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(canonicalValue);
+	if (!value || typeof value !== "object") return value;
+	return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+		.sort(([left], [right]) => left.localeCompare(right))
+		.map(([key, item]) => [key, canonicalValue(item)]));
+}
+
+export function canonicalJson(value: unknown) {
+	return JSON.stringify(canonicalValue(value));
+}
+
+export function contentHash(value: unknown) {
+	return createHash("sha256").update(canonicalJson(value)).digest("hex");
+}
+
+export function parseCorpusJsonl(input: string) {
+	return input.split(/\r?\n/).map((line, index) => ({ line, index })).filter(item => item.line.trim()).map(({ line, index }) => {
+		try {
+			return corpusWindowSchema.parse(JSON.parse(line));
+		} catch (error) {
+			throw new Error(`Invalid corpus line ${index + 1}: ${(error as Error).message}`);
+		}
+	});
+}
+
+export function corpusJsonl(windows: CorpusWindow[]) {
+	return windows.map(window => JSON.stringify(corpusWindowSchema.parse(window))).join("\n") + (windows.length ? "\n" : "");
+}

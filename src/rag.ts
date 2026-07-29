@@ -165,12 +165,7 @@ export class OpenProjectRag {
 	async sync() {
 		if (!this.enabled) return { indexed: 0 };
 		try {
-			const projectIds = new Set([
-				...(await this.openProject.projects()).map(project => project.id),
-				...Object.values(this.config.categoryProjects),
-				...Object.values(this.config.teamRoles).map(mapping => mapping.projectId),
-				...await this.db.categoryProjectIds(),
-			]);
+			const projectIds = new Set((await this.openProject.projects()).map(project => project.id));
 			let indexed = 0;
 			for (const projectId of projectIds) {
 				const workPackages = await this.openProject.workPackages(projectId, "all");

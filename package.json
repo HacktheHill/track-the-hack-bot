@@ -6,10 +6,13 @@
 	"type": "module",
 	"scripts": {
 		"start": "node dist/bot.js",
-		"build": "tsc",
+		"build": "tsc && vite build",
 		"test": "npm run build && node --test test/*.test.js",
 		"evaluate:ai": "npm run build && node dist/evaluate-ai.js",
 		"export:ai-corpus": "npm run build && node dist/export-ai-corpus.js",
+		"sync:ai-corpus": "npm run build && node dist/sync-ai-corpus.js",
+		"corpus:ui": "npm run build && node dist/ai-corpus-server.js",
+		"evaluate:ai-blob": "npm run build && node dist/evaluate-ai-blob.js",
 		"replay:ai": "npm run build && node dist/replay-ai.js",
 		"sync:embeddings": "npm run build && node dist/sync-embeddings.js",
 		"migrate:db": "npm run build && node dist/migrate-db.js",
@@ -18,11 +21,15 @@
 	},
 	"dependencies": {
 		"@azure/identity": "^4.13.1",
+		"@azure/storage-blob": "^12.33.0",
+		"@fontsource/rubik": "^5.3.0",
 		"body-parser": "^2.3.0",
 		"discord.js": "^14.26.5",
 		"dotenv": "^17.4.2",
 		"express": "^5.2.1",
 		"pg": "^8.22.0",
+		"react": "^19.2.8",
+		"react-dom": "^19.2.8",
 		"zod": "^4.4.3"
 	},
 	"engines": {
@@ -38,6 +45,10 @@
 		"@types/express": "^5.0.6",
 		"@types/node": "^24.13.3",
 		"@types/pg": "^8.20.0",
-		"typescript": "^7.0.2"
+		"@types/react": "^19.2.17",
+		"@types/react-dom": "^19.2.3",
+		"@vitejs/plugin-react": "^6.0.4",
+		"typescript": "^7.0.2",
+		"vite": "^8.1.5"
 	}
 }

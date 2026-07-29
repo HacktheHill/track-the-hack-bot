@@ -10,7 +10,8 @@ Automatic evaluation mirrors the production two-stage pipeline. The first model
 call extracts recall-oriented candidates. The second independently assesses each
 candidate for activated specific work, remaining work or a trackable transition,
 durability, decision readiness, contextual sensitivity, and supporting source
-message IDs. A candidate is eligible only when every positive criterion passes,
+message IDs. It also classifies the sensitivity of the complete message window.
+A candidate is eligible only when every positive criterion passes,
 the sensitivity result is `safe`, and its support is grounded in the bounded
 input.
 
@@ -28,7 +29,57 @@ as `N/A` and lists sanitized provider error categories. Deterministic client and
 access failures such as HTTP 403 and 404 are not retried; throttling, transient
 server failures, timeouts, and network failures use the configured retry budget.
 
-## Review-derived corpus
+## Corpus review desk
+
+The canonical corpus is stored as independently versioned case documents under
+`cases/` in the private `ai-evaluation` Blob container. The production sync job
+adds safe review-derived and sampled `no_task` cases as `pending`; it never
+admits a sampled negative without an explicit safe whole-window assessment.
+Review-derived windows retain only candidate source/support messages. Source
+changes preserve notes but reset the case to `pending`; sensitive blocks,
+sensitive overrides, and unsafe input are not synchronized.
+
+Run the UI locally with an Azure identity that has **Storage Blob Data
+Contributor** on the corpus account:
+
+```bash
+az login
+AI_CORPUS_STORAGE_ACCOUNT_URL=https://tthbotcorpus51fa.blob.core.windows.net \
+  npm run corpus:ui
+```
+
+The UI binds to loopback, uses a per-launch request token, validates `Host` and
+`Origin`, applies a restrictive content security policy, and uses ETags to
+prevent silent concurrent overwrites. Blob versioning and soft delete provide
+recovery.
+
+Review states have distinct meanings:
+
+- `pending`: not part of evaluation;
+- `approved`: included in the immutable snapshot referenced by
+  `exports/current-manifest.json`; and
+- `rejected`: invalid corpus material, not a negative example.
+
+To label a valid negative scenario, approve it with an empty expected proposal
+list. **Export approved** writes an immutable JSONL snapshot and a digest- and
+case-version-bound current manifest.
+Start `tth-bot-ai-evaluate` manually before release decisions; reports are
+written under `reports/<run-id>/` and corpus text is not printed to logs.
+
+## Cost controls
+
+Per-case predictions are cached by corpus content, pipeline version, deployment,
+API version, context limit, image limit, and completion-token limit. Cached
+results contribute to quality metrics without new provider tokens or latency.
+During iteration, prefer `--case` or `--changed`; use `--full` for an explicit
+release run and `--fresh` only to bypass compatible cache entries.
+
+`AI_EVAL_MAX_UNCACHED_CASES` defaults to 25 and blocks larger accidental runs.
+The corpus sync job runs daily at 0.25 vCPU/0.5 GiB, while evaluation is manual
+and scales to zero. The embedding safety job runs daily because the always-on
+bot already performs incremental synchronization every ten minutes.
+
+## Legacy file export
 
 Proposal reviews collected after the current database migration can be exported
 without manually writing JSONL:

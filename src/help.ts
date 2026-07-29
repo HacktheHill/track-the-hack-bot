@@ -89,11 +89,11 @@ This bot helps manage and coordinate activities across Hack the Hill's Discord s
 							{
 								name: "OpenProject tasks",
 								value: `
-	Members can use task commands only in this Organizer server. \`/task create\` uses this channel category's project by default; title is required and description, people, priority, size, and dates are optional. Choose from the listed project, priority, and size values. Dates offer Today and the next 30 days as autocomplete suggestions (Discord has no native date picker).
+	Members can use task commands only in this Organizer server. \`/task create\` matches the channel name, then its category name, to an active OpenProject project; if neither matches, one unambiguous project from the assignee's team (or an explicitly selected accountable person's team when there is no assignee) is used. Choose a project manually when no deterministic default exists. Dates offer Today and the next 30 days as autocomplete suggestions (Discord has no native date picker).
 	\`/task view|assign|reschedule|close|reopen|announce\`: Manage or re-post an existing task without opening OpenProject.
 	Message → Apps → \`Create OpenProject task\`: Start a task from a message, choose a project/assignee, and include its backlink.
 	Message → Apps → \`Draft OpenProject task with AI\`: Create an editable, private proposal in an AI-enabled channel; it never creates a task without review.
-	\`/task configure-category\`, \`/task link-user\`, and \`/task reconcile\` are organizer-only setup/recovery commands.
+	\`/task link-user\` and \`/task reconcile\` are organizer-only setup/recovery commands.
 	\`/task metrics\`: Show organizer-only AI proposal quality for the last 7, 30, or 90 days without exposing message content.
 	\`/schedule create|list|cancel\`: Schedule a message in the current channel using your saved display name and avatar. Time examples: \`2 hours\`, \`10am\`, \`tomorrow 10am\`, or an ISO timestamp.
 `,
@@ -170,11 +170,11 @@ Ce bot aide à gérer et coordonner les activités sur les serveurs Discord de H
 							{
 								name: "Tâches OpenProject",
 								value: `
-Les membres de ce serveur d'organisateurs peuvent utiliser les commandes de tâches. \`/task create\` utilise par défaut le projet associé à la catégorie du canal; le titre est requis et la description, les personnes, la priorité, la taille et les dates sont facultatives. Choisissez parmi les projets, priorités et tailles proposés. Les dates proposent aujourd'hui et les 30 prochains jours par autocomplétion (sans sélecteur de date natif).
+Les membres de ce serveur d'organisateurs peuvent utiliser les commandes de tâches. \`/task create\` cherche d'abord un projet OpenProject portant le nom du canal, puis celui de sa catégorie; sinon, un seul projet non ambigu associé à l'équipe de la personne assignée (ou de la personne explicitement responsable en l'absence d'assignation) est utilisé. Choisissez le projet manuellement si aucun défaut déterministe n'existe. Les dates proposent aujourd'hui et les 30 prochains jours par autocomplétion (sans sélecteur de date natif).
 	\`/task view|assign|reschedule|close|reopen|announce\`: Gère ou republie une tâche existante sans ouvrir OpenProject.
 	Message → Applications → \`Create OpenProject task\`: Démarre une tâche à partir d'un message, permet de choisir le projet/l'assigné et ajoute son lien.
 	Message → Applications → \`Draft OpenProject task with AI\`: Produit une proposition privée et modifiable dans un canal autorisé; aucune tâche n'est créée sans révision.
-	\`/task configure-category\`, \`/task link-user\` et \`/task reconcile\` sont des commandes réservées aux organisateurs.
+	\`/task link-user\` et \`/task reconcile\` sont des commandes réservées aux organisateurs.
 	\`/task metrics\`: Affiche aux organisateurs les mesures de qualité des propositions IA des 7, 30 ou 90 derniers jours, sans contenu des messages.
 	\`/schedule create|list|cancel\`: Planifie un message dans le canal actuel avec votre nom d'affichage et votre avatar enregistrés. Exemples: \`2 hours\`, \`10am\`, \`tomorrow 10am\` ou une date ISO.
 `,

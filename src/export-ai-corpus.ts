@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import pg from "pg";
 import { z } from "zod";
-import { corpusWindowSchema } from "./evaluate-ai.js";
+import { corpusWindowSchema, sanitizeCorpusWindow } from "./ai-corpus.js";
 
 const { Pool } = pg;
 
@@ -12,7 +12,7 @@ const configSchema = z.object({
 	DATABASE_URL: z.string().min(1),
 });
 
-const exportRowSchema = z.object({
+export const exportRowSchema = z.object({
 	id: z.coerce.string(),
 	source: z.enum(["manual", "automatic"]),
 	input_snapshot: z.array(z.object({
@@ -40,7 +40,7 @@ const exportRowSchema = z.object({
 	})),
 });
 
-type ExportRow = z.infer<typeof exportRowSchema>;
+export type ExportRow = z.infer<typeof exportRowSchema>;
 
 const negativeDismissalReasons = new Set([
 	"not_actionable",
@@ -72,7 +72,7 @@ function rowAssessments(row: ExportRow) {
 	return row.message_assessments ?? (Array.isArray(row.decision?.candidateAssessments) ? row.decision.candidateAssessments : []);
 }
 
-function candidateAction(row: ExportRow, sourceMessageIds: string[]) {
+function candidateAssessment(row: ExportRow, sourceMessageIds: string[]) {
 	const assessments = rowAssessments(row);
 	if (!Array.isArray(assessments)) return undefined;
 	const expectedIds = [...sourceMessageIds].sort();
@@ -81,8 +81,12 @@ function candidateAction(row: ExportRow, sourceMessageIds: string[]) {
 		const ids: string[] = assessment.sourceMessageIds.filter((id: unknown): id is string => typeof id === "string").sort();
 		return ids.length === expectedIds.length && ids.every((id, index) => id === expectedIds[index]);
 	});
-	if (!matching || typeof matching !== "object" || !("proposedAction" in matching)) return undefined;
-	return z.enum(["create", "update", "complete", "reopen"]).safeParse(matching.proposedAction).data;
+	return matching && typeof matching === "object" ? matching : undefined;
+}
+
+function candidateAction(row: ExportRow, sourceMessageIds: string[]) {
+	const assessment = candidateAssessment(row, sourceMessageIds);
+	return assessment && "proposedAction" in assessment ? z.enum(["create", "update", "complete", "reopen"]).safeParse(assessment.proposedAction).data : undefined;
 }
 
 export function buildCorpusWindow(input: ExportRow) {
@@ -91,7 +95,8 @@ export function buildCorpusWindow(input: ExportRow) {
 	if (row.source === "manual" && row.decision?.groupedCount !== 1) return undefined;
 	const extractionOptions = row.decision?.extractionOptions;
 	if (extractionOptions && typeof extractionOptions === "object" && "allowSensitiveContent" in extractionOptions && extractionOptions.allowSensitiveContent === true) return undefined;
-	if (rowAssessments(row).some(assessment => assessment && typeof assessment === "object" && "sensitivity" in assessment && assessment.sensitivity !== "safe")) return undefined;
+	const assessments = rowAssessments(row);
+	if (!assessments.length || assessments.some(assessment => !assessment || typeof assessment !== "object" || !("sensitivity" in assessment) || assessment.sensitivity !== "safe")) return undefined;
 	const messageIds = new Map(row.input_snapshot.map((message, index) => [message.id, `m${index + 1}`]));
 	const attachmentIds = new Map(row.input_snapshot.flatMap(message => (message.attachments ?? []).map(attachment => `${message.id}:${attachment.id}`))
 		.map((id, index) => [id, `a${index + 1}`]));
@@ -112,9 +117,14 @@ export function buildCorpusWindow(input: ExportRow) {
 	}));
 	const expected = [];
 	const routingTargets: string[][] = [];
+	const relevantMessageIds = new Set<string>();
 	for (const proposal of row.proposals) {
 		if (proposal.status === "dismissed") {
 			if (!proposal.dismissalReason || !negativeDismissalReasons.has(proposal.dismissalReason)) return undefined;
+			const assessment = candidateAssessment(row, proposal.sourceMessageIds);
+			if (!assessment || candidateAction(row, proposal.sourceMessageIds) !== proposal.action) return undefined;
+			proposal.sourceMessageIds.forEach(id => relevantMessageIds.add(id));
+			if (Array.isArray(assessment.supporting_source_message_ids)) assessment.supporting_source_message_ids.forEach((id: unknown) => typeof id === "string" && relevantMessageIds.add(id));
 			continue;
 		}
 		if (proposal.status !== "created") return undefined;
@@ -130,6 +140,9 @@ export function buildCorpusWindow(input: ExportRow) {
 		if (candidateAction(row, rawSourceIds) !== initialAction) return undefined;
 		const sourceMessageIds = rawSourceIds.map(id => messageIds.get(id)).filter((id): id is string => Boolean(id));
 		if (!sourceMessageIds.length || sourceMessageIds.length !== rawSourceIds.length) return undefined;
+		rawSourceIds.forEach(id => relevantMessageIds.add(id));
+		const assessment = candidateAssessment(row, rawSourceIds);
+		if (assessment && Array.isArray(assessment.supporting_source_message_ids)) assessment.supporting_source_message_ids.forEach((id: unknown) => typeof id === "string" && relevantMessageIds.add(id));
 		expected.push({
 			action,
 			titleIncludes: evaluationTitleTerms(title),
@@ -139,14 +152,55 @@ export function buildCorpusWindow(input: ExportRow) {
 		if (action !== "create" && targetWorkPackageId) routingTargets.push(sourceMessageIds);
 	}
 	const metadata = row.decision?.extractionMetadata;
-	return corpusWindowSchema.parse({
+	const window = corpusWindowSchema.safeParse({
 		id: `review-${row.id}`,
 		mode: "automatic",
-		messages,
+		messages: messages.filter((_, index) => relevantMessageIds.has(row.input_snapshot[index]!.id)),
 		...(metadata && typeof metadata === "object" ? { metadata } : {}),
 		...(routingTargets.length ? { routing: { availableTargetSourceMessageIds: routingTargets } } : {}),
 		expected: { proposals: expected },
 	});
+	return window.success ? sanitizeCorpusWindow(window.data) : undefined;
+}
+
+export async function loadReviewedExtractionRows(pool: Pick<pg.Pool, "query">, days: number) {
+	const result = await pool.query(
+		`SELECT e.id,e.source,e.input_snapshot,e.message_assessments,e.decision,
+			jsonb_agg(jsonb_build_object(
+				'status',p.status,
+				'reviewOutcome',p.review_outcome,
+				'dismissalReason',p.dismissal_reason,
+				'action',p.action,
+				'targetWorkPackageId',p.target_work_package_id,
+				'title',p.title,
+				'sourceMessageIds',p.source_message_ids,
+				'initialSnapshot',initial_revision.payload,
+				'finalSnapshot',final_revision.payload
+			) ORDER BY p.created_at,p.id) AS proposals
+		 FROM ai_extraction_events e
+		 JOIN task_proposal_extractions link ON link.extraction_event_id=e.id
+		 JOIN task_proposals p ON p.id=link.proposal_id
+		 LEFT JOIN LATERAL (
+			SELECT payload FROM task_proposal_revisions
+			WHERE proposal_id=p.id AND phase='initial' ORDER BY revision ASC LIMIT 1
+		 ) initial_revision ON TRUE
+		 LEFT JOIN LATERAL (
+			SELECT payload FROM task_proposal_revisions
+			WHERE proposal_id=p.id AND phase='final' ORDER BY revision DESC LIMIT 1
+		 ) final_revision ON TRUE
+		 WHERE e.schema_version='v3' AND e.input_snapshot IS NOT NULL
+		 AND e.created_at >= now() - ($1::text || ' days')::interval
+		 AND NOT EXISTS (
+			SELECT 1 FROM task_proposal_extractions event_link
+			JOIN task_proposal_extractions newer ON newer.proposal_id=event_link.proposal_id
+			AND newer.extraction_event_id > event_link.extraction_event_id
+			WHERE event_link.extraction_event_id=e.id
+		 )
+		 GROUP BY e.id,e.source,e.input_snapshot,e.message_assessments,e.decision
+		 ORDER BY e.id`,
+		[days],
+	);
+	return result.rows.map(row => exportRowSchema.parse(row));
 }
 
 async function main() {
@@ -157,50 +211,15 @@ async function main() {
 	const config = configSchema.parse(process.env);
 	const pool = new Pool({ connectionString: config.DATABASE_URL, max: 1 });
 	try {
-		const result = await pool.query(
-			`SELECT e.id,e.source,e.input_snapshot,e.message_assessments,e.decision,
-				jsonb_agg(jsonb_build_object(
-					'status',p.status,
-					'reviewOutcome',p.review_outcome,
-					'dismissalReason',p.dismissal_reason,
-					'action',p.action,
-					'targetWorkPackageId',p.target_work_package_id,
-					'title',p.title,
-					'sourceMessageIds',p.source_message_ids,
-					'initialSnapshot',initial_revision.payload,
-					'finalSnapshot',final_revision.payload
-				) ORDER BY p.created_at,p.id) AS proposals
-			 FROM ai_extraction_events e
-			 JOIN task_proposal_extractions link ON link.extraction_event_id=e.id
-			 JOIN task_proposals p ON p.id=link.proposal_id
-			 LEFT JOIN LATERAL (
-				SELECT payload FROM task_proposal_revisions
-				WHERE proposal_id=p.id AND phase='initial' ORDER BY revision ASC LIMIT 1
-			 ) initial_revision ON TRUE
-			 LEFT JOIN LATERAL (
-				SELECT payload FROM task_proposal_revisions
-				WHERE proposal_id=p.id AND phase='final' ORDER BY revision DESC LIMIT 1
-			 ) final_revision ON TRUE
-			 WHERE e.schema_version='v3' AND e.input_snapshot IS NOT NULL
-			 AND e.created_at >= now() - ($1::text || ' days')::interval
-			 AND NOT EXISTS (
-				SELECT 1 FROM task_proposal_extractions event_link
-				JOIN task_proposal_extractions newer ON newer.proposal_id=event_link.proposal_id
-				AND newer.extraction_event_id > event_link.extraction_event_id
-				WHERE event_link.extraction_event_id=e.id
-			 )
-			 GROUP BY e.id,e.source,e.input_snapshot,e.message_assessments,e.decision
-			 ORDER BY e.id`,
-			[days],
-		);
-		const windows = result.rows.map(row => buildCorpusWindow(exportRowSchema.parse(row))).filter(window => window !== undefined);
+		const rows = await loadReviewedExtractionRows(pool, days);
+		const windows = rows.map(row => buildCorpusWindow(row)).filter(window => window !== undefined);
 		const output = windows.map(window => JSON.stringify(window)).join("\n");
 		const absoluteOutputPath = resolve(outputPath);
 		await chmod(absoluteOutputPath, 0o600).catch((error: NodeJS.ErrnoException) => {
 			if (error.code !== "ENOENT") throw error;
 		});
 		await writeFile(absoluteOutputPath, output ? `${output}\n` : "", { mode: 0o600 });
-		console.log(JSON.stringify({ reviewedExtractionEvents: result.rows.length, exportedWindows: windows.length, excludedWindows: result.rows.length - windows.length }));
+		console.log(JSON.stringify({ reviewedExtractionEvents: rows.length, exportedWindows: windows.length, excludedWindows: rows.length - windows.length }));
 	} finally {
 		await pool.end();
 	}

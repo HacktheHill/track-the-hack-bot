@@ -33,6 +33,9 @@ import { OpenProjectClient, OpenProjectRequestError, openProjectAttachmentFileNa
 import { attachExtractionDiagnostics, automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, StructuredOutputError, type ExtractedTasks, type ExtractionResult, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
 import { composeOpenProjectMarkdown, describeProposalOperations, formatGeneratedTaskDescription, formatProposalContent, planExistingTaskOperations, sourceContentHash, taskReferencesAreValid, type MetadataFieldName, type ProposalMetadataPatch } from "./task-proposals.js";
+import { isExcludedChannel, projectIdForName, projectIdForProposedOwner, projectIdForTeamRoles, projectIdFromChannelNames, resolveProjectId } from "./project-resolution.js";
+
+export { isExcludedChannel } from "./project-resolution.js";
 
 export const taskCommand = new SlashCommandBuilder()
 	.setName("task")
@@ -97,11 +100,7 @@ export const taskCommand = new SlashCommandBuilder()
 		.addIntegerOption(option => option.setName("message_count").setDescription("Number of recent messages to inspect").setMinValue(1).setMaxValue(50)))
 	.addSubcommand(command => command.setName("link-user").setDescription("Map a Discord user to an OpenProject user")
 		.addUserOption(option => option.setName("discord_user").setDescription("Discord user").setRequired(true))
-		.addStringOption(option => option.setName("openproject_user").setDescription("OpenProject user").setRequired(true).setAutocomplete(true)))
-	.addSubcommand(command => command.setName("configure-category").setDescription("Set a category's default OpenProject project")
-		.addChannelOption(option => option.setName("category").setDescription("Discord category").addChannelTypes(ChannelType.GuildCategory).setRequired(true))
-		.addStringOption(option => option.setName("project").setDescription("OpenProject project").setRequired(true).setAutocomplete(true)),
-	);
+		.addStringOption(option => option.setName("openproject_user").setDescription("OpenProject user").setRequired(true).setAutocomplete(true)));
 
 export const taskMessageCommand = new ContextMenuCommandBuilder()
 	.setName("Create OpenProject task")
@@ -523,10 +522,6 @@ function matchedTeam(member: GuildMember | null, mappings: Record<string, TeamMa
 		.sort(([, a], [, b]) => (a.priority ?? 999) - (b.priority ?? 999))[0];
 }
 
-export function teamProjectId(member: GuildMember | null, mappings: Record<string, TeamMapping>) {
-	return matchedTeam(member, mappings)?.[1].projectId;
-}
-
 async function accountableFor(
 	assignee: GuildMember | null,
 	services: Services,
@@ -549,17 +544,21 @@ async function accountableFor(
 	return undefined;
 }
 
-async function requireCreator(interaction: ChatInputCommandInteraction | MessageContextMenuCommandInteraction | ModalSubmitInteraction | ButtonInteraction, services: Services) {
+async function requireTaskMember(interaction: ChatInputCommandInteraction | MessageContextMenuCommandInteraction | ModalSubmitInteraction | ButtonInteraction, services: Services) {
 	if (!interaction.inGuild() || !isOrganizerGuild(services.config, interaction.guildId)) {
 		throw new Error("OpenProject tasks are available only in the Organizer Discord server.");
-	}
-	const externalCategory = services.config.OPENPROJECT_EXTERNAL_CATEGORY_ID;
-	if (externalCategory && await isExcludedChannel(interaction.channelId!, interaction.guild!, new Set([externalCategory]))) {
-		throw new Error("OpenProject task operations are disabled in the external category.");
 	}
 	const member = await interaction.guild!.members.fetch(interaction.user.id);
 	if (!member.roles.cache.has(services.config.ORGANIZER_GUILD_MEMBER_ROLE_ID)) {
 		throw new Error("You need the Members role to create or manage OpenProject tasks.");
+	}
+	return member;
+}
+
+async function requireCreator(interaction: ChatInputCommandInteraction | MessageContextMenuCommandInteraction | ModalSubmitInteraction | ButtonInteraction, services: Services) {
+	const member = await requireTaskMember(interaction, services);
+	if (await isExcludedChannel(interaction.channelId!, interaction.guild!, services.config.excludedChannelIds)) {
+		throw new Error("OpenProject task creation is disabled in this channel category.");
 	}
 	return member;
 }
@@ -644,31 +643,6 @@ export function proposalReviewComponents(
 	return rows;
 }
 
-export async function isExcludedChannel(channelId: string, guild: Guild, excludedIds: ReadonlySet<string>) {
-	let channel = await guild.channels.fetch(channelId).catch(() => null);
-	for (let depth = 0; channel && depth < 5; depth++) {
-		if (excludedIds.has(channel.id)) return true;
-		if (!channel.parentId) break;
-		channel = await guild.channels.fetch(channel.parentId).catch(() => null);
-	}
-	return false;
-}
-
-async function categoryIdFor(channelId: string, guild: Guild) {
-	let channel = await guild.channels.fetch(channelId);
-	for (let depth = 0; channel && depth < 3; depth++) {
-		if (channel.type === ChannelType.GuildCategory) return channel.id;
-		if (!channel.parentId) return undefined;
-		channel = await guild.channels.fetch(channel.parentId);
-	}
-	return undefined;
-}
-
-async function categoryProject(channelId: string, guild: Guild, services: Services) {
-	const categoryId = await categoryIdFor(channelId, guild);
-	return categoryId ? await services.db.categoryProject(categoryId) ?? services.config.categoryProjects[categoryId] : undefined;
-}
-
 async function allowedProjectIds(channelId: string, member: GuildMember, services: Services) {
 	void channelId;
 	void member;
@@ -680,7 +654,7 @@ export function projectAccessAllowed(projectId: number, projects: readonly { id:
 }
 
 async function requireProjectAccess(interaction: TaskInteraction | MessageContextMenuCommandInteraction, projectId: number, services: Services) {
-	await requireCreator(interaction, services);
+	await requireTaskMember(interaction, services);
 	if (!projectAccessAllowed(projectId, await services.openProject.projects())) {
 		throw new Error("The selected OpenProject project is inactive or inaccessible.");
 	}
@@ -707,18 +681,19 @@ async function resolveProject(
 	channelId: string,
 	guild: Guild,
 	assignee: GuildMember | null,
+	accountable: GuildMember | null,
 	services: Services,
 ) {
+	const projects = await services.openProject.projects();
 	if (explicit) {
 		if (/^\d+$/.test(explicit)) return Number(explicit);
-		const normalized = explicit.trim().toLocaleLowerCase();
-		const matches = (await services.openProject.projects()).filter(project => project.name.toLocaleLowerCase() === normalized);
-		if (matches.length === 1) return matches[0].id;
+		const projectId = projectIdForName(explicit, projects);
+		if (projectId) return projectId;
 		throw new Error("Select a valid OpenProject project name.");
 	}
-	const categoryDefault = await categoryProject(channelId, guild, services);
-	if (categoryDefault) return categoryDefault;
-	return teamProjectId(assignee, services.config.teamRoles);
+	return resolveProjectId(channelId, guild, projects, {
+		teamProjectId: projectIdForProposedOwner(assignee, accountable, services.config.teamRoles),
+	});
 }
 
 export function databaseDate(value: unknown) {
@@ -773,8 +748,9 @@ async function createAndAnnounce(args: {
 	if (assignee && !assigneeOpenProjectId) throw new Error("The assignee is not mapped to OpenProject.");
 	const accountableOverride = args.accountableId ? await services.db.openProjectUserId(args.accountableId) : undefined;
 	if (args.accountableId && !accountableOverride) throw new Error("The accountable user is not mapped to OpenProject.");
-	const projectId = await resolveProject(args.projectText, interaction.channelId!, guild, assignee, services);
-	if (!projectId) throw new Error("Select a project; no channel or assignee-team default is configured.");
+	const accountableMember = !assignee && args.accountableId ? await guild.members.fetch(args.accountableId).catch(() => null) : null;
+	const projectId = await resolveProject(args.projectText, interaction.channelId!, guild, assignee, accountableMember, services);
+	if (!projectId) throw new Error("Select a project; the channel, category, and proposed owner do not resolve to one active OpenProject project.");
 	await requireProjectAccess(interaction, projectId, services);
 	const projects = await services.openProject.projects();
 	const project = projects.find(item => item.id === projectId);
@@ -866,8 +842,10 @@ async function showCreationPreview(
 	draft: Omit<CreationDraft, "userId" | "channelId" | "expiresAt">,
 ) {
 	const assignee = draft.assigneeId ? await interaction.guild!.members.fetch(draft.assigneeId).catch(() => null) : null;
+	const accountable = !assignee && draft.accountableId ? await interaction.guild!.members.fetch(draft.accountableId).catch(() => null) : null;
 	const explicitProjectId = draft.projectText && /^\d+$/.test(draft.projectText) ? Number(draft.projectText) : undefined;
-	const projectId = explicitProjectId ?? await resolveProject(draft.projectText, interaction.channelId!, interaction.guild!, assignee, services);
+	const projectId = explicitProjectId ?? await resolveProject(draft.projectText, interaction.channelId!, interaction.guild!, assignee, accountable, services);
+	if (!projectId) throw new Error("Select a project explicitly because the channel, category, and proposed owner do not resolve to one active OpenProject project.");
 	const priorities = await services.openProject.priorities();
 	const sizes = projectId ? await services.openProject.sizeOptions(projectId) : [];
 	const sizeId = draft.sizeHref ? Number(draft.sizeHref.split("/").at(-1)) : undefined;
@@ -917,7 +895,7 @@ async function showCreationPreview(
 		.filter(Boolean).join(" · ");
 	const description = enrichedDraft.description.trim() ? `\n\n${enrichedDraft.description.slice(0, 1200)}` : "";
 	await interaction.editReply({
-		content: `Review before creating:\n**${enrichedDraft.title}**\nProject: ${project?.name ?? "resolved from category/team"}${metadataSummary ? `\n${metadataSummary}` : ""}${dates}${description}`,
+		content: `Review before creating:\n**${enrichedDraft.title}**\nProject: ${project?.name ?? "select manually"}${metadataSummary ? `\n${metadataSummary}` : ""}${dates}${description}`,
 		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
 			new ButtonBuilder().setCustomId(`op-create-final:${id}`).setLabel("Create").setStyle(ButtonStyle.Success),
 			new ButtonBuilder().setCustomId(`op-edit-final:${id}`).setLabel("Edit").setStyle(ButtonStyle.Primary),
@@ -933,8 +911,7 @@ async function handleAutocomplete(interaction: AutocompleteInteraction, services
 	let choices: Array<{ name: string; value: string }> = [];
 	if (focused.name === "project") {
 		if (!interaction.inGuild()) return interaction.respond([]);
-		const externalCategory = services.config.OPENPROJECT_EXTERNAL_CATEGORY_ID;
-		if (externalCategory && await isExcludedChannel(interaction.channelId, interaction.guild!, new Set([externalCategory]))) return interaction.respond([]);
+		if (await isExcludedChannel(interaction.channelId, interaction.guild!, services.config.excludedChannelIds)) return interaction.respond([]);
 		choices = (await services.openProject.projects()).map(project => ({ name: project.name, value: String(project.id) }));
 	} else if (focused.name === "priority") {
 		choices = (await services.openProject.priorities()).map(priority => ({ name: priority.name, value: String(priority.id) }));
@@ -942,9 +919,10 @@ async function handleAutocomplete(interaction: AutocompleteInteraction, services
 		choices = dateChoices(query, focused.name === "start_date", new Date(), services.config.BOT_TIME_ZONE);
 	} else if (focused.name === "size") {
 		const explicitProject = interaction.options.getString("project");
+		const projects = await services.openProject.projects();
 		const projectId = explicitProject && /^\d+$/.test(explicitProject)
 			? Number(explicitProject)
-			: await categoryProject(interaction.channelId, interaction.guild!, services);
+			: await projectIdFromChannelNames(interaction.channelId, interaction.guild!, projects);
 		if (projectId) choices = (await services.openProject.sizeOptions(projectId)).map(option => ({ name: option.value, value: `/api/v3/custom_options/${option.id}` }));
 	} else if (focused.name === "openproject_user") {
 		choices = (await services.openProject.linkableUsers()).map(user => ({
@@ -993,19 +971,8 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 		await interaction.editReply(`Mapped <@${discordUser.id}> to OpenProject user **${user.name}**.`);
 		return;
 	}
-	if (subcommand === "configure-category") {
-		requireOrganizer(interaction, services);
-		const projectId = Number(interaction.options.getString("project", true));
-		const category = interaction.options.getChannel("category", true);
-		if (category.type !== ChannelType.GuildCategory) throw new Error("Select a Discord category.");
-		const project = (await services.openProject.projects()).find(item => item.id === projectId);
-		if (!project) throw new Error("Select a valid active OpenProject project.");
-		await services.db.setCategoryProject(category.id, projectId, interaction.user.id);
-		await interaction.editReply(`Category **${category.name}** now defaults to **${project.name}**.`);
-		return;
-	}
-	await requireCreator(interaction, services);
 	if (subcommand === "extract") {
+		await requireCreator(interaction, services);
 		requireOrganizer(interaction, services);
 		if (!services.extractor.enabled) throw new Error("No task extraction provider is configured.");
 		const limit = interaction.options.getInteger("message_count") ?? 20;
@@ -1090,6 +1057,7 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 		await interaction.editReply(`${subcommand === "close" ? "Closed" : "Reopened"} ${services.openProject.workPackageUrl(id)}.`);
 		return;
 	}
+	await requireCreator(interaction, services);
 	const defaults = defaultTaskDates(new Date(), services.config.OPENPROJECT_DEFAULT_START_TODAY, services.config.OPENPROJECT_DEFAULT_DUE_DAYS, services.config.BOT_TIME_ZONE);
 	const priority = interaction.options.getString("priority") ? Number(interaction.options.getString("priority")) : undefined;
 	const explicitDueDate = interaction.options.getString("due_date") ?? undefined;
@@ -1117,7 +1085,7 @@ async function handleContext(interaction: MessageContextMenuCommandInteraction, 
 	const allowed = await allowedProjectIds(interaction.channelId, member, services);
 	const projects = (await services.openProject.projects()).filter(project => allowed.has(project.id));
 	if (!projects.length) throw new Error("No OpenProject project is configured for this channel or your team.");
-	const defaultProject = await resolveProject(null, interaction.channelId, interaction.guild!, null, services);
+	const defaultProject = await resolveProject(null, interaction.channelId, interaction.guild!, null, null, services);
 	const payload = {
 		userId: interaction.user.id, channelId: interaction.channelId, targetId: interaction.targetId,
 		title: interaction.targetMessage.content.split("\n")[0].slice(0, 255) || "Discord follow-up",
@@ -1585,13 +1553,14 @@ async function completeAiContext(
 	context: CollectedContext,
 	allowSensitiveContent = false,
 ) {
-	const tentativeProjectId = await categoryProject(interaction.channelId!, interaction.guild!, services);
+	const projects = await services.openProject.projects();
+	const tentativeProjectId = await projectIdFromChannelNames(interaction.channelId!, interaction.guild!, projects);
 	const priorities = await services.openProject.priorities();
 	const tentativeSizes = tentativeProjectId ? await services.openProject.sizeOptions(tentativeProjectId) : [];
 	const extraction = await services.extractor.extract(context.messages, {
 		allowSensitiveContent,
 		mode: "manual",
-		metadata: { priorities: priorities.map(priority => priority.name), sizes: tentativeSizes.map(size => size.value) },
+		metadata: { priorities: priorities.map(priority => priority.name), sizes: tentativeSizes.map(size => size.value), projects: projects.map(project => project.name) },
 	});
 	const { result, deployment } = extraction;
 	const inputSnapshot = extraction.inputMessages.map(({ containedSensitiveData: _, ...message }) => message);
@@ -1626,8 +1595,8 @@ async function completeAiContext(
 			proposedAction: task.proposed_action,
 			sourceMessageIds: task.source_message_ids,
 		})),
-		pipelineVersion: "v3",
-		extractionPromptVersion: "candidate-v3",
+		pipelineVersion: "v4",
+		extractionPromptVersion: "candidate-v4",
 		gatePromptVersion: "automatic-precision-v1",
 		stages: {
 			extraction: { deployment: extraction.deployment, latencyMs: extraction.latencyMs - gate.latencyMs },
@@ -1684,9 +1653,13 @@ async function completeAiCandidate(
 	const assigneeId = context.explicitAssigneeId ?? (candidate.assignee_alias ? context.reverseAliases.get(candidate.assignee_alias) : undefined);
 	const accountableId = context.primaryAuthorId;
 	const assigneeMember = assigneeId ? await interaction.guild!.members.fetch(assigneeId).catch(() => null) : null;
-	const initialProjectId = await resolveProject(null, interaction.channelId, interaction.guild!, assigneeMember, services);
+	const projects = await services.openProject.projects();
+	const initialProjectId = await resolveProjectId(interaction.channelId, interaction.guild!, projects, {
+		teamProjectId: projectIdForTeamRoles(assigneeMember, services.config.teamRoles),
+		inferredProjectName: candidate.project_name,
+	});
 	let projectId = initialProjectId;
-	const project = projectId ? (await services.openProject.projects()).find(item => item.id === projectId) : undefined;
+	const project = projectId ? projects.find(item => item.id === projectId) : undefined;
 	let priority = candidate.priority_name
 		? priorities.find(item => item.name.toLocaleLowerCase() === candidate.priority_name!.toLocaleLowerCase())
 		: undefined;

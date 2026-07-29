@@ -1,11 +1,12 @@
-import { ChannelType, Client, Message, type MessageCreateOptions } from "discord.js";
+import { Client, Message, type MessageCreateOptions } from "discord.js";
 import { automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, SensitiveContentError, StructuredOutputError, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
 import { isOrganizerGuild, type IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient, titlesLikelyDuplicate, workPackageMarkdownLink } from "./openproject.js";
-import { AI_CONTEXT_GAP_MS, boundedDiscordContent, defaultAiDueDate, formatAiTaskDescription, inferCreationMetadata, proposalReviewComponents, relevantImageAttachments, teamProjectId } from "./tasks.js";
+import { AI_CONTEXT_GAP_MS, boundedDiscordContent, defaultAiDueDate, formatAiTaskDescription, inferCreationMetadata, proposalReviewComponents, relevantImageAttachments } from "./tasks.js";
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
 import { describeProposalOperations, formatProposalContent, planExistingTaskOperations, sourceContentHash, taskReferencesAreValid } from "./task-proposals.js";
+import { isExcludedChannel, projectIdForTeamRoles, projectIdFromChannelNames, resolveProjectId } from "./project-resolution.js";
 
 type AutomaticServices = { config: IntegrationConfig; db: Database; extractor: TaskExtractor; openProject: OpenProjectClient; rag?: OpenProjectRag };
 type Batch = { messages: Message[]; timer: NodeJS.Timeout };
@@ -103,29 +104,6 @@ async function enrichAutomaticContext(messages: Message[], focal: Message) {
 	return { messages: [...extras.values(), ...messages], roles };
 }
 
-async function categoryProject(message: Message, services: AutomaticServices) {
-	if (!message.inGuild()) return undefined;
-	let channel = await message.guild.channels.fetch(message.channelId);
-	for (let depth = 0; channel && depth < 3; depth++) {
-		if (channel.type === ChannelType.GuildCategory) {
-			return await services.db.categoryProject(channel.id) ?? services.config.categoryProjects[channel.id];
-		}
-		if (!channel.parentId) return undefined;
-		channel = await message.guild.channels.fetch(channel.parentId);
-	}
-	return undefined;
-}
-
-async function isExcludedChannel(message: Message, services: AutomaticServices) {
-	let channel = await message.guild!.channels.fetch(message.channelId).catch(() => null);
-	for (let depth = 0; channel && depth < 5; depth++) {
-		if (services.config.excludedChannelIds.has(channel.id)) return true;
-		if (!channel.parentId) break;
-		channel = await message.guild!.channels.fetch(channel.parentId).catch(() => null);
-	}
-	return false;
-}
-
 export function registerAutomaticTaskDetection(client: Client, services: AutomaticServices) {
 	if (services.config.OPENPROJECT_AUTOMATION_MODE === "off" || !services.extractor.enabled) return;
 	const batches = new Map<string, Batch>();
@@ -136,7 +114,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 		if (!batch) return;
 		batches.delete(channelId);
 		const batchSource = batch.messages.slice(-30);
-		if (batchSource[0] && await isExcludedChannel(batchSource[0], services)) return;
+		if (batchSource[0] && await isExcludedChannel(batchSource[0].channelId, batchSource[0].guild!, services.config.excludedChannelIds)) return;
 		const seenCandidates: Array<{ title: string; action: string; projectId?: number; targetWorkPackageId?: number; assigneeId?: string }> = [];
 		for (const window of automaticFocalWindows(batchSource, 8)) {
 		const context = await enrichAutomaticContext(window.messages, window.focal);
@@ -176,13 +154,13 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 		let completedExtraction: Awaited<ReturnType<TaskExtractor["extract"]>> | undefined;
 		let completedGate: Awaited<ReturnType<TaskExtractor["assessAutomaticCandidates"]>> | undefined;
 		try {
-			const channelProjectId = await categoryProject(primary, services);
 			const projects = await services.openProject.projects();
+			const channelProjectId = await projectIdFromChannelNames(primary.channelId, primary.guild!, projects);
 			const priorities = await services.openProject.priorities();
 			const sizes = channelProjectId ? await services.openProject.sizeOptions(channelProjectId) : [];
 			const extraction = completedExtraction = await services.extractor.extract(minimized, {
 				mode: "automatic",
-				metadata: { priorities: priorities.map(priority => priority.name), sizes: sizes.map(size => size.value) },
+				metadata: { priorities: priorities.map(priority => priority.name), sizes: sizes.map(size => size.value), projects: projects.map(project => project.name) },
 			});
 			const { result, deployment } = extraction;
 			let createdProposals = 0;
@@ -217,10 +195,12 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			let pipelineLatencyMs = extraction.latencyMs + gate.latencyMs;
 			let pipelineUsage = combinedUsage(extraction.usage, gate.usage);
 			for (const task of eligibleTasks) {
-				let projectId = channelProjectId;
 				const assigneeId = task.assignee_alias ? reverse.get(task.assignee_alias) : undefined;
 				const assignee = assigneeId ? await primary.guild!.members.fetch(assigneeId).catch(() => null) : null;
-				if (!projectId && assignee) projectId = teamProjectId(assignee, services.config.teamRoles);
+				let projectId = await resolveProjectId(primary.channelId, primary.guild!, projects, {
+					teamProjectId: projectIdForTeamRoles(assignee, services.config.teamRoles),
+					inferredProjectName: task.project_name,
+				});
 				const accountableId = source.find(message => task.source_message_ids.includes(message.id))?.author.id;
 				const accountableName = source.find(message => message.author.id === accountableId)?.member?.displayName
 					?? source.find(message => message.author.id === accountableId)?.author.username;
@@ -448,8 +428,9 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					invalidGroundingCount: result.tasks.length - individuallyGroundedTasks.length,
 					extractionMetadata: extraction.metadata,
 					extractionOptions: extraction.replayOptions,
-					pipelineVersion: "v3",
-					extractionPromptVersion: "candidate-v3",
+					windowSensitivity: gate.windowSensitivity,
+					pipelineVersion: "v4",
+					extractionPromptVersion: "candidate-v4",
 					gatePromptVersion: "automatic-precision-v1",
 					stages: {
 						extraction: { deployment: extraction.deployment, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage },
@@ -494,7 +475,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 
 	const enqueueMessage = async (message: Message) => {
 		if (!message.inGuild() || !isOrganizerGuild(services.config, message.guildId) || message.author.bot || message.system) return;
-		if (await isExcludedChannel(message, services)) return;
+		if (await isExcludedChannel(message.channelId, message.guild!, services.config.excludedChannelIds)) return;
 		const existing = batches.get(message.channelId);
 		if (existing) clearTimeout(existing.timer);
 		const messages = [...(existing?.messages ?? []).filter(item => item.id !== message.id), message]

@@ -88,10 +88,16 @@ proposal still requires a permitted human reviewer and the bot never creates
 tasks automatically. `off` remains the emergency kill switch.
 
 Normal proposal reviews seed the private corpus after migrations have created
-the proposal-to-extraction linkage and dismissal-reason fields. Export them with
-`npm run export:ai-corpus -- /secure/path/reviewed-corpus.jsonl` from a private
-one-off Container Apps Job, then evaluate that file from the same network. Do
-not persist the corpus in the image, logs, repository, or a public artifact.
+the proposal-to-extraction linkage and dismissal-reason fields. The canonical
+store is a Standard LRS Blob account with public blob access and shared-key
+authorization disabled. Entra RBAC is required for local reviewers and the jobs
+identity. Keep Blob versioning and 30-day soft deletion enabled.
+
+`tth-bot-corpus-sync` runs daily with 0.25 vCPU/0.5 GiB and writes only safe,
+pseudonymized pending cases. `tth-bot-ai-evaluate` is manual, uses the same
+low-cost resources, reaches Azure OpenAI through the existing private network,
+and persists cache/report blobs. Neither job prints corpus content. The
+localhost UI is not deployed and adds no always-on compute cost.
 
 RAG requires separate Azure OpenAI embedding configuration and the PostgreSQL
 `vector` extension. Set `OPENPROJECT_RAG_MODE=shadow` to synchronize vectors
@@ -107,9 +113,23 @@ from the chat extraction deployment. RAG proposals use PostgreSQL similarity
 catalog synchronization includes every active project visible to the integration
 account, while each similarity lookup remains filtered to its selected project.
 Matches are applied only after a reviewer confirms the update; the current
-`lockVersion` is checked immediately before the PATCH. Internal channel category
-and team mappings choose defaults, not project authorization. Keep the External
-category in `OPENPROJECT_EXCLUDED_CHANNEL_IDS`.
+`lockVersion` is checked immediately before the PATCH. Project defaults match a
+normalized Discord channel name first and its category name second; emoji, case,
+hyphens, and underscores do not affect exact matching. When names do not match,
+one unambiguous project from the proposed assignee's team roles is used; direct
+manual creation may instead use an explicitly selected accountable person's team
+when no assignee exists. AI proposals then may infer an exact active project name
+from cited discussion, but the source-message author's team never affects routing
+and a reviewer must select the project when the model abstains. Keep External,
+Information, and any other non-task categories in
+`OPENPROJECT_EXCLUDED_CHANNEL_IDS`; exclusions apply to all descendants.
+
+The bot already performs incremental embedding synchronization on its required
+always-on replica. Keep the scheduled embedding job as a daily recovery run,
+not a second ten-minute loop. Azure OpenAI GlobalStandard capacity is quota, not
+reserved throughput; lowering capacity does not lower token charges. The main
+cost controls are fewer uncached evaluations, bounded images/context, and
+conversation-level batching only after the reviewed corpus validates recall.
 
 ## Build and deployment workflow
 

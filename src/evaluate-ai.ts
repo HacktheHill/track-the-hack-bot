@@ -1,53 +1,20 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { config as loadDotEnv } from "dotenv";
 import { z } from "zod";
 import { automaticCandidateEligible, AzureTaskExtractor, mergeRelatedTaskCandidates, StructuredOutputError, type AutomaticCandidateAssessment, type ExtractedTasks, type MinimizedMessage } from "./azure-openai.js";
+import { contentHash, corpusWindowSchema, parseCorpusJsonl } from "./ai-corpus.js";
 import type { IntegrationConfig } from "./config.js";
 import { resolveProposedAction } from "./rag.js";
 import { taskReferencesAreValid } from "./task-proposals.js";
+import { normalizeProjectName } from "./project-resolution.js";
 
 loadDotEnv();
 
-const messageSchema = z.object({
-	id: z.string().min(1),
-	channelId: z.string().optional(),
-	authorAlias: z.string().min(1),
-	text: z.string(),
-	timestamp: z.iso.datetime(),
-	replyTo: z.string().optional(),
-	contextRole: z.enum(["primary", "preceding", "subsequent", "thread_root", "reply_target", "referenced_history"]).optional(),
-	priority: z.boolean().optional(),
-	attachments: z.array(z.object({ id: z.string(), name: z.string(), contentType: z.string().optional(), url: z.url() })).optional(),
-});
+export { corpusWindowSchema } from "./ai-corpus.js";
 
-const expectedProposalSchema = z.object({
-	action: z.enum(["create", "update", "complete", "reopen"]),
-	titleIncludes: z.array(z.string().min(1)).min(1),
-	assigneeAlias: z.string().nullable().optional(),
-	dueDate: z.string().nullable().optional(),
-	sourceMessageIds: z.array(z.string()).min(1),
-});
-
-export const corpusWindowSchema = z.object({
-	id: z.string().min(1),
-	mode: z.enum(["manual", "automatic"]),
-	messages: z.array(messageSchema).min(1),
-	metadata: z.object({ priorities: z.array(z.string()).optional(), sizes: z.array(z.string()).optional() }).optional(),
-	routing: z.object({ availableTargetSourceMessageIds: z.array(z.array(z.string()).min(1)).default([]) }).optional(),
-	expected: z.object({ proposals: z.array(expectedProposalSchema).max(5) }),
-}).superRefine((window, context) => {
-	const focal = window.messages.filter(message => message.contextRole === "primary" || message.priority);
-	if (window.mode === "automatic" && focal.length !== 1) {
-		context.addIssue({ code: "custom", message: "Automatic evaluation windows require exactly one primary or priority focal message." });
-	}
-	if (window.mode === "manual" && !focal.length) {
-		context.addIssue({ code: "custom", message: "Manual evaluation windows require at least one primary or priority focal message." });
-	}
-});
-
-const envSchema = z.object({
+export const evaluationEnvSchema = z.object({
 	AZURE_OPENAI_ENDPOINT: z.url(),
 	AZURE_OPENAI_DEPLOYMENT: z.string().min(1),
 	AZURE_OPENAI_API_VERSION: z.string().default("v1"),
@@ -56,6 +23,8 @@ const envSchema = z.object({
 	OPENPROJECT_AI_MAX_IMAGE_ATTACHMENTS: z.coerce.number().int().min(0).max(20).default(0),
 	AI_EVAL_MIN_INTERVAL_MS: z.coerce.number().int().min(0).max(60000).default(0),
 	AI_EVAL_PROVIDER_RETRIES: z.coerce.number().int().min(0).max(10).default(3),
+	AI_EVAL_CACHE_DIR: z.string().default(".private/ai-eval-cache"),
+	AI_EVAL_MAX_UNCACHED_CASES: z.coerce.number().int().min(1).max(10000).default(25),
 });
 
 type ExtractedTask = ExtractedTasks["tasks"][number];
@@ -102,6 +71,42 @@ function sleep(milliseconds: number) {
 	return new Promise(resolveSleep => setTimeout(resolveSleep, milliseconds));
 }
 
+const EVALUATOR_PIPELINE_VERSION = "automatic-v3.2";
+const cachedCaseSchema = z.object({
+	version: z.literal(EVALUATOR_PIPELINE_VERSION),
+	predicted: z.array(z.unknown()),
+});
+
+async function cachedPrediction(directory: string, key: string) {
+	try {
+		return cachedCaseSchema.parse(JSON.parse(await readFile(resolve(directory, `${key}.json`), "utf8"))).predicted as ExtractedTask[];
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		return undefined;
+	}
+}
+
+async function storePrediction(directory: string, key: string, predicted: ExtractedTask[]) {
+	await mkdir(resolve(directory), { recursive: true, mode: 0o700 });
+	const target = resolve(directory, `${key}.json`);
+	const temporary = `${target}.${process.pid}.tmp`;
+	await writeFile(temporary, `${JSON.stringify({ version: EVALUATOR_PIPELINE_VERSION, predicted })}\n`, { mode: 0o600 });
+	await rename(temporary, target);
+	await chmod(target, 0o600);
+}
+
+export function evaluationCacheKey(window: z.infer<typeof corpusWindowSchema>, env: z.infer<typeof evaluationEnvSchema>) {
+	return contentHash({
+		window,
+		pipeline: EVALUATOR_PIPELINE_VERSION,
+		deployment: env.AZURE_OPENAI_DEPLOYMENT,
+		apiVersion: env.AZURE_OPENAI_API_VERSION,
+		maxCompletionTokens: env.AZURE_OPENAI_MAX_COMPLETION_TOKENS,
+		maxContextChars: env.OPENPROJECT_AI_MAX_CONTEXT_CHARS,
+		maxImages: env.OPENPROJECT_AI_MAX_IMAGE_ATTACHMENTS,
+	});
+}
+
 export function providerFailureCategory(error: unknown) {
 	if (error instanceof StructuredOutputError) return "invalid_output";
 	const message = error instanceof Error ? error.message : String(error);
@@ -119,17 +124,30 @@ export function retryableProviderFailure(error: unknown) {
 
 async function main() {
 	const inputPath = process.argv[2];
-	if (!inputPath) throw new Error("Usage: npm run evaluate:ai -- <private-corpus.jsonl> [output-prefix]");
+	if (!inputPath) throw new Error("Usage: npm run evaluate:ai -- <private-corpus.jsonl> [output-prefix] [--case <id>] [--changed] [--fresh] [--full]");
+	const cli = process.argv.slice(3);
+	const outputArgument = cli[0] && !cli[0].startsWith("--") ? cli.shift() : undefined;
+	const caseIndex = cli.indexOf("--case");
+	const selectedCaseId = caseIndex >= 0 ? cli[caseIndex + 1] : undefined;
+	const fresh = cli.includes("--fresh");
+	const changedOnly = cli.includes("--changed");
+	const full = cli.includes("--full");
 	const absoluteInput = resolve(inputPath);
-	const outputPrefix = resolve(process.argv[3] ?? `${absoluteInput}.report`);
-	const windows = (await readFile(absoluteInput, "utf8"))
-		.split(/\r?\n/)
-		.filter(line => line.trim())
-		.map((line, index) => {
-			try { return corpusWindowSchema.parse(JSON.parse(line)); }
-			catch (error) { throw new Error(`Invalid corpus line ${index + 1}: ${(error as Error).message}`); }
-		});
-	const env = envSchema.parse(process.env);
+	const outputPrefix = resolve(outputArgument ?? `${absoluteInput}.report`);
+	let windows = parseCorpusJsonl(await readFile(absoluteInput, "utf8"));
+	const env = evaluationEnvSchema.parse(process.env);
+	if (selectedCaseId) windows = windows.filter(window => window.id === selectedCaseId);
+	if (selectedCaseId && !windows.length) throw new Error(`Corpus case was not found: ${selectedCaseId}`);
+	const prepared = await Promise.all(windows.map(async window => {
+		const key = evaluationCacheKey(window, env);
+		return { window, key, cached: fresh ? undefined : await cachedPrediction(env.AI_EVAL_CACHE_DIR, key) };
+	}));
+	if (changedOnly) windows = prepared.filter(item => !item.cached).map(item => item.window);
+	const selected = prepared.filter(item => windows.some(window => window.id === item.window.id));
+	const uncachedCount = selected.filter(item => !item.cached).length;
+	if (!full && uncachedCount > env.AI_EVAL_MAX_UNCACHED_CASES) {
+		throw new Error(`${uncachedCount} cases require Azure calls, exceeding AI_EVAL_MAX_UNCACHED_CASES=${env.AI_EVAL_MAX_UNCACHED_CASES}. Use --case, --changed, or explicitly pass --full.`);
+	}
 	const extractor = new AzureTaskExtractor(env as unknown as IntegrationConfig);
 	let truePositives = 0;
 	let falsePositives = 0;
@@ -145,12 +163,20 @@ async function main() {
 	let latencySamples = 0;
 	let totalTokens = 0;
 	let providerRetries = 0;
+	let cacheHits = 0;
 	let lastRequestAt = 0;
 	const providerErrorCategories: Record<string, number> = {};
 	const cases: Array<Record<string, unknown>> = [];
 
-	for (const window of windows) {
+	for (const item of selected) {
+		const { window } = item;
 		try {
+			let predicted: ExtractedTask[];
+			if (item.cached) {
+				predicted = item.cached;
+				cacheHits++;
+				validOutputs++;
+			} else {
 			let extraction: Awaited<ReturnType<AzureTaskExtractor["extract"]>> | undefined;
 			for (let attempt = 0; attempt <= env.AI_EVAL_PROVIDER_RETRIES; attempt++) {
 				const waitFor = Math.max(0, env.AI_EVAL_MIN_INTERVAL_MS - (Date.now() - lastRequestAt));
@@ -166,7 +192,6 @@ async function main() {
 				}
 			}
 			if (!extraction) throw new Error("AI evaluation exhausted retries without a result.");
-			validOutputs++;
 			totalLatencyMs += extraction.latencyMs;
 			latencySamples++;
 			totalTokens += extraction.usage?.totalTokens ?? 0;
@@ -181,13 +206,21 @@ async function main() {
 				totalLatencyMs += gate.latencyMs;
 				totalTokens += gate.usage?.totalTokens ?? 0;
 			}
-			const predicted = runtimeProposalCandidates(extraction.result.tasks, window.messages as MinimizedMessage[], window.routing, window.mode, assessments);
+			predicted = runtimeProposalCandidates(extraction.result.tasks, window.messages as MinimizedMessage[], window.routing, window.mode, assessments);
+			await storePrediction(env.AI_EVAL_CACHE_DIR, item.key, predicted);
+			validOutputs++;
+			}
 			const unmatched = new Set(predicted.map((_, index) => index));
 			let matched = 0;
 			for (const expected of window.expected.proposals) {
 				const index = [...unmatched].find(candidateIndex => {
 					const candidate = predicted[candidateIndex];
 					if (!candidate || candidate.proposed_action !== expected.action || !sameSet(candidate.source_message_ids, expected.sourceMessageIds)) return false;
+					if (expected.projectName !== undefined) {
+						const actualProject = candidate.project_name ? normalizeProjectName(candidate.project_name) : null;
+						const expectedProject = expected.projectName ? normalizeProjectName(expected.projectName) : null;
+						if (actualProject !== expectedProject) return false;
+					}
 					const content = `${candidate.title}\n${candidate.description}`.toLocaleLowerCase();
 					return expected.titleIncludes.every(term => content.includes(term.toLocaleLowerCase()));
 				});
@@ -207,7 +240,7 @@ async function main() {
 			truePositives += matched;
 			falseNegatives += window.expected.proposals.length - matched;
 			falsePositives += predicted.length - matched;
-			cases.push({ id: window.id, expectedProposals: window.expected.proposals.length, predictedProposals: predicted.length, matchedProposals: matched, validOutput: true });
+			cases.push({ id: window.id, expectedProposals: window.expected.proposals.length, predictedProposals: predicted.length, matchedProposals: matched, validOutput: true, cached: Boolean(item.cached) });
 		} catch (error) {
 			if (error instanceof StructuredOutputError) invalidOutputs++;
 			else {
@@ -222,19 +255,21 @@ async function main() {
 
 	const report = {
 		generatedAt: new Date().toISOString(),
-		corpusWindows: windows.length,
+		corpusWindows: selected.length,
 		model: env.AZURE_OPENAI_DEPLOYMENT,
 		metrics: {
 			proposalPrecision: ratio(truePositives, truePositives + falsePositives),
 			proposalRecall: ratio(truePositives, truePositives + falseNegatives),
 			ownerAccuracy: ratio(ownerCorrect, ownerCompared),
 			deadlineAccuracy: ratio(deadlineCorrect, deadlineCompared),
-			validOutputRate: ratio(validOutputs, windows.length),
+			validOutputRate: ratio(validOutputs, selected.length),
 			averageLatencyMs: ratio(totalLatencyMs, latencySamples),
 			totalTokens,
 			invalidOutputs,
 			providerErrors,
 			providerRetries,
+			cacheHits,
+			uncachedCases: uncachedCount,
 		},
 		counts: { truePositives, falsePositives, falseNegatives },
 		providerErrorCategories,
@@ -246,7 +281,7 @@ async function main() {
 		"",
 		`Generated: ${report.generatedAt}`,
 		`Model: ${report.model}`,
-		`Corpus windows: ${report.corpusWindows}`,
+		`Corpus windows: ${report.corpusWindows} (${cacheHits} cached; ${uncachedCount} requiring Azure calls)`,
 		"",
 		"| Metric | Result | Target |",
 		"| --- | ---: | ---: |",
@@ -258,11 +293,12 @@ async function main() {
 		`| Average latency | ${Math.round(report.metrics.averageLatencyMs)} ms | — |`,
 		`| Total tokens | ${report.metrics.totalTokens} | — |`,
 		`| Provider retries | ${report.metrics.providerRetries} | — |`,
+		`| Cache hits | ${report.metrics.cacheHits} | — |`,
 		"",
 		`Invalid outputs: ${invalidOutputs}; provider errors: ${providerErrors}.`,
 		providerErrors ? `Provider error categories: ${Object.entries(providerErrorCategories).map(([category, count]) => `${category}=${count}`).join(", ")}.` : "",
 		!validOutputs ? "\n> Evaluation incomplete: no valid model outputs were produced. Quality metrics are unavailable; fix provider access before using this report for a rollout decision." : "",
-		windows.length < 100 ? "\n> Warning: this corpus has fewer than the planned 100 representative windows." : "",
+		selected.length < 100 ? "\n> Warning: this run has fewer than the planned 100 representative windows." : "",
 	].join("\n");
 	await writeFile(`${outputPrefix}.json`, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
 	await writeFile(`${outputPrefix}.md`, `${markdown}\n`, { mode: 0o600 });

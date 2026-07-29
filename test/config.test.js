@@ -21,6 +21,7 @@ test("AI review automation remains disabled by default", () => {
 		assert.equal(config?.OPENPROJECT_RUN_MIGRATIONS, false);
 		assert.equal(config?.BOT_TIME_ZONE, "America/Toronto");
 		assert.equal("aiChannels" in config, false);
+		assert.equal("categoryProjects" in config, false);
 	} finally {
 		for (const key of Object.keys(process.env)) delete process.env[key];
 		Object.assign(process.env, previous);

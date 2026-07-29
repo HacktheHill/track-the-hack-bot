@@ -3,7 +3,9 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 COPY tsconfig.json ./
+COPY vite.config.ts ./
 COPY src ./src
+COPY corpus-ui ./corpus-ui
 RUN npm run build
 
 FROM node:24-bookworm-slim AS runtime

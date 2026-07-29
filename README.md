@@ -88,11 +88,12 @@ above the Hacker and Organizer roles that it manages.
 - **`/help`**: Show server-specific command help.
 - **`/task create`**: Members-role users in the Organizer server create tasks;
   the title is required, while the project can be selected explicitly or
-  inferred from the channel category or assignee's team. Description, assignee,
+  inferred by matching the channel name and then its category name to an active
+  OpenProject project. Description, assignee,
   accountable user, priority, size, dates, and estimates are optional.
 - **`/task view|assign|reschedule|close|reopen|announce`**: Manage an existing task.
-- **`/task link-user`, `/task configure-category`, `/task reconcile`**: Organizer-only
-  identity, category mapping, and ambiguous-create recovery commands.
+- **`/task link-user`, `/task reconcile`**: Organizer-only identity and
+  ambiguous-create recovery commands.
 - **`/task metrics`**: Organizer-only AI proposal outcomes, edit rates, latency,
   token usage, and failure counts for the previous 7, 30, or 90 days.
 - **`/task extract`**: Organizer-only forced extraction from recent channel
@@ -113,13 +114,17 @@ The integration is enabled when `OPENPROJECT_BASE_URL`, `OPENPROJECT_API_KEY`,
 synchronization, and help remain available while task interactions are disabled.
 
 `npm run migrate:db` creates or updates the PostgreSQL schema and seeds identity
-and category mappings from the environment. Runtime migrations are disabled by
+mappings from the environment. Runtime migrations are disabled by
 default and can be enabled explicitly for local development with
-`OPENPROJECT_RUN_MIGRATIONS=true`. Organizers can then maintain those
-mappings with `/task link-user` and `/task configure-category`. Internal
-Organizer channels can select any active project visible to the OpenProject
-integration account; category and team mappings provide defaults rather than
-authorization boundaries. `OPENPROJECT_BLOCKED_CHANNEL_IDS` remains supported
+`OPENPROJECT_RUN_MIGRATIONS=true`. Organizers can then maintain user mappings
+with `/task link-user`. Internal Organizer channels can select any active project
+visible to the OpenProject integration account. Project defaults match the
+normalized channel name first and category name second. When neither matches,
+one unambiguous team project from the proposed assignee, or an explicitly chosen
+accountable person when there is no assignee, provides the default. AI proposals
+may then infer an exact active project name from their cited discussion; the
+source-message author's team is never used for routing.
+`OPENPROJECT_BLOCKED_CHANNEL_IDS` remains supported
 for exact channel blocks. `OPENPROJECT_EXCLUDED_CHANNEL_IDS` accepts both
 channel and category IDs; category IDs exclude all descendant channels and are
 used for the External category.
@@ -242,15 +247,34 @@ never available to automatic extraction. This reduces exposure but is not a
 guarantee. Evaluate extraction on representative conversations before enabling
 it in production.
 
-Run an offline evaluation against a private pseudonymized JSONL corpus outside
-the repository:
+The canonical reviewed corpus lives in a private Azure Blob container. Real
+review outcomes are synchronized by the private `tth-bot-corpus-sync` Container
+Apps Job and enter an explicit approval queue. Start the review desk locally
+after `az login`:
 
 ```bash
-npm run export:ai-corpus -- .private/reviewed-corpus.jsonl
-npm run evaluate:ai -- .private/reviewed-corpus.jsonl
+AI_CORPUS_STORAGE_ACCOUNT_URL=https://tthbotcorpus51fa.blob.core.windows.net \
+  npm run corpus:ui
 ```
 
-The exporter builds an initial corpus from normal proposal reviews. Accepted
+The server binds only to `127.0.0.1`, authenticates through
+`DefaultAzureCredential`, and prints the local URL. Cases remain excluded from
+evaluation until approved. An approved case with zero expected proposals is a
+valid negative example; rejecting a case removes it from the approved export.
+
+Use **Export approved** in the UI, then start the manual
+`tth-bot-ai-evaluate` Azure job. Local file evaluation remains available:
+
+```bash
+npm run evaluate:ai -- .private/reviewed-corpus.jsonl --changed
+npm run evaluate:ai -- .private/reviewed-corpus.jsonl --case review-42
+npm run evaluate:ai -- .private/reviewed-corpus.jsonl --full
+```
+
+Without `--full`, more than `AI_EVAL_MAX_UNCACHED_CASES` cache misses fail before
+any provider request. Use `--fresh` only for a deliberately uncached run.
+
+The legacy file exporter builds an initial corpus from normal proposal reviews. Accepted
 manual extractions are evaluated in automatic mode as examples the automatic
 workflow should detect. Accepted automatic proposals, reviewer corrections, and
 clear negative dismissal reasons are also used. Dismissal asks the reviewer to
