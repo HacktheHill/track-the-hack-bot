@@ -329,6 +329,11 @@ test("automatic precision gate judges raw evidence and validates complete candid
 		assert.equal(request.response_format.json_schema.name, "discord_automatic_precision_gate_v1");
 		assert.match(request.messages[0].content, /untrusted hypothesis/);
 		assert.match(request.messages[0].content, /How does Instagram access work/);
+		assert.match(request.messages[0].content, /already present in a tracker is not activation/);
+		assert.match(request.messages[0].content, /Choosing a meeting time/);
+		assert.match(request.messages[0].content, /merely sharing the artifact is not/);
+		assert.match(request.messages[0].content, /Accepted review feedback/);
+		assert.match(request.messages[0].content, /reply chain/);
 		const input = JSON.parse(request.messages[1].content[0].text);
 		assert.equal(input.messages[0].text.includes("How does Instagram access work"), true);
 	} finally {
