@@ -30,7 +30,7 @@ import { randomUUID } from "node:crypto";
 import { isOrganizerGuild, type IntegrationConfig, type TeamMapping } from "./config.js";
 import { correctionFields, Database, proposalDismissalReasons, type CorrectionFlags, type ProposalDismissalReason, type ProposalMetrics, type ProposalRagCandidate } from "./database.js";
 import { OpenProjectClient, OpenProjectRequestError, openProjectAttachmentFileName, workPackageChangesApplied, workPackageMarkdownLink, type OpenProjectAttachmentInput } from "./openproject.js";
-import { attachExtractionDiagnostics, automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, StructuredOutputError, type ExtractedTasks, type ExtractionResult, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
+import { attachExtractionDiagnostics, automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, StructuredOutputError, type ContextSelectionResult, type ExtractedTasks, type ExtractionResult, type MinimizedMessage, type ProposalReconciliationResult, type TaskExtractor } from "./azure-openai.js";
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
 import { composeOpenProjectMarkdown, describeProposalOperations, formatGeneratedTaskDescription, formatProposalContent, planExistingTaskOperations, sourceContentHash, taskReferencesAreValid, type MetadataFieldName, type ProposalMetadataPatch } from "./task-proposals.js";
 import { isExcludedChannel, projectIdForName, projectIdForProposedOwner, projectIdForTeamRoles, projectIdFromChannelNames, resolveProjectId } from "./project-resolution.js";
@@ -345,6 +345,47 @@ async function deliverProposalReply(
 	} catch (error) {
 		if (markInitialDeliveryFailure) await services.db.markProposalDeliveryFailed(proposalId, (error as Error).message);
 		throw error;
+	}
+}
+
+async function updateProposalReviewCard(
+	interaction: MessageContextMenuCommandInteraction | ChatInputCommandInteraction | ButtonInteraction,
+	services: Services,
+	proposalId: string,
+	payload: InteractionEditReplyOptions,
+) {
+	const proposal = await services.db.proposal(proposalId);
+	if (!proposal?.review_message_id) return;
+	const channel = await interaction.client.channels.fetch(proposal.channel_id).catch(() => null);
+	if (!channel?.isTextBased() || !("messages" in channel)) {
+		await services.db.markProposalDeliveryFailed(proposalId, "The revised proposal review channel is unavailable.");
+		throw new Error("The revised proposal review channel is unavailable.");
+	}
+	let reviewMessage: Message | undefined;
+	try {
+		reviewMessage = await channel.messages.fetch(proposal.review_message_id);
+	} catch (error) {
+		if (!(error && typeof error === "object" && "code" in error && error.code === 10008)) {
+			await services.db.markProposalDeliveryFailed(proposalId, `Could not fetch the revised proposal review card: ${(error as Error).message}`);
+			throw error;
+		}
+	}
+	if (reviewMessage) {
+		try {
+			await reviewMessage.edit({ content: payload.content ?? undefined, components: payload.components ?? [] });
+			return;
+		} catch (error) {
+			if (!(error && typeof error === "object" && "code" in error && error.code === 10008)) {
+				await services.db.markProposalDeliveryFailed(proposalId, `Could not update the revised proposal review card: ${(error as Error).message}`);
+				throw error;
+			}
+		}
+	}
+	if (!channel.isSendable()) throw new Error("The revised proposal review channel cannot accept a replacement card.");
+	const replacement = await channel.send({ content: payload.content ?? undefined, components: payload.components ?? [] });
+	if (!await services.db.replaceProposalReviewMessage(proposalId, proposal.review_message_id, replacement.id)) {
+		await replacement.delete().catch(() => undefined);
+		throw new Error("The revised proposal was handled before its replacement review card could be attached.");
 	}
 }
 
@@ -1267,11 +1308,11 @@ async function collectContext(target: Message, interaction: MessageContextMenuCo
 		const existing = byId.get(message.id);
 		if (!existing || rolePriority[role] < rolePriority[existing.role]) byId.set(message.id, { message, role });
 	};
-	const addPrecedingWindow = async (anchor: Message, includeReferencedHistory = false, includeContinuation = false) => {
-		if (byId.size >= 40) return;
+	const addPrecedingWindow = async (anchor: Message, includeReferencedHistory = false, includeContinuation = false, windowLimit = 8) => {
+		if (byId.size >= 60) return;
 		const older = await anchor.channel.messages.fetch({ before: anchor.id, limit: includeReferencedHistory ? 100 : 50 }).catch(() => null);
 		if (!older) return;
-		for (const message of precedingUntilGap(anchor.createdTimestamp, [...older.values()], Math.min(20, 40 - byId.size))) {
+		for (const message of [...older.values()].sort((left, right) => right.createdTimestamp - left.createdTimestamp).slice(0, Math.min(windowLimit, 60 - byId.size))) {
 			add(message, "preceding");
 		}
 		if (includeContinuation) {
@@ -1303,11 +1344,11 @@ async function collectContext(target: Message, interaction: MessageContextMenuCo
 			for (const candidate of candidates) add(candidate.message, "referenced_history");
 		}
 	};
-	const addFollowingWindow = async (anchor: Message, includeContinuation = false) => {
-		if (byId.size >= 40) return;
+	const addFollowingWindow = async (anchor: Message, includeContinuation = false, windowLimit = 8) => {
+		if (byId.size >= 60) return;
 		const newer = await anchor.channel.messages.fetch({ after: anchor.id, limit: includeContinuation ? 100 : 50 }).catch(() => null);
 		if (!newer) return;
-		for (const message of followingUntilGap(anchor.createdTimestamp, [...newer.values()], Math.min(20, 40 - byId.size))) {
+		for (const message of [...newer.values()].sort((left, right) => left.createdTimestamp - right.createdTimestamp).slice(0, Math.min(windowLimit, 60 - byId.size))) {
 			add(message, "subsequent");
 		}
 		if (includeContinuation) {
@@ -1333,23 +1374,26 @@ async function collectContext(target: Message, interaction: MessageContextMenuCo
 	};
 
 	add(target, "primary");
-	await addPrecedingWindow(target, true, true);
-	await addFollowingWindow(target, true);
+	const replyAnchors = [target];
+	let replyCursor = target;
+	for (let depth = 0; depth < 12; depth++) {
+		const referenced = await fetchReplyTarget(replyCursor);
+		if (!referenced || byId.has(referenced.id)) break;
+		add(referenced, "reply_target");
+		replyAnchors.push(referenced);
+		replyCursor = referenced;
+	}
 	if (target.channel.isThread()) {
 		const starter = await target.channel.fetchStarterMessage().catch(() => null);
 		if (starter) {
 			add(starter, "thread_root");
-			await addPrecedingWindow(starter);
+			if (!replyAnchors.some(anchor => anchor.id === starter.id)) replyAnchors.push(starter);
 		}
 	}
-	let replyWindows = 0;
-	for (const { message } of byId.values()) {
-		if (replyWindows >= 8 || byId.size >= 40) break;
-		const referenced = await fetchReplyTarget(message);
-		if (!referenced) continue;
-		add(referenced, "reply_target");
-		await addPrecedingWindow(referenced);
-		replyWindows++;
+	for (const [index, anchor] of replyAnchors.entries()) {
+		if (byId.size >= 60) break;
+		await addPrecedingWindow(anchor, index === 0, index === 0, index === 0 ? 10 : 4);
+		await addFollowingWindow(anchor, index === 0, index === 0 ? 10 : 4);
 	}
 	const aliases = new Map<string, string>();
 	const reverseAliases = new Map<string, string>();
@@ -1559,17 +1603,47 @@ async function completeAiContext(
 	const tentativeProjectId = await projectIdFromChannelNames(interaction.channelId!, interaction.guild!, projects);
 	const priorities = await services.openProject.priorities();
 	const tentativeSizes = tentativeProjectId ? await services.openProject.sizeOptions(tentativeProjectId) : [];
-	const extraction = await services.extractor.extract(context.messages, {
+	let contextSelection: ContextSelectionResult = { messages: context.messages, deployment: "deterministic", latencyMs: 0 };
+	if (services.extractor.selectContext) try {
+		contextSelection = await services.extractor.selectContext(context.messages, [...context.focusIds]);
+	} catch (error) {
+		console.warn("AI context selection failed; using the bounded collected graph", { error: (error as Error).message });
+	}
+	const extraction = await services.extractor.extract(contextSelection.messages, {
 		allowSensitiveContent,
 		mode: "manual",
 		metadata: { priorities: priorities.map(priority => priority.name), sizes: tentativeSizes.map(size => size.value), projects: projects.map(project => project.name) },
 	});
+	extraction.latencyMs += contextSelection.latencyMs;
+	extraction.usage = combinedTokenUsage(extraction.usage, contextSelection.usage);
 	const { result, deployment } = extraction;
 	const inputSnapshot = extraction.inputMessages.map(({ containedSensitiveData: _, ...message }) => message);
 	const validAttachmentIds = new Set([...context.sourceRecords.values()].flatMap(record => record.attachments.map(attachment => attachment.id)));
-	const individuallyGroundedCandidates = result.tasks.filter(task => taskReferencesAreValid(task, context.validIds, context.focusIds, validAttachmentIds));
-	const candidates = mergeRelatedTaskCandidates(individuallyGroundedCandidates);
-	const gate = await services.extractor.assessAutomaticCandidates(extraction.inputMessages, candidates);
+	const selectedContextIds = new Set(contextSelection.messages.map(message => message.id));
+	const individuallyGroundedCandidates = result.tasks.filter(task => taskReferencesAreValid(task, selectedContextIds, context.focusIds, validAttachmentIds));
+	const groupedCandidates = mergeRelatedTaskCandidates(individuallyGroundedCandidates);
+	const pendingProposalCandidates = await services.db.pendingProposalContexts(interaction.channelId!);
+	const pendingProposals = (await Promise.all(pendingProposalCandidates.map(async pending => {
+		const proposal = await services.db.proposal(pending.id);
+		return proposal && await canReviewProposal(interaction, proposal, services) ? pending : undefined;
+	}))).filter((pending): pending is NonNullable<typeof pending> => Boolean(pending));
+	let reconciliation: ProposalReconciliationResult = {
+		proposals: groupedCandidates.map(candidate => ({ candidate })),
+		supersededPendingProposalIds: [], deployment: "deterministic", latencyMs: 0,
+	};
+	if (services.extractor.reconcileProposals) try {
+		reconciliation = await services.extractor.reconcileProposals(extraction.inputMessages, groupedCandidates, pendingProposals);
+	} catch (error) {
+		console.warn("AI proposal reconciliation failed; using grounded candidates", { error: (error as Error).message });
+	}
+	const candidates = await Promise.all(reconciliation.proposals.map(async item => {
+		if (!item.pendingProposalId) return item;
+		const proposal = await services.db.proposal(item.pendingProposalId);
+		return proposal && await canReviewProposal(interaction, proposal, services) ? item : { ...item, pendingProposalId: undefined };
+	}));
+	extraction.latencyMs += reconciliation.latencyMs;
+	extraction.usage = combinedTokenUsage(extraction.usage, reconciliation.usage);
+	const gate = await services.extractor.assessAutomaticCandidates(extraction.inputMessages, candidates.map(item => item.candidate));
 	const contextualSensitivity = gate.assessments.filter(assessment => assessment.sensitivity !== "safe");
 	if (contextualSensitivity.length && !allowSensitiveContent) {
 		throw attachExtractionDiagnostics(new SensitiveContentError([
@@ -1587,21 +1661,24 @@ async function completeAiContext(
 		taskCount: result.tasks.length,
 		automaticEligibleCount: candidates.filter((_, index) => automaticCandidateEligible(gate.assessments[index])).length,
 		invalidGroundingCount: result.tasks.length - individuallyGroundedCandidates.length,
-		groupedCount: candidates.length,
+		groupedCount: groupedCandidates.length,
+		reconciledCount: candidates.length,
 		extractionMetadata: extraction.metadata,
 		extractionOptions: extraction.replayOptions,
 		primaryMessageIds: [...context.focusIds],
-		candidateAssessments: candidates.map((task, index) => ({
+		candidateAssessments: candidates.map(({ candidate: task }, index) => ({
 			...gate.assessments[index],
 			automaticEligibility: automaticCandidateEligible(gate.assessments[index]) ? "eligible" : "ineligible",
 			proposedAction: task.proposed_action,
 			sourceMessageIds: task.source_message_ids,
 		})),
-		pipelineVersion: "v4",
+		pipelineVersion: "v5",
 		extractionPromptVersion: "candidate-v4",
 		gatePromptVersion: "automatic-precision-v1",
 		stages: {
-			extraction: { deployment: extraction.deployment, latencyMs: extraction.latencyMs - gate.latencyMs },
+			contextSelection: { deployment: contextSelection.deployment, latencyMs: contextSelection.latencyMs, candidateMessageCount: context.messages.length, selectedMessageCount: contextSelection.messages.length },
+			extraction: { deployment: extraction.deployment, latencyMs: extraction.latencyMs - gate.latencyMs - contextSelection.latencyMs - reconciliation.latencyMs },
+			proposalReconciliation: { deployment: reconciliation.deployment, latencyMs: reconciliation.latencyMs, pendingProposalCount: pendingProposals.length },
 			precisionGate: { deployment: gate.deployment, latencyMs: gate.latencyMs },
 		},
 	};
@@ -1615,9 +1692,14 @@ async function completeAiContext(
 		await interaction.editReply(`No task proposal was found in the selected context. ${detail}`);
 		return;
 	}
-	for (const [index, candidate] of candidates.entries()) {
+	const preparedProposalIds = new Set<string>();
+	for (const [index, reconciled] of candidates.entries()) {
 		try {
-			await completeAiCandidate(interaction, services, context, extraction, candidate, priorities, inputSnapshot, decisionTelemetry, index === 0);
+			const preparedProposalId = await completeAiCandidate(
+				interaction, services, context, extraction, reconciled.candidate, priorities, inputSnapshot, decisionTelemetry,
+				index === 0, reconciled.pendingProposalId, pendingProposals.map(proposal => proposal.id),
+			);
+			if (preparedProposalId) preparedProposalIds.add(preparedProposalId);
 		} catch (error) {
 			attachExtractionDiagnostics(error, {
 				inputMessages: extraction.inputMessages,
@@ -1628,6 +1710,19 @@ async function completeAiContext(
 			if (index === 0) throw error;
 			await interaction.followUp({ content: `Another candidate could not be prepared: ${(error as Error).message}`, flags: MessageFlags.Ephemeral });
 		}
+	}
+	const supersededIds = candidates.length === 1 && preparedProposalIds.size === 1
+		? reconciliation.supersededPendingProposalIds.filter(id => !preparedProposalIds.has(id))
+		: [];
+	const superseded = supersededIds.length
+		? await services.db.mergeAndSupersedePendingProposals([...preparedProposalIds][0]!, supersededIds)
+		: [];
+	for (const proposal of superseded) {
+		if (!proposal.review_message_id) continue;
+		const channel = await interaction.client.channels.fetch(proposal.channel_id).catch(() => null);
+		if (!channel?.isTextBased() || !("messages" in channel)) continue;
+		const reviewMessage = await channel.messages.fetch(proposal.review_message_id).catch(() => null);
+		if (reviewMessage) await reviewMessage.edit({ content: "This proposal is no longer active after the source discussion was reconciled.", components: [] }).catch(() => undefined);
 	}
 }
 
@@ -1650,6 +1745,8 @@ async function completeAiCandidate(
 		candidateAssessments: Array<Record<string, unknown>>;
 	},
 	replaceReply: boolean,
+	preferredProposalId?: string,
+	permittedExistingProposalIds: string[] = [],
 ) {
 	const { result, deployment } = extraction;
 	const assigneeId = context.explicitAssigneeId ?? (candidate.assignee_alias ? context.reverseAliases.get(candidate.assignee_alias) : undefined);
@@ -1738,7 +1835,7 @@ async function completeAiCandidate(
 			decision: { ...decisionTelemetry, requestedAction: candidate.proposed_action, outcome: "no_existing_match" },
 		});
 		await deliverAiStatus(interaction, `The discussion suggests an existing-task ${candidate.proposed_action}, but no sufficiently close OpenProject task was found.`, replaceReply);
-		return;
+		return undefined;
 	}
 	if (projectId && match && action !== "create") {
 		const operations = planExistingTaskOperations({
@@ -1755,9 +1852,11 @@ async function completeAiCandidate(
 		});
 		if (operations.contentOperation === "none" && Object.keys(operations.metadataPatch).length === 0) {
 			await deliverAiStatus(interaction, "The discussion matched an existing task but did not contain an explicit update to apply.", replaceReply);
-			return;
+			return undefined;
 		}
 		const proposal = await services.db.createProposal({
+			preferredProposalId,
+			permittedExistingProposalIds,
 			requesterId: interaction.user.id, channelId: interaction.channelId, projectId,
 			title: candidate.title, description, assigneeDiscordId: assigneeId, accountableDiscordId: accountableId,
 			priorityId: priority?.id, sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate, dueDate,
@@ -1794,16 +1893,16 @@ async function completeAiCandidate(
 			const existing = await services.db.proposal(proposal.id);
 			if (!existing || !proposalIsReviewable(existing)) {
 				await deliverAiStatus(interaction, "This discussion already has a task update proposal that is no longer pending.", replaceReply);
-				return;
+				return undefined;
 			}
 			if (!existing.operation_schema_version || !existing.content_operation) {
 				await services.db.supersedeLegacyProposal(existing.id);
 				await deliverAiStatus(interaction, "The existing proposal used the older unsafe update format and was invalidated. Run extraction again.", replaceReply);
-				return;
+				return undefined;
 			}
 			if (!await canReviewProposal(interaction, existing, services)) {
 				await deliverAiStatus(interaction, "This discussion already has a pending task update proposal, but you are not one of its reviewers.", replaceReply);
-				return;
+				return undefined;
 			}
 			redisplayed = existing;
 		} else {
@@ -1829,16 +1928,20 @@ async function completeAiCandidate(
 		const displayedContent = redisplayed?.content_markdown ?? operations.contentMarkdown;
 		const displayedAmbiguities = redisplayed?.ambiguities ?? result.ambiguities;
 		const warning = displayedOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : "";
-		await deliverProposalReply(interaction, services, proposal.id, {
+		const reviewPayload: InteractionEditReplyOptions = {
 			content: boundedDiscordContent(`**Possible ${displayedAction} for ${displayedWorkPackageLink}**\n${operationSummary.map(item => `- ${item}`).join("\n")}${warning}${formatProposalContent(displayedOperation, displayedContent)}${redisplayed ? "" : `\n\nSimilarity: ${Math.round(match.similarity * 100)}%`}${displayedAmbiguities.length ? `\nAmbiguities: ${displayedAmbiguities.join("; ")}` : ""}`),
 			components: proposalReviewComponents(proposal.id, displayedAction, redisplayed?.rag_candidates ?? ragCandidates),
-		}, !proposal.reused, replaceReply);
-		return;
+		};
+		if (proposal.revised) await updateProposalReviewCard(interaction, services, proposal.id, reviewPayload);
+		await deliverProposalReply(interaction, services, proposal.id, reviewPayload, !proposal.reused, replaceReply);
+		return proposal.id;
 	}
 	const advisory = ragCandidates.length
 		? `${ragCandidates.length} existing OpenProject ${ragCandidates.length === 1 ? "task may" : "tasks may"} track the same or related work. Select one below, or choose Review new task to keep this as new work.`
 		: undefined;
 	const proposal = await services.db.createProposal({
+		preferredProposalId,
+		permittedExistingProposalIds,
 		requesterId: interaction.user.id, channelId: interaction.channelId, projectId,
 		title: candidate.title, description,
 		assigneeDiscordId: assigneeId, accountableDiscordId: accountableId, priorityId: priority?.id,
@@ -1874,11 +1977,11 @@ async function completeAiCandidate(
 		const existing = await services.db.proposal(proposal.id);
 		if (!existing || !proposalIsReviewable(existing)) {
 			await deliverAiStatus(interaction, "This discussion already has a task proposal that is no longer pending.", replaceReply);
-			return;
+			return undefined;
 		}
 		if (!await canReviewProposal(interaction, existing, services)) {
 			await deliverAiStatus(interaction, "This discussion already has a pending task proposal, but you are not one of its reviewers.", replaceReply);
-			return;
+			return undefined;
 		}
 		redisplayed = existing;
 	} else {
@@ -1930,10 +2033,13 @@ async function completeAiCandidate(
 		].join("\n");
 		cardBody = `**${redisplayed?.title ?? candidate.title}**\n${redisplayed?.description ?? description}\n\n${details}`;
 	}
-	await deliverProposalReply(interaction, services, proposal.id, {
+	const reviewPayload: InteractionEditReplyOptions = {
 		content: boundedDiscordContent(`${cardBody}${displayedAmbiguities.length ? `\n\nAmbiguities: ${displayedAmbiguities.join("; ")}` : ""}`),
 		components: proposalReviewComponents(proposal.id, displayedAction, displayedAction === "create" ? redisplayed?.rag_candidates ?? ragCandidates : []),
-	}, !proposal.reused, replaceReply);
+	};
+	if (proposal.revised) await updateProposalReviewCard(interaction, services, proposal.id, reviewPayload);
+	await deliverProposalReply(interaction, services, proposal.id, reviewPayload, !proposal.reused, replaceReply);
+	return proposal.id;
 }
 
 async function handleSensitiveOverrideButton(interaction: ButtonInteraction, services: Services) {

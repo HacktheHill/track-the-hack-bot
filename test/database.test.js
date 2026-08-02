@@ -203,6 +203,25 @@ test("overlapping active proposals deduplicate similar generated titles", async 
 	assert.equal(queries.some(sql => sql.includes("expires_at > now()")), true);
 });
 
+test("unauthorized pending proposals are excluded from automatic deduplication", async () => {
+	const db = databaseWithPool({
+		async query(sql) {
+			if (sql.includes("SELECT id,title,status,work_item_key")) return {
+				rowCount: 1, rows: [{ id: "restricted", title: "Publish venue map", description: "Old", status: "pending_review", work_item_key: "venue-map", source_content_hash: "old", revision: 1 }],
+			};
+			if (sql.includes("INSERT INTO task_proposals")) return { rowCount: 1, rows: [{ id: "new-proposal" }] };
+			if (sql === "BEGIN" || sql === "COMMIT" || sql.includes("pg_advisory_xact_lock")) return { rowCount: 0, rows: [] };
+			throw new Error(`Unexpected query: ${sql}`);
+		},
+	});
+	const proposal = await db.createProposal({
+		channelId: "channel", title: "Publish venue map", description: "New", sourceMessageIds: ["new-message"],
+		workItemKey: "venue-map", sourceContentHash: "new", modelDeployment: "model", permittedExistingProposalIds: [],
+	});
+	assert.equal(proposal.id, "new-proposal");
+	assert.equal(proposal.reused, false);
+});
+
 test("a clarification revises the matching pending work item instead of creating another proposal", async () => {
 	const queries = [];
 	const db = databaseWithPool({
@@ -228,10 +247,82 @@ test("a clarification revises the matching pending work item instead of creating
 	const revision = queries.find(({ sql }) => sql.includes("source_message_ids=ARRAY"));
 	assert.equal(Boolean(revision), true);
 	assert.match(revision.sql, /assignee_discord_id=\$11/);
+	assert.match(revision.sql, /task_proposals\.permitted_reviewer_ids \|\| \$21::text\[\]/);
+	assert.match(revision.sql, /task_proposals\.source_attachments \|\| \$32::jsonb/);
 	assert.match(revision.sql, /content_operation=\$30/);
 	assert.deepEqual(revision.values.slice(9, 16), [8, "new-owner", "accountable", null, null, null, "2026-08-01"]);
 	assert.deepEqual(revision.values.slice(24, 31), ["update", 42, 5, 1, '{"dueDate":"2026-08-01"}', "postComment", "Clarified fields"]);
 	assert.equal(queries.some(({ sql }) => sql.includes("'edit'")), true);
+});
+
+test("model reconciliation revises same-content proposals when operations change", async () => {
+	const queries = [];
+	const db = databaseWithPool({
+		async query(sql, values) {
+			queries.push({ sql, values });
+			if (sql.includes("SELECT id,title,status,work_item_key")) return {
+				rowCount: 1,
+				rows: [{ id: "selected", title: "Sponsor deck", description: "Old scope", status: "pending_review", work_item_key: null, source_content_hash: "same-source", revision: 1 }],
+			};
+			if (sql.includes("UPDATE task_proposals SET title=")) return { rowCount: 1, rows: [{ revision: 2 }] };
+			if (sql === "BEGIN" || sql === "COMMIT" || sql.includes("pg_advisory_xact_lock")) return { rowCount: 0, rows: [] };
+			throw new Error(`Unexpected query: ${sql}`);
+		},
+	});
+	assert.deepEqual(await db.createProposal({
+		preferredProposalId: "selected", channelId: "channel", title: "Sponsor deck", description: "Old scope",
+		sourceMessageIds: ["message"], sourceContentHash: "same-source", modelDeployment: "model",
+		action: "update", targetWorkPackageId: 42, targetLockVersion: 3,
+		contentOperation: "postComment", contentMarkdown: "Updated operation",
+	}), { id: "selected", reused: true, revised: true });
+	const selection = queries.find(({ sql }) => sql.includes("SELECT id,title,status,work_item_key"));
+	assert.match(selection.sql, /channel_id=\$1 AND .*id=\$8::uuid/s);
+	assert.equal(selection.values[7], "selected");
+	const revision = queries.find(({ sql }) => sql.includes("UPDATE task_proposals SET title="));
+	assert.deepEqual(revision.values.slice(24, 31), ["update", 42, 3, 1, "{}", "postComment", "Updated operation"]);
+});
+
+test("superseded proposal lineage is merged into the survivor", async () => {
+	let query;
+	const db = databaseWithPool({
+		async query(sql, values) {
+			query = { sql, values };
+			return { rowCount: 1, rows: [] };
+		},
+	});
+	await db.mergePendingProposalLineage("00000000-0000-0000-0000-000000000001", [
+		"00000000-0000-0000-0000-000000000001",
+		"00000000-0000-0000-0000-000000000002",
+	]);
+	assert.match(query.sql, /target\.source_message_ids \|\| merged\.source_message_ids/);
+	assert.match(query.sql, /target\.permitted_reviewer_ids \|\| merged\.permitted_reviewer_ids/);
+	assert.match(query.sql, /merged\.source_attachments \|\| target\.source_attachments/);
+	assert.deepEqual(query.values[1], ["00000000-0000-0000-0000-000000000002"]);
+});
+
+test("lineage merge and supersession lock and commit as one transaction", async () => {
+	const queries = [];
+	const db = databaseWithPool({
+		async query(sql, values) {
+			queries.push({ sql, values });
+			if (sql.includes("SELECT id,status")) return { rowCount: 2, rows: [
+				{ id: "00000000-0000-0000-0000-000000000001", status: "pending_review" },
+				{ id: "00000000-0000-0000-0000-000000000002", status: "pending_review" },
+			] };
+			if (sql.includes("RETURNING id,channel_id,review_message_id")) return { rowCount: 1, rows: [{ id: "00000000-0000-0000-0000-000000000002", channel_id: "channel", review_message_id: "card" }] };
+			return { rowCount: 1, rows: [] };
+		},
+	});
+	const result = await db.mergeAndSupersedePendingProposals(
+		"00000000-0000-0000-0000-000000000001",
+		["00000000-0000-0000-0000-000000000002"],
+	);
+	assert.equal(result.length, 1);
+	assert.equal(queries[0].sql, "BEGIN");
+	assert.match(queries[1].sql, /FOR UPDATE/);
+	assert.match(queries[2].sql, /UPDATE task_proposals target SET/);
+	assert.match(queries[3].sql, /status='superseded'/);
+	assert.equal(queries[4].sql, "COMMIT");
 });
 
 test("proposal insertion and its initial revision commit atomically", async () => {
@@ -462,11 +553,14 @@ test("proposal review cards attach, clear idempotently, and remain discoverable 
 		},
 	});
 	assert.equal(await db.setProposalReviewMessage("proposal", "message"), true);
+	assert.equal(await db.replaceProposalReviewMessage("proposal", "message", "replacement"), true);
 	assert.equal(await db.clearProposalReviewMessage("proposal", "message"), true);
 	assert.deepEqual(await db.terminalProposalReviewMessages(), [{ id: "proposal", channel_id: "channel", review_message_id: "message" }]);
 	assert.match(queries[0].sql, /status IN \('pending_review','creating'\)/);
-	assert.match(queries[1].sql, /review_message_id=\$2/);
-	assert.match(queries[2].sql, /status IN \('created','dismissed','duplicate','failed','superseded','needs_reconciliation'\)/);
+	assert.match(queries[1].sql, /review_message_id=\$3/);
+	assert.deepEqual(queries[1].values, ["proposal", "message", "replacement"]);
+	assert.match(queries[2].sql, /review_message_id=\$2/);
+	assert.match(queries[3].sql, /status IN \('created','dismissed','duplicate','failed','superseded','needs_reconciliation'\)/);
 });
 
 test("proposal claims use an expiring lease", async () => {

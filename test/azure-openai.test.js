@@ -96,6 +96,166 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 	}
 });
 
+test("context selection uses semantic boundaries and retains reply ancestry", async () => {
+	const originalFetch = globalThis.fetch;
+	let request;
+	globalThis.fetch = async (_url, init) => {
+		request = JSON.parse(init.body);
+		return Response.json({ choices: [{ message: { content: JSON.stringify({ selected_message_ids: ["m3"] }) } }] });
+	};
+	try {
+		const result = await new AzureTaskExtractor(config, async () => "token").selectContext([
+			{ id: "m1", authorAlias: "USER_1", text: "Prepare the sponsor deck", timestamp: "2026-07-01T00:00:00Z" },
+			{ id: "m2", authorAlias: "USER_2", text: "Use the new benefits", timestamp: "2026-07-10T00:00:00Z", replyTo: "m1" },
+			{ id: "m3", authorAlias: "USER_1", text: "Please finish this", timestamp: "2026-07-20T00:00:00Z", replyTo: "m2", contextRole: "primary" },
+			{ id: "m4", authorAlias: "USER_3", text: "Unrelated venue question", timestamp: "2026-07-20T00:01:00Z" },
+		], ["m3"]);
+		assert.deepEqual(result.messages.map(message => message.id), ["m1", "m2", "m3"]);
+		assert.equal(request.response_format.json_schema.name, "discord_context_selection_v1");
+		assert.match(request.messages[0].content, /both the subject has materially changed and the elapsed time/);
+		assert.match(request.messages[0].content, /replyTo links upward/);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("proposal reconciliation revises the best pending proposal and supersedes duplicates", async () => {
+	const originalFetch = globalThis.fetch;
+	let request;
+	const candidate = {
+		title: "Finish sponsor deck", work_item_key: "sponsor-deck", description: "Finish the deck with the new benefits.", assignee_alias: null,
+		start_date: null, due_date: null, priority_name: null, size_name: null, project_name: null, estimated_hours: null,
+		source_message_ids: ["m2"], relevant_attachment_ids: [], evidence: "The focal reply requests completion.",
+		proposed_action: "create", content_intent: "none", metadata_change_fields: [],
+	};
+	globalThis.fetch = async (_url, init) => {
+		request = JSON.parse(init.body);
+		return Response.json({ choices: [{ message: { content: JSON.stringify({
+			proposals: [{ pending_proposal_id: "pending-best", candidate: { ...candidate, description: "USER_1 should finish the deck with the new benefits." } }],
+			superseded_pending_proposal_ids: ["pending-duplicate"],
+		}) } }] });
+	};
+	try {
+		const result = await new AzureTaskExtractor(config, async () => "token").reconcileProposals(
+			[{ id: "m2", authorAlias: "USER_1", text: "Finish the sponsor deck with the new benefits", timestamp: "2026-07-20T00:00:00Z", contextRole: "primary" }],
+			[candidate],
+			[
+				{ id: "pending-best", title: "Sponsor deck", description: "Finish the deck.", action: "create", sourceMessageIds: ["m1"] },
+				{ id: "pending-duplicate", title: "Update sponsor benefits", description: "Add benefits.", action: "create", workItemKey: "sponsor-deck", sourceMessageIds: ["m0"] },
+			],
+		);
+		assert.equal(result.proposals[0].pendingProposalId, "pending-best");
+		assert.equal(result.proposals[0].candidate.description.includes("USER_1"), false);
+		assert.deepEqual(result.supersededPendingProposalIds, ["pending-duplicate"]);
+		assert.equal(request.response_format.json_schema.name, "discord_proposal_reconciliation_v1");
+		assert.match(request.messages[0].content, /Split lists into separate proposals/);
+		assert.equal(JSON.parse(request.messages[1].content).pendingProposals.length, 2);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("proposal reconciliation does not conflate distinct tasks from one source message", async () => {
+	const originalFetch = globalThis.fetch;
+	const candidate = {
+		title: "Publish the venue map", work_item_key: "venue-map", description: "Publish the final map.", assignee_alias: null,
+		start_date: null, due_date: null, priority_name: null, size_name: null, project_name: null, estimated_hours: null,
+		source_message_ids: ["m1"], relevant_attachment_ids: [], evidence: "The map is ready.",
+		proposed_action: "create", content_intent: "none", metadata_change_fields: [],
+	};
+	globalThis.fetch = async () => Response.json({ choices: [{ message: { content: JSON.stringify({
+		proposals: [{ pending_proposal_id: "other", candidate }], superseded_pending_proposal_ids: ["other"],
+	}) } }] });
+	try {
+		const result = await new AzureTaskExtractor(config, async () => "token").reconcileProposals(
+			[{ id: "m1", authorAlias: "USER_1", text: "Publish the map and order volunteer shirts", timestamp: "2026-07-20T00:00:00Z", contextRole: "primary" }],
+			[candidate],
+			[{ id: "other", title: "Order volunteer shirts", description: "Order shirts.", action: "create", workItemKey: "volunteer-shirts", sourceMessageIds: ["m1"] }],
+		);
+		assert.equal(result.proposals[0].pendingProposalId, undefined);
+		assert.deepEqual(result.supersededPendingProposalIds, []);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("invalid reconciliation grounding falls back to valid extracted candidates", async () => {
+	const originalFetch = globalThis.fetch;
+	const candidate = {
+		title: "Publish the venue map", work_item_key: "venue-map", description: "Publish the final map.", assignee_alias: null,
+		start_date: null, due_date: null, priority_name: null, size_name: null, project_name: null, estimated_hours: null,
+		source_message_ids: ["m1"], relevant_attachment_ids: [], evidence: "The map is ready.",
+		proposed_action: "create", content_intent: "none", metadata_change_fields: [],
+	};
+	globalThis.fetch = async () => Response.json({ choices: [{ message: { content: JSON.stringify({
+		proposals: [{ pending_proposal_id: null, candidate: { ...candidate, source_message_ids: ["unknown"] } }],
+		superseded_pending_proposal_ids: [],
+	}) } }] });
+	try {
+		const result = await new AzureTaskExtractor(config, async () => "token").reconcileProposals(
+			[{ id: "m1", authorAlias: "USER_1", text: "Publish the map", timestamp: "2026-07-20T00:00:00Z", contextRole: "primary" }],
+			[candidate], [],
+		);
+		assert.deepEqual(result.proposals.map(item => item.candidate.source_message_ids), [["m1"]]);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("one pending proposal cannot be assigned to multiple canonical tasks", async () => {
+	const originalFetch = globalThis.fetch;
+	const candidate = {
+		title: "Publish the venue map", work_item_key: "venue-map", description: "Publish the final map.", assignee_alias: null,
+		start_date: null, due_date: null, priority_name: null, size_name: null, project_name: null, estimated_hours: null,
+		source_message_ids: ["m1"], relevant_attachment_ids: [], evidence: "The map is ready.",
+		proposed_action: "create", content_intent: "none", metadata_change_fields: [],
+	};
+	globalThis.fetch = async () => Response.json({ choices: [{ message: { content: JSON.stringify({
+		proposals: [
+			{ pending_proposal_id: "pending", candidate },
+			{ pending_proposal_id: "pending", candidate: { ...candidate, title: "Publish the parking map", work_item_key: "parking-map" } },
+		],
+		superseded_pending_proposal_ids: [],
+	}) } }] });
+	try {
+		const result = await new AzureTaskExtractor(config, async () => "token").reconcileProposals(
+			[{ id: "m1", authorAlias: "USER_1", text: "Publish both maps", timestamp: "2026-07-20T00:00:00Z", contextRole: "primary" }],
+			[candidate],
+			[{ id: "pending", title: "Publish the venue map", description: "Publish it.", action: "create", workItemKey: "venue-map", sourceMessageIds: ["old"] }],
+		);
+		assert.deepEqual(result.proposals.map(item => item.pendingProposalId), ["pending", undefined]);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("proposal reconciliation bounds cached pending proposal content", async () => {
+	const originalFetch = globalThis.fetch;
+	let request;
+	const candidate = {
+		title: "Publish the venue map", work_item_key: "venue-map", description: "Publish the final map.", assignee_alias: null,
+		start_date: null, due_date: null, priority_name: null, size_name: null, project_name: null, estimated_hours: null,
+		source_message_ids: ["m1"], relevant_attachment_ids: [], evidence: "The map is ready.",
+		proposed_action: "create", content_intent: "none", metadata_change_fields: [],
+	};
+	globalThis.fetch = async (_url, init) => {
+		request = JSON.parse(init.body);
+		return Response.json({ choices: [{ message: { content: JSON.stringify({ proposals: [{ pending_proposal_id: null, candidate }], superseded_pending_proposal_ids: [] }) } }] });
+	};
+	try {
+		await new AzureTaskExtractor(config, async () => "token").reconcileProposals(
+			[{ id: "m1", authorAlias: "USER_1", text: "Publish the map", timestamp: "2026-07-20T00:00:00Z", contextRole: "primary" }],
+			[candidate],
+			Array.from({ length: 30 }, (_, index) => ({ id: `p${index}`, title: `Proposal ${index}`, description: "x".repeat(4000), action: "create", sourceMessageIds: [`old${index}`] })),
+		);
+		const payload = JSON.parse(request.messages[1].content);
+		assert.equal(payload.pendingProposals.length, 20);
+		assert.ok(JSON.stringify(payload.pendingProposals).length < 18_000);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
 test("automatic eligibility requires every precision check and safe context", () => {
 	const eligible = {
 		candidate_index: 0, has_activated_specific_work: true, has_remaining_work_or_trackable_transition: true,

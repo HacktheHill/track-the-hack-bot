@@ -1,4 +1,5 @@
 import pg from "pg";
+import type { PoolClient } from "pg";
 import type { IntegrationConfig } from "./config.js";
 import { randomUUID } from "node:crypto";
 import { proposalMetadataPatchSchema, type ContentOperation, type ProposalMetadataPatch } from "./task-proposals.js";
@@ -559,6 +560,96 @@ export class Database {
 		);
 	}
 
+	async pendingProposalContexts(channelId: string) {
+		const result = await this.pool.query<{
+			id: string; title: string; description: string; action: "create" | "update" | "complete" | "reopen";
+			project_id: number | null; work_item_key: string | null; source_message_ids: string[];
+			assignee_discord_id: string | null; start_date: string | null; due_date: string | null; estimated_hours: number | null;
+			requester_discord_id: string | null; permitted_reviewer_ids: string[];
+		}>(`SELECT id,title,description,action,project_id,work_item_key,source_message_ids,
+			assignee_discord_id,start_date,due_date,estimated_hours,requester_discord_id,permitted_reviewer_ids
+			FROM task_proposals WHERE channel_id=$1 AND status='pending_review' AND expires_at > now()
+			ORDER BY updated_at DESC LIMIT 20`, [channelId]);
+		return result.rows.map(row => ({
+			id: row.id, title: row.title, description: row.description, action: row.action,
+			projectId: row.project_id ?? undefined, workItemKey: row.work_item_key ?? undefined,
+			sourceMessageIds: row.source_message_ids, assigneeDiscordId: row.assignee_discord_id ?? undefined,
+			startDate: row.start_date ?? undefined, dueDate: row.due_date ?? undefined, estimatedHours: row.estimated_hours ?? undefined,
+			requesterDiscordId: row.requester_discord_id ?? undefined, permittedReviewerIds: row.permitted_reviewer_ids,
+		}));
+	}
+
+	async supersedePendingProposals(ids: string[]) {
+		if (!ids.length) return [];
+		const result = await this.pool.query<{ id: string; channel_id: string; review_message_id: string | null }>(
+			`UPDATE task_proposals SET status='superseded',review_outcome='superseded',reviewed_at=now(),updated_at=now()
+			 WHERE id = ANY($1::uuid[]) AND status='pending_review'
+			 RETURNING id,channel_id,review_message_id`,
+			[ids],
+		);
+		return result.rows;
+	}
+
+	async mergePendingProposalLineage(targetId: string, sourceIds: string[]) {
+		const mergeIds = sourceIds.filter(id => id !== targetId);
+		if (!mergeIds.length) return;
+		await this.mergePendingProposalLineageUsing(this.pool as Pick<PoolClient, "query">, targetId, mergeIds);
+	}
+
+	private async mergePendingProposalLineageUsing(client: Pick<PoolClient, "query">, targetId: string, mergeIds: string[]) {
+		await client.query(
+			`UPDATE task_proposals target SET
+			 source_message_ids=ARRAY(SELECT DISTINCT value FROM unnest(target.source_message_ids || merged.source_message_ids) value),
+			 source_links=ARRAY(SELECT DISTINCT value FROM unnest(target.source_links || merged.source_links) value),
+			 permitted_reviewer_ids=ARRAY(SELECT DISTINCT value FROM unnest(target.permitted_reviewer_ids || merged.permitted_reviewer_ids) value),
+			 source_attachments=(SELECT COALESCE(jsonb_agg(value ORDER BY attachment_id),'[]'::jsonb) FROM (
+				SELECT DISTINCT ON (value->>'id') value,value->>'id' AS attachment_id
+				FROM jsonb_array_elements(merged.source_attachments || target.source_attachments) WITH ORDINALITY attachment(value,ordinality)
+				ORDER BY value->>'id',ordinality DESC
+			 ) attachments),updated_at=now()
+			 FROM (SELECT
+				COALESCE((SELECT array_agg(DISTINCT value) FROM task_proposals proposal CROSS JOIN LATERAL unnest(proposal.source_message_ids) value WHERE proposal.id = ANY($2::uuid[]) AND proposal.status='pending_review'),'{}') AS source_message_ids,
+				COALESCE((SELECT array_agg(DISTINCT value) FROM task_proposals proposal CROSS JOIN LATERAL unnest(proposal.source_links) value WHERE proposal.id = ANY($2::uuid[]) AND proposal.status='pending_review'),'{}') AS source_links,
+				COALESCE((SELECT array_agg(DISTINCT value) FROM task_proposals proposal CROSS JOIN LATERAL unnest(proposal.permitted_reviewer_ids) value WHERE proposal.id = ANY($2::uuid[]) AND proposal.status='pending_review'),'{}') AS permitted_reviewer_ids,
+				COALESCE((SELECT jsonb_agg(DISTINCT value) FROM task_proposals proposal CROSS JOIN LATERAL jsonb_array_elements(proposal.source_attachments) value WHERE proposal.id = ANY($2::uuid[]) AND proposal.status='pending_review'),'[]'::jsonb) AS source_attachments
+			 ) merged
+			 WHERE target.id=$1 AND target.status='pending_review'`,
+			[targetId, mergeIds],
+		);
+	}
+
+	async mergeAndSupersedePendingProposals(targetId: string, sourceIds: string[]) {
+		const mergeIds = [...new Set(sourceIds.filter(id => id !== targetId))];
+		if (!mergeIds.length) return [];
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			const locked = await client.query<{ id: string; status: string }>(
+				"SELECT id,status FROM task_proposals WHERE id = ANY($1::uuid[]) FOR UPDATE",
+				[[targetId, ...mergeIds]],
+			);
+			if (locked.rows.length !== mergeIds.length + 1 || locked.rows.some(row => row.status !== "pending_review")) {
+				await client.query("ROLLBACK");
+				return [];
+			}
+			await this.mergePendingProposalLineageUsing(client, targetId, mergeIds);
+			const superseded = await client.query<{ id: string; channel_id: string; review_message_id: string | null }>(
+				`UPDATE task_proposals SET status='superseded',review_outcome='superseded',reviewed_at=now(),updated_at=now()
+				 WHERE id = ANY($1::uuid[]) AND status='pending_review'
+				 RETURNING id,channel_id,review_message_id`,
+				[mergeIds],
+			);
+			if (superseded.rows.length !== mergeIds.length) throw new Error("Pending proposal supersession changed concurrently.");
+			await client.query("COMMIT");
+			return superseded.rows;
+		} catch (error) {
+			await client.query("ROLLBACK");
+			throw error;
+		} finally {
+			client.release();
+		}
+	}
+
 	async createProposal(input: {
 		requesterId?: string;
 		channelId: string;
@@ -595,6 +686,8 @@ export class Database {
 		contentOperation?: ContentOperation;
 		contentMarkdown?: string | null;
 		ragCandidates?: ProposalRagCandidate[];
+		preferredProposalId?: string;
+		permittedExistingProposalIds?: string[];
 	}) {
 		if (input.action && input.action !== "create" && (!input.targetWorkPackageId || input.targetLockVersion === undefined)) {
 			throw new Error("Existing-task proposals require a target task and lock version.");
@@ -613,6 +706,7 @@ export class Database {
 			input.sourceContentHash ?? "no-content-hash",
 		].join(":");
 		const dedupeLocks = new Set([
+			...(input.preferredProposalId ? [`${input.channelId}:proposal:${input.preferredProposalId}`] : []),
 			...(input.workItemKey ? [`${input.channelId}:work-item:${input.workItemKey.trim().toLocaleLowerCase()}`] : []),
 			...sortedSourceIds.map(sourceId => `${input.channelId}:source:${sourceId}`),
 		]);
@@ -624,31 +718,42 @@ export class Database {
 		try {
 			await client.query("BEGIN");
 			for (const lock of [...dedupeLocks].sort()) await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [lock]);
-			const overlapping = await client.query<{ id: string; title: string; status: string; work_item_key: string | null; source_content_hash: string | null; revision: number }>(
-				`SELECT id,title,status,work_item_key,source_content_hash,revision FROM task_proposals
+			const overlapping = await client.query<{ id: string; title: string; description: string; status: string; work_item_key: string | null; source_content_hash: string | null; revision: number }>(
+				`SELECT id,title,status,work_item_key,source_content_hash,revision,description FROM task_proposals
 				 WHERE channel_id=$1 AND (source_message_ids && $2::text[] OR (
 					status='pending_review' AND $7::text IS NOT NULL AND lower(work_item_key)=lower($7)
-				 ))
+				 ) OR (status='pending_review' AND id=$8::uuid))
 				 AND ((status='created' AND action=$3 AND project_id IS NOT DISTINCT FROM $4
 					AND target_work_package_id IS NOT DISTINCT FROM $5 AND assignee_discord_id IS NOT DISTINCT FROM $6)
 					OR (status IN ('pending_review','creating') AND expires_at > now()))`,
-				[input.channelId, sortedSourceIds, input.action ?? "create", input.projectId ?? null, input.targetWorkPackageId ?? null, input.assigneeDiscordId ?? null, input.workItemKey ?? null],
+				[input.channelId, sortedSourceIds, input.action ?? "create", input.projectId ?? null, input.targetWorkPackageId ?? null, input.assigneeDiscordId ?? null, input.workItemKey ?? null, input.preferredProposalId ?? null],
 			);
 			const normalizedWorkItemKey = input.workItemKey?.trim().toLocaleLowerCase();
-			const overlappingDuplicate = overlapping.rows.find(row => (
+			const permittedOverlapping = overlapping.rows.filter(row => row.status === "created" || input.permittedExistingProposalIds === undefined || input.permittedExistingProposalIds.includes(row.id));
+			const preferredProposal = input.preferredProposalId ? permittedOverlapping.find(row => row.id === input.preferredProposalId && row.status === "pending_review") : undefined;
+			const overlappingDuplicate = preferredProposal ?? permittedOverlapping.find(row => (
 				titlesLikelyDuplicate(row.title, input.title)
 				|| Boolean(normalizedWorkItemKey && row.work_item_key?.trim().toLocaleLowerCase() === normalizedWorkItemKey)
 			) && (row.status !== "created" || !input.sourceContentHash || row.source_content_hash === input.sourceContentHash));
 			if (overlappingDuplicate) {
 				proposalId = overlappingDuplicate.id;
 				reused = true;
-				if (overlappingDuplicate.status === "pending_review" && input.sourceContentHash && input.sourceContentHash !== overlappingDuplicate.source_content_hash) {
+				if (overlappingDuplicate.status === "pending_review" && input.sourceContentHash && (
+					input.sourceContentHash !== overlappingDuplicate.source_content_hash
+					|| Boolean(preferredProposal)
+				)) {
 					const updated = await client.query<{ revision: number }>(
 						`UPDATE task_proposals SET title=$2,description=$3,source_message_ids=ARRAY(SELECT DISTINCT value FROM unnest(task_proposals.source_message_ids || $4::text[]) value),
-						 source_links=ARRAY(SELECT DISTINCT value FROM unnest(task_proposals.source_links || $5::text[]) value),source_attachments=$32,evidence=$6,ambiguities=$7,
+						 source_links=ARRAY(SELECT DISTINCT value FROM unnest(task_proposals.source_links || $5::text[]) value),
+						 source_attachments=(SELECT COALESCE(jsonb_agg(value ORDER BY attachment_id),'[]'::jsonb) FROM (
+							SELECT DISTINCT ON (value->>'id') value,value->>'id' AS attachment_id
+							FROM jsonb_array_elements(task_proposals.source_attachments || $32::jsonb) WITH ORDINALITY attachment(value,ordinality)
+							ORDER BY value->>'id',ordinality DESC
+						 ) merged_attachments),evidence=$6,ambiguities=$7,
 						 work_item_key=COALESCE($8,work_item_key),source_content_hash=$9,project_id=$10,
 						 assignee_discord_id=$11,accountable_discord_id=$12,priority_id=$13,size_href=$14,start_date=$15,due_date=$16,
-						 estimated_hours=$17,metadata_inference=$18,classification=$19,model_deployment=$20,permitted_reviewer_ids=$21,
+						 estimated_hours=$17,metadata_inference=$18,classification=$19,model_deployment=$20,
+						 permitted_reviewer_ids=ARRAY(SELECT DISTINCT value FROM unnest(task_proposals.permitted_reviewer_ids || $21::text[]) value),
 						 latency_ms=$22,token_usage=$23,escalation_reason=$24,action=$25,target_work_package_id=$26,target_lock_version=$27,
 						 operation_schema_version=$28,metadata_patch=$29,content_operation=$30,content_markdown=$31,
 						 revision=revision + 1,updated_at=now()
@@ -827,6 +932,15 @@ export class Database {
 		const result = await this.pool.query(
 			"UPDATE task_proposals SET review_message_id=NULL, updated_at=now() WHERE id=$1 AND review_message_id=$2",
 			[id, messageId],
+		);
+		return result.rowCount === 1;
+	}
+
+	async replaceProposalReviewMessage(id: string, previousMessageId: string, nextMessageId: string) {
+		const result = await this.pool.query(
+			`UPDATE task_proposals SET review_message_id=$3,updated_at=now()
+			 WHERE id=$1 AND review_message_id=$2 AND status='pending_review'`,
+			[id, previousMessageId, nextMessageId],
 		);
 		return result.rowCount === 1;
 	}
