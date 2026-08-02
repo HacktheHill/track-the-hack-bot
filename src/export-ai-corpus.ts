@@ -165,6 +165,63 @@ export function buildCorpusWindow(input: ExportRow) {
 	return window.success ? sanitizeCorpusWindow(window.data) : undefined;
 }
 
+export function buildPendingCorrectionWindow(input: ExportRow) {
+	const row = exportRowSchema.parse(input);
+	if (!row.input_snapshot.length || !row.proposals.length || row.proposals.length > 5) return undefined;
+	if (row.source === "manual" && row.decision?.groupedCount !== 1) return undefined;
+	if (!row.proposals.every(proposal => proposal.status === "dismissed" && proposal.reviewOutcome === "dismissed" && proposal.dismissalReason === "incorrect_proposal" && proposal.initialSnapshot)) return undefined;
+	const extractionOptions = row.decision?.extractionOptions;
+	if (extractionOptions && typeof extractionOptions === "object" && "allowSensitiveContent" in extractionOptions && extractionOptions.allowSensitiveContent === true) return undefined;
+	if (row.decision?.windowSensitivity !== undefined && row.decision.windowSensitivity !== "safe") return undefined;
+	const assessments = rowAssessments(row);
+	if (!assessments.length || assessments.some(assessment => !assessment || assessment.sensitivity !== "safe")) return undefined;
+
+	const messageIds = new Map(row.input_snapshot.map((message, index) => [message.id, `m${index + 1}`]));
+	const attachmentIds = new Map(row.input_snapshot.flatMap(message => (message.attachments ?? []).map(attachment => `${message.id}:${attachment.id}`))
+		.map((id, index) => [id, `a${index + 1}`]));
+	const expected = row.proposals.map(proposal => {
+		const snapshot = proposal.initialSnapshot!;
+		const action = z.enum(["create", "update", "complete", "reopen"]).safeParse(snapshot.action).data;
+		const title = stringValue(snapshot.title) ?? proposal.title;
+		const rawSourceIds = Array.isArray(snapshot.sourceMessageIds)
+			? snapshot.sourceMessageIds.filter((id): id is string => typeof id === "string")
+			: proposal.sourceMessageIds;
+		const sourceMessageIds = rawSourceIds.map(id => messageIds.get(id)).filter((id): id is string => Boolean(id));
+		if (!action || !rawSourceIds.length || sourceMessageIds.length !== rawSourceIds.length || !candidateAssessment(row, rawSourceIds)) return undefined;
+		const projectName = snapshot.projectName === null || typeof snapshot.projectName === "string" ? snapshot.projectName : undefined;
+		const assigneeAlias = snapshot.assigneeAlias === null || typeof snapshot.assigneeAlias === "string" ? snapshot.assigneeAlias : undefined;
+		const dueDate = snapshot.dueDate === null || (typeof snapshot.dueDate === "string" && z.iso.date().safeParse(snapshot.dueDate).success) ? snapshot.dueDate : undefined;
+		return {
+			action,
+			titleIncludes: evaluationTitleTerms(title),
+			...(projectName !== undefined ? { projectName } : {}),
+			...(assigneeAlias !== undefined ? { assigneeAlias } : {}),
+			...(dueDate !== undefined ? { dueDate } : {}),
+			sourceMessageIds,
+		};
+	});
+	if (expected.some(proposal => !proposal)) return undefined;
+	const metadata = row.decision?.extractionMetadata;
+	const window = corpusWindowSchema.safeParse({
+		id: `review-${row.id}`,
+		mode: "automatic",
+		messages: row.input_snapshot.map(message => ({
+			id: messageIds.get(message.id), authorAlias: message.authorAlias, text: message.text, timestamp: message.timestamp,
+			...(message.contextRole ? { contextRole: message.contextRole } : {}),
+			...(message.priority ? { priority: true } : {}),
+			...(message.replyTo && messageIds.has(message.replyTo) ? { replyTo: messageIds.get(message.replyTo) } : {}),
+			...(message.attachments?.length ? { attachments: message.attachments.map(attachment => ({
+				id: attachmentIds.get(`${message.id}:${attachment.id}`)!, name: attachment.name,
+				...(attachment.contentType ? { contentType: attachment.contentType } : {}),
+				url: `https://example.invalid/attachment/${attachmentIds.get(`${message.id}:${attachment.id}`)}`,
+			})) } : {}),
+		})),
+		...(metadata && typeof metadata === "object" ? { metadata } : {}),
+		expected: { proposals: expected },
+	});
+	return window.success ? sanitizeCorpusWindow(window.data) : undefined;
+}
+
 export async function loadReviewedExtractionRows(pool: Pick<pg.Pool, "query">, days: number) {
 	const result = await pool.query(
 		`SELECT e.id,e.source,e.input_snapshot,e.message_assessments,e.decision,

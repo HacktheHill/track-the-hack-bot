@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildCorpusWindow, evaluationTitleTerms } from "../dist/export-ai-corpus.js";
+import { buildCorpusWindow, buildPendingCorrectionWindow, evaluationTitleTerms } from "../dist/export-ai-corpus.js";
 
 function reviewedRow(overrides = {}) {
 	return {
@@ -87,4 +87,58 @@ test("automatic events use their dedicated candidate assessments", () => {
 	assert.equal(buildCorpusWindow(automatic).expected.proposals.length, 1);
 	automatic.message_assessments[0].sensitivity = "sensitive";
 	assert.equal(buildCorpusWindow(automatic), undefined);
+});
+
+test("incorrect proposals build sync-only pending correction windows from the full safe snapshot", () => {
+	const row = reviewedRow({
+		input_snapshot: [
+			...reviewedRow().input_snapshot,
+			{ id: "context-message", authorAlias: "Person B", text: "This context must remain available.", timestamp: "2026-07-20T12:59:00.000Z", contextRole: "preceding" },
+		],
+		decision: {
+			groupedCount: 1, windowSensitivity: "safe", extractionMetadata: { projects: ["Partnerships"] },
+			candidateAssessments: [{ proposedAction: "create", sourceMessageIds: ["discord-message"], sensitivity: "safe" }],
+		},
+		proposals: [{
+			status: "dismissed", reviewOutcome: "dismissed", dismissalReason: "incorrect_proposal", action: "create",
+			targetWorkPackageId: null, title: "Revise the sponsor deck", sourceMessageIds: ["discord-message"],
+			initialSnapshot: { title: "Revise the sponsor deck", action: "create", sourceMessageIds: ["discord-message"], projectName: "Partnerships", dueDate: "2026-08-01" }, finalSnapshot: null,
+		}],
+	});
+	const window = buildPendingCorrectionWindow(row);
+	assert.equal(buildCorpusWindow(row), undefined);
+	assert.equal(window.messages.length, 2);
+	assert.deepEqual(window.expected.proposals, [{
+		action: "create", titleIncludes: ["sponsor", "deck"], projectName: "Partnerships", dueDate: "2026-08-01", sourceMessageIds: ["m1"],
+	}]);
+});
+
+test("correction builder excludes unsafe, ungrounded, mixed, overridden, and oversized cases", () => {
+	const correction = () => {
+		const row = reviewedRow();
+		row.decision.windowSensitivity = "safe";
+		row.proposals[0] = { ...row.proposals[0], status: "dismissed", reviewOutcome: "dismissed", dismissalReason: "incorrect_proposal", finalSnapshot: null };
+		return row;
+	};
+	const unsafe = correction();
+	unsafe.decision.windowSensitivity = "unsafe";
+	assert.equal(buildPendingCorrectionWindow(unsafe), undefined);
+	const override = correction();
+	override.decision.extractionOptions = { allowSensitiveContent: true };
+	assert.equal(buildPendingCorrectionWindow(override), undefined);
+	const regrouped = correction();
+	regrouped.decision.groupedCount = 2;
+	assert.equal(buildPendingCorrectionWindow(regrouped), undefined);
+	const missingSource = correction();
+	missingSource.proposals[0].initialSnapshot.sourceMessageIds = ["missing"];
+	assert.equal(buildPendingCorrectionWindow(missingSource), undefined);
+	const unmatchedAssessment = correction();
+	unmatchedAssessment.decision.candidateAssessments[0].sourceMessageIds = ["other"];
+	assert.equal(buildPendingCorrectionWindow(unmatchedAssessment), undefined);
+	const mixed = correction();
+	mixed.proposals.push({ ...structuredClone(mixed.proposals[0]), dismissalReason: "not_actionable" });
+	assert.equal(buildPendingCorrectionWindow(mixed), undefined);
+	const oversized = correction();
+	oversized.proposals = Array.from({ length: 6 }, () => structuredClone(oversized.proposals[0]));
+	assert.equal(buildPendingCorrectionWindow(oversized), undefined);
 });

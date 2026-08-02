@@ -26,7 +26,7 @@ export interface ExpectedProposal {
 export interface CorpusCase {
 	schemaVersion: "v2";
 	id: string;
-	origin: { type: "reviewed_proposal" | "sampled_no_task" | "manual_scenario"; [key: string]: unknown };
+	origin: { type: "reviewed_proposal" | "sampled_no_task" | "manual_scenario"; reviewKind?: "incorrect_proposal"; reviewFingerprint?: string; [key: string]: unknown };
 	window: {
 		id: string;
 		mode: "manual" | "automatic";
@@ -66,6 +66,7 @@ export interface CaseSummary {
 	id: string;
 	status?: ReviewStatus;
 	originType?: string;
+	reviewKind?: "incorrect_proposal";
 	mode?: "manual" | "automatic";
 	messageCount?: number;
 	proposalCount?: number;

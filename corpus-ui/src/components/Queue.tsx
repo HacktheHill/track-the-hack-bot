@@ -38,6 +38,7 @@ export function Queue({ cases, activeId, status, query, loading, onStatus, onQue
 				const messageCount = item.messageCount ?? item.window?.messages?.length;
 				return <button type="button" className={`queue-item ${activeId === item.id ? "selected" : ""}`} key={item.id} onClick={() => onSelect(item.id)} aria-current={activeId === item.id ? "true" : undefined}>
 					<span className="queue-item-top"><strong>{item.id}</strong><span className={`status-dot ${itemStatus}`}>{itemStatus}</span></span>
+					{item.reviewKind === "incorrect_proposal" ? <span className="correction-marker">Correction needed</span> : null}
 					<span className="queue-meta"><span>{origin}</span><span>{mode ?? "unassigned"}</span>{messageCount !== undefined ? <span>{messageCount} msg</span> : null}</span>
 				</button>;
 			})}

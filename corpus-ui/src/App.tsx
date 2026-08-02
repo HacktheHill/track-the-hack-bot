@@ -197,7 +197,7 @@ export default function App() {
 				<Queue cases={cases} activeId={selectedId} status={status} query={query} loading={loading} onStatus={setStatus} onQuery={setQuery} onSelect={selectCase} />
 				{draft ? <>
 					<div className="case-main" aria-busy={busy}>
-						<div className="case-title"><div><span className={`status-chip ${draft.adjudication.status}`}>{draft.adjudication.status}</span><h2 ref={caseHeading} tabIndex={-1}>{draft.id}</h2><p>{draft.origin.type} origin · {draft.window.mode} mode · updated {formatDate(draft.updatedAt)}{dirty ? " · unsaved changes" : ""}</p></div><div className="case-mark">#{draft.schemaVersion}</div></div>
+						<div className="case-title"><div><span className={`status-chip ${draft.adjudication.status}`}>{draft.adjudication.status}</span>{draft.origin.reviewKind === "incorrect_proposal" ? <span className="correction-marker">Correction needed: replace or remove the rejected output</span> : null}<h2 ref={caseHeading} tabIndex={-1}>{draft.id}</h2><p>{draft.origin.type} origin · {draft.window.mode} mode · updated {formatDate(draft.updatedAt)}{dirty ? " · unsaved changes" : ""}</p></div><div className="case-mark">#{draft.schemaVersion}</div></div>
 						<Timeline messages={draft.window.messages} discordMessages={draft.reviewContext?.discordMessages} invalidEvidence={invalidFields.some(field => field.startsWith("role-"))} onRecoverContext={openRecovery} onChange={messages => {
 							const next = { ...draft, window: { ...draft.window, messages } };
 							if (invalidFields.length) setInvalidFields(validate(next).flatMap(error => error.field ? [error.field] : []));

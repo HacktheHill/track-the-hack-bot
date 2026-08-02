@@ -184,6 +184,7 @@ textarea { min-height: 96px; line-height: 1.5; resize: vertical; }
 .queue-meta { justify-content: flex-start; margin-top: 10px; color: #704b45; font-size: 11px; }
 .queue-meta span + span::before { margin-right: 6px; content: "·"; }
 .status-dot, .status-chip { display: inline-flex; align-items: center; gap: 5px; font-weight: 600; text-transform: capitalize; }
+.correction-marker { display: inline-flex; width: fit-content; margin: 7px 0 0; padding: 3px 7px; color: var(--error); background: #f9d3c4; border: 1px solid currentColor; border-radius: 5px; font-size: 10px; font-weight: 700; }
 .status-dot { font-size: 10px; }
 .status-dot::before { width: 8px; height: 8px; background: var(--warning); border-radius: 50%; content: ""; }
 .status-dot.included::before { background: var(--success); }

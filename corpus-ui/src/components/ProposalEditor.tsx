@@ -7,7 +7,7 @@ interface ProposalEditorProps {
 	onChange: (proposals: ExpectedProposal[]) => void;
 }
 
-const emptyProposal = (): ExpectedProposal => ({ action: "create", titleIncludes: [], sourceMessageIds: [], assigneeAlias: null, dueDate: null });
+const emptyProposal = (): ExpectedProposal => ({ action: "create", titleIncludes: [], sourceMessageIds: [], projectName: null, assigneeAlias: null, dueDate: null });
 
 export function ProposalEditor({ proposals, messages, invalidFields, onChange }: ProposalEditorProps) {
 	function patch(index: number, value: Partial<ExpectedProposal>) {
@@ -29,6 +29,7 @@ export function ProposalEditor({ proposals, messages, invalidFields, onChange }:
 				</div>
 				<label>Title must include<input id={`proposal-title-${index}`} value={proposal.titleIncludes.join(", ")} onChange={event => patch(index, { titleIncludes: event.target.value.split(",").map(value => value.trim()) })} onBlur={() => patch(index, { titleIncludes: proposal.titleIncludes.filter(Boolean) })} placeholder="sponsor, outreach, deck" aria-invalid={invalidFields.includes(`proposal-title-${index}`)} aria-describedby={`title-help-${index}`} /></label>
 				<span className="field-help" id={`title-help-${index}`}>{invalidFields.includes(`proposal-title-${index}`) ? "Enter at least one matching term." : "Comma-separated matching terms."}</span>
+				<label>Project name<input value={proposal.projectName ?? ""} onChange={event => patch(index, { projectName: event.target.value || null })} placeholder="Optional project" /></label>
 				<label>Due date<input type="date" value={proposal.dueDate ?? ""} onChange={event => patch(index, { dueDate: event.target.value || null })} /></label>
 				<div className="source-picker" id={`proposal-source-${index}`} tabIndex={-1} aria-invalid={invalidFields.includes(`proposal-source-${index}`)} aria-describedby={invalidFields.includes(`proposal-source-${index}`) ? `source-error-${index}` : undefined}>
 					<span className="field-label">Source messages</span>

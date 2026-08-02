@@ -7,6 +7,7 @@ export type CorpusCaseSummary = {
 	id: string;
 	status: CorpusCase["adjudication"]["status"];
 	originType: CorpusCase["origin"]["type"];
+	reviewKind?: CorpusCase["origin"]["reviewKind"];
 	updatedAt: string;
 	messageCount: number;
 	proposalCount: number;
@@ -102,6 +103,7 @@ export class AzureBlobCorpusStore implements CorpusStore {
 		return {
 			status: value.adjudication.status,
 			origin: value.origin.type,
+			...(value.origin.reviewKind ? { reviewkind: value.origin.reviewKind } : {}),
 			updated: value.updatedAt,
 			messages: String(value.window.messages.length),
 			proposals: String(value.window.expected.proposals.length),
@@ -119,6 +121,7 @@ export class AzureBlobCorpusStore implements CorpusStore {
 					id,
 					status: zStatus(item.metadata.status),
 					originType: zOrigin(item.metadata.origin),
+					reviewKind: zReviewKind(item.metadata.reviewkind),
 					updatedAt: item.metadata.updated,
 					messageCount: Number(item.metadata.messages ?? 0),
 					proposalCount: Number(item.metadata.proposals ?? 0),
@@ -132,6 +135,7 @@ export class AzureBlobCorpusStore implements CorpusStore {
 				id: value.id,
 				status: value.adjudication.status,
 				originType: value.origin.type,
+				reviewKind: value.origin.reviewKind,
 				updatedAt: value.updatedAt,
 				messageCount: value.window.messages.length,
 				proposalCount: value.window.expected.proposals.length,
@@ -269,4 +273,9 @@ function zStatus(value: string): CorpusCase["adjudication"]["status"] {
 function zOrigin(value: string): CorpusCase["origin"]["type"] {
 	if (value === "reviewed_proposal" || value === "sampled_no_task" || value === "manual_scenario") return value;
 	throw new Error("Corpus blob has invalid origin metadata.");
+}
+
+function zReviewKind(value: string | undefined): CorpusCase["origin"]["reviewKind"] {
+	if (value === undefined || value === "incorrect_proposal") return value;
+	throw new Error("Corpus blob has invalid review kind metadata.");
 }
