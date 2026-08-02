@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { automaticCandidateEligible, AzureTaskExtractor, containsSensitiveContent, mergeRelatedTaskCandidates, minimizeText, normalizeExtractedDate, sensitiveContentReasons } from "../dist/azure-openai.js";
+import { automaticCandidateEligible, AzureTaskExtractor, containsSensitiveContent, mergeRelatedTaskCandidates, minimizeText, normalizeExtractedDate, sensitiveContentReasons, shouldReconcileTaskProposals, shouldSelectTaskContext } from "../dist/azure-openai.js";
 
 test("minimizeText removes common credentials and personal contact data", () => {
 	const value = minimizeText(
@@ -24,6 +24,15 @@ test("extracted dates are normalized or discarded before review", () => {
 	assert.equal(normalizeExtractedDate("2026-07-28T12:30:00Z"), "2026-07-28");
 	assert.equal(normalizeExtractedDate("2026-02-30"), null);
 	assert.equal(normalizeExtractedDate("07/28/2026"), null);
+});
+
+test("auxiliary AI stages run only when they add material value", () => {
+	assert.equal(shouldSelectTaskContext(24), false);
+	assert.equal(shouldSelectTaskContext(25), true);
+	assert.equal(shouldReconcileTaskProposals(1, 0), false);
+	assert.equal(shouldReconcileTaskProposals(2, 0), true);
+	assert.equal(shouldReconcileTaskProposals(1, 1), true);
+	assert.equal(shouldReconcileTaskProposals(0, 1), false);
 });
 
 const config = {
@@ -91,6 +100,45 @@ test("Azure extractor authenticates, bounds output, and uses the configured depl
 			timestamp: "2026-07-13T00:00:00Z", contextRole: "primary",
 		}]);
 		assert.deepEqual(extraction.metadata, { priorities: ["High"], sizes: ["Small"], projects: ["Communications Team"] });
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("Azure extractor retries transient rate limits using provider guidance", async () => {
+	const originalFetch = globalThis.fetch;
+	let calls = 0;
+	globalThis.fetch = async () => {
+		calls++;
+		if (calls === 1) return Response.json({ error: { message: "rate limited" } }, { status: 429, headers: { "retry-after-ms": "0" } });
+		return Response.json({ choices: [{ message: { content: JSON.stringify({ tasks: [], ambiguities: [] }) } }] });
+	};
+	try {
+		const result = await new AzureTaskExtractor(config, async () => "token").extract([
+			{ id: "m1", authorAlias: "USER_1", text: "Ship it", timestamp: "2026-07-13T00:00:00Z", contextRole: "primary" },
+		]);
+		assert.equal(calls, 2);
+		assert.deepEqual(result.result.tasks, []);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("Azure extractor bounds persistent rate-limit retries", async () => {
+	const originalFetch = globalThis.fetch;
+	let calls = 0;
+	globalThis.fetch = async () => {
+		calls++;
+		return Response.json({ error: { message: "rate limited" } }, { status: 429, headers: { "retry-after-ms": "0" } });
+	};
+	try {
+		await assert.rejects(
+			new AzureTaskExtractor(config, async () => "token").extract([
+				{ id: "m1", authorAlias: "USER_1", text: "Ship it", timestamp: "2026-07-13T00:00:00Z", contextRole: "primary" },
+			]),
+			/429/,
+		);
+		assert.equal(calls, 3);
 	} finally {
 		globalThis.fetch = originalFetch;
 	}

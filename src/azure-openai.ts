@@ -196,6 +196,14 @@ export function automaticCandidateEligible(assessment?: AutomaticCandidateAssess
 		&& assessment.sensitivity === "safe");
 }
 
+export function shouldSelectTaskContext(messageCount: number) {
+	return messageCount > 24;
+}
+
+export function shouldReconcileTaskProposals(candidateCount: number, pendingProposalCount: number) {
+	return candidateCount > 1 || (candidateCount > 0 && pendingProposalCount > 0);
+}
+
 export function mergeRelatedTaskCandidates(tasks: ExtractedTask[]) {
 	const grouped: ExtractedTask[] = [];
 	const compatibleValue = (left: unknown, right: unknown) => left == null || right == null || left === right;
@@ -541,6 +549,43 @@ function addDeterministicAmbiguities(extraction: ExtractionResult, messages: Min
 	return extraction;
 }
 
+function providerRetryDelayMs(response: Response, attempt: number) {
+	const retryAfterMsHeader = response.headers.get("retry-after-ms") ?? response.headers.get("x-ms-retry-after-ms");
+	if (retryAfterMsHeader !== null) {
+		const retryAfterMs = Number(retryAfterMsHeader);
+		if (Number.isFinite(retryAfterMs)) return Math.min(30_000, Math.max(0, retryAfterMs));
+	}
+	const retryAfter = response.headers.get("retry-after");
+	if (retryAfter !== null) {
+		const seconds = Number(retryAfter);
+		if (Number.isFinite(seconds)) return Math.min(30_000, Math.max(0, seconds * 1000));
+		const date = Date.parse(retryAfter);
+		if (Number.isFinite(date)) return Math.min(30_000, Math.max(0, date - Date.now()));
+	}
+	return 5000 * (attempt + 1);
+}
+
+async function fetchProviderWithRetry(url: string, init: RequestInit, attempts = 3) {
+	for (let attempt = 0; ; attempt++) {
+		const response = await fetch(url, init);
+		const retryable = response.status === 429 || response.status === 500 || response.status === 502 || response.status === 503 || response.status === 504;
+		if (!retryable || attempt + 1 >= attempts) return response;
+		await response.body?.cancel().catch(() => undefined);
+		await new Promise<void>((resolve, reject) => {
+			const onAbort = () => {
+				clearTimeout(timer);
+				reject(init.signal?.reason ?? new Error("Provider request aborted."));
+			};
+			const timer = setTimeout(() => {
+				init.signal?.removeEventListener("abort", onAbort);
+				resolve();
+			}, providerRetryDelayMs(response, attempt));
+			if (init.signal?.aborted) onAbort();
+			else init.signal?.addEventListener("abort", onAbort, { once: true });
+		});
+	}
+}
+
 async function invokeContextSelectionCompatible(options: {
 	url: string;
 	model: string;
@@ -554,7 +599,7 @@ async function invokeContextSelectionCompatible(options: {
 	const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 120000);
 	try {
 		const started = Date.now();
-		const response = await fetch(options.url, {
+		const response = await fetchProviderWithRetry(options.url, {
 			method: "POST",
 			signal: controller.signal,
 			headers: { ...(options.token ? { Authorization: `Bearer ${options.token}` } : {}), "Content-Type": "application/json" },
@@ -611,7 +656,7 @@ async function invokeProposalReconciliationCompatible(options: {
 	const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 120000);
 	try {
 		const started = Date.now();
-		const response = await fetch(options.url, {
+		const response = await fetchProviderWithRetry(options.url, {
 			method: "POST",
 			signal: controller.signal,
 			headers: { ...(options.token ? { Authorization: `Bearer ${options.token}` } : {}), "Content-Type": "application/json" },
@@ -695,7 +740,7 @@ async function invokeCompatible(options: {
 			{ type: "text", text: JSON.stringify(selectedMessages) },
 			...imageParts,
 		];
-		const response = await fetch(options.url, {
+		const response = await fetchProviderWithRetry(options.url, {
 			method: "POST",
 			signal: controller.signal,
 			headers: {
@@ -776,7 +821,7 @@ async function invokeAutomaticGateCompatible(options: {
 			proposedAction: candidate.proposed_action,
 			sourceMessageIds: candidate.source_message_ids,
 		}));
-		const response = await fetch(options.url, {
+		const response = await fetchProviderWithRetry(options.url, {
 			method: "POST",
 			signal: controller.signal,
 			headers: {
@@ -829,7 +874,7 @@ async function invokeRagRerankerCompatible(options: {
 	const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 120000);
 	try {
 		const started = Date.now();
-		const response = await fetch(options.url, {
+		const response = await fetchProviderWithRetry(options.url, {
 			method: "POST",
 			signal: controller.signal,
 			headers: {

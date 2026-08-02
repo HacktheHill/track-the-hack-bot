@@ -30,7 +30,7 @@ import { randomUUID } from "node:crypto";
 import { isOrganizerGuild, type IntegrationConfig, type TeamMapping } from "./config.js";
 import { correctionFields, Database, proposalDismissalReasons, type CorrectionFlags, type ProposalDismissalReason, type ProposalMetrics, type ProposalRagCandidate } from "./database.js";
 import { OpenProjectClient, OpenProjectRequestError, openProjectAttachmentFileName, workPackageChangesApplied, workPackageMarkdownLink, type OpenProjectAttachmentInput } from "./openproject.js";
-import { attachExtractionDiagnostics, automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, StructuredOutputError, type ContextSelectionResult, type ExtractedTasks, type ExtractionResult, type MinimizedMessage, type ProposalReconciliationResult, type TaskExtractor } from "./azure-openai.js";
+import { attachExtractionDiagnostics, automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, normalizeExtractedDate, sanitizeGeneratedDescription, SensitiveContentError, shouldReconcileTaskProposals, shouldSelectTaskContext, StructuredOutputError, type ContextSelectionResult, type ExtractedTasks, type ExtractionResult, type MinimizedMessage, type ProposalReconciliationResult, type TaskExtractor } from "./azure-openai.js";
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
 import { composeOpenProjectMarkdown, describeProposalOperations, formatGeneratedTaskDescription, formatProposalContent, planExistingTaskOperations, sourceContentHash, taskReferencesAreValid, type MetadataFieldName, type ProposalMetadataPatch } from "./task-proposals.js";
 import { isExcludedChannel, projectIdForName, projectIdForProposedOwner, projectIdForTeamRoles, projectIdFromChannelNames, resolveProjectId } from "./project-resolution.js";
@@ -1608,7 +1608,7 @@ async function completeAiContext(
 	const priorities = await services.openProject.priorities();
 	const tentativeSizes = tentativeProjectId ? await services.openProject.sizeOptions(tentativeProjectId) : [];
 	let contextSelection: ContextSelectionResult = { messages: context.messages, deployment: "deterministic", latencyMs: 0 };
-	if (services.extractor.selectContext) try {
+	if (services.extractor.selectContext && shouldSelectTaskContext(context.messages.length)) try {
 		contextSelection = await services.extractor.selectContext(context.messages, [...context.focusIds]);
 	} catch (error) {
 		console.warn("AI context selection failed; using the bounded collected graph", { error: (error as Error).message });
@@ -1635,7 +1635,7 @@ async function completeAiContext(
 		proposals: groupedCandidates.map(candidate => ({ candidate })),
 		supersededPendingProposalIds: [], deployment: "deterministic", latencyMs: 0,
 	};
-	if (services.extractor.reconcileProposals) try {
+	if (services.extractor.reconcileProposals && shouldReconcileTaskProposals(groupedCandidates.length, pendingProposals.length)) try {
 		reconciliation = await services.extractor.reconcileProposals(extraction.inputMessages, groupedCandidates, pendingProposals);
 	} catch (error) {
 		console.warn("AI proposal reconciliation failed; using grounded candidates", { error: (error as Error).message });
