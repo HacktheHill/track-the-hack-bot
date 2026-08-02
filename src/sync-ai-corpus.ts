@@ -66,7 +66,18 @@ export async function reconcileCase(store: Pick<AzureBlobCorpusStore, "getCase" 
 	try {
 		const existing = await store.getCase(value.id);
 		const sourceChanged = existing.case.origin.fingerprint !== value.origin.fingerprint;
-		const reviewContextChanged = JSON.stringify(existing.case.reviewContext) !== JSON.stringify(value.reviewContext);
+		const reconstructedIds = new Set(existing.case.reviewContext?.reconstruction?.addedMessageIds ?? []);
+		const validMessageIds = new Set(existing.case.window.messages.map(message => message.id));
+		const reconstructedDiscordMessages = Object.fromEntries(Object.entries(existing.case.reviewContext?.discordMessages ?? {})
+			.filter(([id]) => reconstructedIds.has(id) && validMessageIds.has(id)));
+		const discordMessages = { ...reconstructedDiscordMessages, ...(value.reviewContext?.discordMessages ?? {}) };
+		const mergedReviewContext = Object.keys(discordMessages).length || existing.case.reviewContext?.reconstruction
+			? {
+				discordMessages,
+				...(existing.case.reviewContext?.reconstruction ? { reconstruction: existing.case.reviewContext.reconstruction } : {}),
+			}
+			: undefined;
+		const reviewContextChanged = contentHash(existing.case.reviewContext ?? null) !== contentHash(mergedReviewContext ?? null);
 		if (!sourceChanged && !reviewContextChanged) return "unchanged" as const;
 		await store.putCase(sourceChanged ? {
 			...value,
@@ -75,7 +86,7 @@ export async function reconcileCase(store: Pick<AzureBlobCorpusStore, "getCase" 
 			updatedAt: new Date().toISOString(),
 		} : {
 			...existing.case,
-			reviewContext: value.reviewContext,
+			reviewContext: mergedReviewContext,
 			updatedAt: new Date().toISOString(),
 		}, existing.etag);
 		return "updated" as const;

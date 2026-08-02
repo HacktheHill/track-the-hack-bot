@@ -18,6 +18,7 @@ export interface ExpectedProposal {
 	action: ProposalAction;
 	titleIncludes: string[];
 	sourceMessageIds: string[];
+	projectName?: string | null;
 	assigneeAlias?: string | null;
 	dueDate?: string | null;
 }
@@ -36,6 +37,12 @@ export interface CorpusCase {
 	};
 	reviewContext?: {
 		discordMessages: Record<string, { guildId: string; channelId: string; messageId: string; url: string }>;
+		reconstruction?: {
+			recoveredAt: string;
+			recoveredBy?: string;
+			baseFingerprint?: string;
+			addedMessageIds: string[];
+		};
 	};
 	adjudication: {
 		status: ReviewStatus;
@@ -46,6 +53,13 @@ export interface CorpusCase {
 	};
 	createdAt: string;
 	updatedAt: string;
+}
+
+export interface RecoveryPreview {
+	case: CorpusCase;
+	etag: string;
+	addedMessageIds: string[];
+	warnings: string[];
 }
 
 export interface CaseSummary {

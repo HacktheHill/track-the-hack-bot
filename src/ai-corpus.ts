@@ -93,6 +93,12 @@ export const corpusCaseSchema = z.object({
 			messageId: z.string().regex(/^\d+$/),
 			url: z.url(),
 		})),
+		reconstruction: z.object({
+			recoveredAt: z.iso.datetime(),
+			recoveredBy: z.string().max(200).optional(),
+			baseFingerprint: z.string().optional(),
+			addedMessageIds: z.array(z.string().min(1)),
+		}).optional(),
 	}).optional(),
 	adjudication: corpusAdjudicationSchema,
 	createdAt: z.iso.datetime(),
@@ -103,6 +109,13 @@ export const corpusCaseSchema = z.object({
 		if (!messageIds.has(id)) context.addIssue({ code: "custom", message: `Discord reference points to unknown corpus message ${id}.` });
 		const expectedUrl = `https://discord.com/channels/${reference.guildId}/${reference.channelId}/${reference.messageId}`;
 		if (reference.url !== expectedUrl) context.addIssue({ code: "custom", message: `Discord reference for ${id} has an invalid URL.` });
+	}
+	for (const id of value.reviewContext?.reconstruction?.addedMessageIds ?? []) {
+		if (!messageIds.has(id)) context.addIssue({ code: "custom", message: `Reconstruction points to unknown corpus message ${id}.` });
+		if (!value.reviewContext?.discordMessages[id]) context.addIssue({ code: "custom", message: `Reconstructed message ${id} requires a Discord reference.` });
+	}
+	if (new Set(value.reviewContext?.reconstruction?.addedMessageIds ?? []).size !== (value.reviewContext?.reconstruction?.addedMessageIds.length ?? 0)) {
+		context.addIssue({ code: "custom", message: "Reconstructed corpus message IDs must be unique." });
 	}
 });
 

@@ -4,8 +4,9 @@ import { CreateDialog } from "./components/CreateDialog";
 import { ExcludeDialog } from "./components/ExcludeDialog";
 import { ProposalEditor } from "./components/ProposalEditor";
 import { Queue } from "./components/Queue";
+import { RecoverContextDialog } from "./components/RecoverContextDialog";
 import { Timeline } from "./components/Timeline";
-import type { CaseSummary, CorpusCase, DashboardSummary, ExclusionReason, ReviewStatus } from "./types";
+import type { CaseSummary, CorpusCase, DashboardSummary, ExclusionReason, RecoveryPreview, ReviewStatus } from "./types";
 
 type Notice = { type: "error" | "success"; text: string } | null;
 
@@ -23,6 +24,7 @@ export default function App() {
 	const [notice, setNotice] = useState<Notice>(null);
 	const [createOpen, setCreateOpen] = useState(false);
 	const [excludeOpen, setExcludeOpen] = useState(false);
+	const [recoverOpen, setRecoverOpen] = useState(false);
 	const listRequest = useRef(0);
 	const caseRequest = useRef(0);
 	const caseHeading = useRef<HTMLHeadingElement>(null);
@@ -148,6 +150,28 @@ export default function App() {
 		finally { setBusy(false); }
 	}
 
+	function openRecovery() {
+		if (dirty) { setNotice({ type: "error", text: "Save or discard the visible changes before recovering Discord context." }); return; }
+		setNotice(null);
+		setRecoverOpen(true);
+	}
+
+	async function previewRecovery(messageUrls: string[]) {
+		if (!draft) throw new Error("No case is selected.");
+		try {
+			setBusy(true); setNotice(null);
+			return await corpusApi.recoverContext(draft.id, messageUrls, etag);
+		} finally { setBusy(false); }
+	}
+
+	function applyRecovery(preview: RecoveryPreview) {
+		setDraft(preview.case);
+		setEtag(preview.etag);
+		setInvalidFields(validate(preview.case).flatMap(error => error.field ? [error.field] : []));
+		setRecoverOpen(false);
+		setNotice({ type: "success", text: `Added ${preview.addedMessageIds.length} recovered message${preview.addedMessageIds.length === 1 ? "" : "s"} to the draft. Review and save this pending case.` });
+	}
+
 	const counts = {
 		total: summary.counters?.total ?? summary.total ?? 0,
 		pending: summary.counters?.pending ?? summary.pending ?? 0,
@@ -174,7 +198,7 @@ export default function App() {
 				{draft ? <>
 					<div className="case-main" aria-busy={busy}>
 						<div className="case-title"><div><span className={`status-chip ${draft.adjudication.status}`}>{draft.adjudication.status}</span><h2 ref={caseHeading} tabIndex={-1}>{draft.id}</h2><p>{draft.origin.type} origin · {draft.window.mode} mode · updated {formatDate(draft.updatedAt)}{dirty ? " · unsaved changes" : ""}</p></div><div className="case-mark">#{draft.schemaVersion}</div></div>
-						<Timeline messages={draft.window.messages} discordMessages={draft.reviewContext?.discordMessages} invalidEvidence={invalidFields.some(field => field.startsWith("role-"))} onChange={messages => {
+						<Timeline messages={draft.window.messages} discordMessages={draft.reviewContext?.discordMessages} invalidEvidence={invalidFields.some(field => field.startsWith("role-"))} onRecoverContext={openRecovery} onChange={messages => {
 							const next = { ...draft, window: { ...draft.window, messages } };
 							if (invalidFields.length) setInvalidFields(validate(next).flatMap(error => error.field ? [error.field] : []));
 							setDraft(next);
@@ -193,6 +217,7 @@ export default function App() {
 			</div>
 		</main>
 		<CreateDialog open={createOpen} onClose={() => setCreateOpen(false)} onCreate={createCase} />
+		{draft ? <RecoverContextDialog open={recoverOpen} busy={busy} onClose={() => setRecoverOpen(false)} onPreview={previewRecovery} onApply={applyRecovery} /> : null}
 		{draft ? <ExcludeDialog open={excludeOpen} busy={busy} initialReasons={draft.adjudication.exclusionReasons} initialNotes={draft.adjudication.notes} onClose={() => setExcludeOpen(false)} onExclude={async (reasons, notes) => {
 			const saved = await saveCase("excluded", true, { reasons, notes });
 			if (saved) setExcludeOpen(false);

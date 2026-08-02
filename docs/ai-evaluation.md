@@ -73,6 +73,23 @@ Review-derived cases also retain validated Discord guild, channel, and message
 references outside the evaluation window. The local desk links pseudonymous
 message labels back to Discord for authorized reviewers; these identifiers and
 URLs are never written to evaluation snapshots.
+
+When `DISCORD_TOKEN` and `ORGANIZER_GUILD_ID` are available locally, **Recover
+context** accepts up to 40 exact Discord message links from the organizer guild.
+The desk retrieves those messages through Discord REST without starting another
+Gateway client, reuses existing author aliases, assigns new pseudonymous message
+IDs, and previews the result before changing the draft. Applying a recovery
+resets the case to `pending`; the reviewer must verify evidence roles and proposal
+sources, then save and include it normally. Recovered source IDs and links remain
+review-only, and ETag checks prevent recovery from being applied over a newer
+case version. Daily synchronization preserves recovered evidence while its base
+source fingerprint is unchanged.
+
+Recovery currently preserves attachment metadata only. It does not retain image
+bytes, and the dialog warns when a recovered message has attachments. Keep a case
+excluded with `missing_attachment` whenever attachment contents are necessary to
+establish the expected outcome.
+
 Start `tth-bot-ai-evaluate` manually before release decisions; reports are
 written under `reports/<run-id>/` and corpus text is not printed to logs.
 

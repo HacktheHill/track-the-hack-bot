@@ -264,6 +264,12 @@ evaluation until included. An included case with zero expected proposals is a
 valid negative example. Unusable cases are retained as excluded records with
 structured reasons, but never enter evaluation exports.
 
+If `DISCORD_TOKEN` and `ORGANIZER_GUILD_ID` are set, the local desk can recover
+missing text context from exact organizer-server message links. Recovery uses
+Discord REST only, previews pseudonymized evidence, and resets the draft to
+pending. It does not preserve attachment contents, so image-dependent cases must
+remain excluded until private attachment storage is supported.
+
 Use **Export included** in the UI, then start the manual
 `tth-bot-ai-evaluate` Azure job. Local file evaluation remains available:
 

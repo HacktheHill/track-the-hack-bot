@@ -1,4 +1,4 @@
-import type { CaseSummary, CorpusCase, DashboardSummary, ReviewStatus } from "./types";
+import type { CaseSummary, CorpusCase, DashboardSummary, RecoveryPreview, ReviewStatus } from "./types";
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 	const response = await fetch(path, {
@@ -32,6 +32,10 @@ export const corpusApi = {
 	create: (value: CorpusCase) => request<{ case: CorpusCase; etag: string }>("/api/cases", {
 		method: "POST",
 		body: JSON.stringify({ case: value }),
+	}),
+	recoverContext: (id: string, messageUrls: string[], etag: string) => request<RecoveryPreview>(`/api/cases/${encodeURIComponent(id)}/reconstruction-preview`, {
+		method: "POST",
+		body: JSON.stringify({ messageUrls, etag }),
 	}),
 	exportIncluded: () => request<{ filename?: string; count?: number; message?: string }>("/api/export", { method: "POST" }),
 };

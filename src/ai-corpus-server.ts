@@ -4,12 +4,15 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import express, { type Request, type Response } from "express";
+import { REST } from "discord.js";
 import { z } from "zod";
 import { AzureBlobCorpusStore, type CorpusStore } from "./ai-corpus-blob.js";
-import { corpusCaseSchema, sanitizeCorpusCase } from "./ai-corpus.js";
+import { corpusCaseSchema, sanitizeCorpusCase, type CorpusCase } from "./ai-corpus.js";
 import { loadAiCorpusConfig } from "./ai-corpus-config.js";
+import { createDiscordCorpusRecovery, type CorpusRecoveryPreview } from "./discord-corpus-recovery.js";
 
 const caseRequestSchema = z.object({ case: corpusCaseSchema, etag: z.string().optional() });
+const recoveryRequestSchema = z.object({ etag: z.string().min(1), messageUrls: z.array(z.string().min(1)).min(1).max(40) });
 
 function localAuthority(value?: string) {
 	if (!value) return false;
@@ -26,7 +29,13 @@ function sessionToken(request: Request) {
 	return cookies?.[1] ? decodeURIComponent(cookies[1]) : undefined;
 }
 
-export function createCorpusApp(options: { store: CorpusStore; token: string; assetsDirectory: string; reviewer?: string }) {
+export function createCorpusApp(options: {
+	store: CorpusStore;
+	token: string;
+	assetsDirectory: string;
+	reviewer?: string;
+	recoverContext?: (value: CorpusCase, messageUrls: string[]) => Promise<CorpusRecoveryPreview>;
+}) {
 	const app = express();
 	app.disable("x-powered-by");
 	app.use((request, response, next) => {
@@ -65,6 +74,17 @@ export function createCorpusApp(options: { store: CorpusStore; token: string; as
 	app.get("/api/cases/:id", async (request, response, next) => {
 		try { response.json(await options.store.getCase(request.params.id)); }
 		catch (error) { next(error); }
+	});
+
+	app.post("/api/cases/:id/reconstruction-preview", async (request, response, next) => {
+		try {
+			if (!options.recoverContext) return response.status(503).send("Discord context recovery is not configured for this local review desk.");
+			const input = recoveryRequestSchema.parse(request.body);
+			const current = await options.store.getCase(request.params.id);
+			if (current.etag !== input.etag) return response.status(409).send("This case changed after it was opened. Reload before recovering context.");
+			const preview = await options.recoverContext(current.case, input.messageUrls);
+			response.json({ ...preview, etag: current.etag });
+		} catch (error) { next(error); }
 	});
 
 	app.put("/api/cases/:id", async (request, response, next) => {
@@ -123,9 +143,10 @@ export function createCorpusApp(options: { store: CorpusStore; token: string; as
 	});
 	app.use(express.static(options.assetsDirectory, { index: false, etag: true, maxAge: "1h" }));
 	app.use((error: unknown, _request: Request, response: Response, _next: unknown) => {
-		const statusCode = error && typeof error === "object" && "statusCode" in error && typeof error.statusCode === "number" ? error.statusCode : 500;
+		const statusCode = error instanceof z.ZodError ? 400 : error && typeof error === "object" && "statusCode" in error && typeof error.statusCode === "number" ? error.statusCode : 500;
 		const safeStatus = statusCode === 404 ? 404 : statusCode === 409 || statusCode === 412 ? 409 : statusCode >= 400 && statusCode < 500 ? 400 : 500;
-		response.status(safeStatus).send(safeStatus === 500 ? "Corpus operation failed. Check the local terminal for the error category." : (error as Error).message);
+		const detail = error instanceof z.ZodError ? error.issues[0]?.message ?? "Invalid corpus request." : (error as Error).message;
+		response.status(safeStatus).send(safeStatus === 500 ? "Corpus operation failed. Check the local terminal for the error category." : detail);
 		console.error("Corpus UI request failed", { status: safeStatus, error: error instanceof Error ? error.name : "unknown" });
 	});
 	return app;
@@ -139,7 +160,11 @@ async function main() {
 		prefix: config.AI_CORPUS_PREFIX,
 	});
 	const token = randomBytes(32).toString("base64url");
-	const app = createCorpusApp({ store, token, assetsDirectory: resolve("dist/corpus-ui"), reviewer: process.env.USER ?? process.env.USERNAME });
+	const reviewer = process.env.USER ?? process.env.USERNAME;
+	const recoverContext = process.env.DISCORD_TOKEN && process.env.ORGANIZER_GUILD_ID
+		? createDiscordCorpusRecovery({ rest: new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN), guildId: process.env.ORGANIZER_GUILD_ID, reviewer })
+		: undefined;
+	const app = createCorpusApp({ store, token, assetsDirectory: resolve("dist/corpus-ui"), reviewer, recoverContext });
 	app.listen(config.AI_CORPUS_UI_PORT, "127.0.0.1", () => {
 		console.log(`Corpus review desk: http://127.0.0.1:${config.AI_CORPUS_UI_PORT}/?token=${token}`);
 	});

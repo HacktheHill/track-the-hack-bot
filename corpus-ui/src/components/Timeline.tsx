@@ -5,6 +5,7 @@ interface TimelineProps {
 	discordMessages?: Record<string, { url: string }>;
 	invalidEvidence: boolean;
 	onChange: (messages: CorpusMessage[]) => void;
+	onRecoverContext: () => void;
 }
 
 const roles: Array<{ value: ContextRole | ""; label: string }> = [
@@ -17,7 +18,7 @@ const roles: Array<{ value: ContextRole | ""; label: string }> = [
 	{ value: "referenced_history", label: "Referenced history" },
 ];
 
-export function Timeline({ messages, discordMessages, invalidEvidence, onChange }: TimelineProps) {
+export function Timeline({ messages, discordMessages, invalidEvidence, onChange, onRecoverContext }: TimelineProps) {
 	function setRole(index: number, role: string) {
 		onChange(messages.map((message, messageIndex) => messageIndex === index
 			? { ...message, contextRole: role ? role as ContextRole : undefined, priority: role === "primary" ? true : undefined }
@@ -27,7 +28,7 @@ export function Timeline({ messages, discordMessages, invalidEvidence, onChange 
 	return <section className="timeline-panel" aria-labelledby="conversation-title">
 		<div className="section-heading">
 			<div><p className="eyebrow">Conversation evidence</p><h2 id="conversation-title">Timeline</h2></div>
-			<span>{messages.length} messages</span>
+			<div className="section-actions"><span>{messages.length} messages</span><button type="button" className="secondary" onClick={onRecoverContext}>Recover context</button></div>
 		</div>
 		<div className="timeline">
 			{invalidEvidence ? <p className="inline-error" id="evidence-role-error" role="alert">Choose the required primary / focal evidence role.</p> : null}
