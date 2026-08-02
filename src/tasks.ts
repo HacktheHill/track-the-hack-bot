@@ -983,15 +983,18 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 	await interaction.deferReply({ ephemeral: true });
 	if (subcommand === "reconcile") {
 		requireOrganizer(interaction, services);
+		const reconciliationId = interaction.options.getString("proposal", true);
 		const workPackageId = interaction.options.getInteger("work_package_id", true);
 		const workPackage = await services.openProject.workPackage(workPackageId);
 		await requireProjectAccess(interaction, projectIdFromWorkPackage(workPackage), services);
+		const attachments = await services.db.reconciliationAttachments(reconciliationId);
+		if (attachments.length) await services.openProject.attachWorkPackageImages(workPackageId, attachments);
 		await services.db.reconcileCreation(
-			interaction.options.getString("proposal", true),
+			reconciliationId,
 			interaction.user.id,
 			workPackageId,
 		);
-		await interaction.editReply("Creation reconciled; no second OpenProject task was created.");
+		await interaction.editReply(`Creation reconciled${attachments.length ? " and its missing images were uploaded" : ""}; no second OpenProject task was created.`);
 		return;
 	}
 	if (subcommand === "metrics") {

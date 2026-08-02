@@ -1205,6 +1205,17 @@ export class Database {
 		);
 	}
 
+	async reconciliationAttachments(id: string) {
+		const result = await this.pool.query<{ attachments: OpenProjectAttachmentInput[] }>(
+			`SELECT source_attachments AS attachments FROM task_proposals WHERE id=$1 AND status='needs_reconciliation'
+			 UNION ALL
+			 SELECT COALESCE(payload->'sourceAttachments','[]'::jsonb) AS attachments FROM task_drafts WHERE id=$1 AND status='needs_reconciliation'
+			 LIMIT 1`,
+			[id],
+		);
+		return result.rows[0]?.attachments ?? [];
+	}
+
 	async reconcileCreation(id: string, actorId: string, workPackageId: number) {
 		const client = await this.pool.connect();
 		try {
