@@ -382,6 +382,7 @@ test("proposal metrics aggregate RAG model and reviewer outcomes", async () => {
 		async query(sql) {
 			if (sql.includes("WITH evaluations AS")) return { rows: [{
 				evaluations: "20", recommendations: "8", abstentions: "10", failures: "2", average_latency_ms: "325.5",
+				review_abstentions: "6", no_commonality: "3", no_candidates: "1", errors: "1", reranker_unavailable: "1",
 			}] };
 			if (sql.includes("WITH decisions AS")) return { rows: [{
 				no_task: "3", incorrect: "2", reextracted: "1", reextracted_approved: "1",
@@ -402,6 +403,11 @@ test("proposal metrics aggregate RAG model and reviewer outcomes", async () => {
 	assert.equal(metrics.ragRecommendationRate, 8 / 18);
 	assert.equal(metrics.ragAbstentionRate, 10 / 18);
 	assert.equal(metrics.ragFailureRate, 0.1);
+	assert.equal(metrics.ragReviewAbstentions, 6);
+	assert.equal(metrics.ragNoCommonality, 3);
+	assert.equal(metrics.ragNoCandidates, 1);
+	assert.equal(metrics.ragErrors, 1);
+	assert.equal(metrics.ragRerankerUnavailable, 1);
 	assert.equal(metrics.ragRecommendationAcceptanceRate, 0.6);
 	assert.equal(metrics.ragMeanReciprocalRank, 0.7);
 	assert.equal(metrics.ragRecallAt3, 0.8);

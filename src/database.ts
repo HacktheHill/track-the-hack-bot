@@ -68,6 +68,11 @@ export type ProposalMetrics = {
 	ragRecommendations: number;
 	ragAbstentions: number;
 	ragFailures: number;
+	ragReviewAbstentions: number;
+	ragNoCommonality: number;
+	ragNoCandidates: number;
+	ragErrors: number;
+	ragRerankerUnavailable: number;
 	ragRecommendationRate: number;
 	ragAbstentionRate: number;
 	ragFailureRate: number;
@@ -1256,6 +1261,8 @@ export class Database {
 		);
 		const rag = await this.pool.query<{
 			evaluations: string; recommendations: string; abstentions: string; failures: string;
+			review_abstentions: string; no_commonality: string; no_candidates: string;
+			errors: string; reranker_unavailable: string;
 			average_latency_ms: string | null;
 		}>(
 			`WITH evaluations AS (
@@ -1272,6 +1279,11 @@ export class Database {
 				COUNT(*) FILTER (WHERE evaluation->>'outcome'='recommended')::text AS recommendations,
 				COUNT(*) FILTER (WHERE evaluation->>'outcome' IN ('review','no_commonality','no_candidates'))::text AS abstentions,
 				COUNT(*) FILTER (WHERE evaluation->>'outcome' IN ('error','reranker_unavailable'))::text AS failures,
+				COUNT(*) FILTER (WHERE evaluation->>'outcome'='review')::text AS review_abstentions,
+				COUNT(*) FILTER (WHERE evaluation->>'outcome'='no_commonality')::text AS no_commonality,
+				COUNT(*) FILTER (WHERE evaluation->>'outcome'='no_candidates')::text AS no_candidates,
+				COUNT(*) FILTER (WHERE evaluation->>'outcome'='error')::text AS errors,
+				COUNT(*) FILTER (WHERE evaluation->>'outcome'='reranker_unavailable')::text AS reranker_unavailable,
 				AVG(COALESCE((evaluation->>'latencyMs')::numeric,0) + COALESCE((evaluation->>'retrievalLatencyMs')::numeric,0) + COALESCE((evaluation->>'rerankLatencyMs')::numeric,0))
 					FILTER (WHERE evaluation->>'outcome'<>'disabled')::text AS average_latency_ms
 			FROM evaluations`,
@@ -1348,6 +1360,11 @@ export class Database {
 			ragRecommendations,
 			ragAbstentions,
 			ragFailures,
+			ragReviewAbstentions: Number(r?.review_abstentions ?? 0),
+			ragNoCommonality: Number(r?.no_commonality ?? 0),
+			ragNoCandidates: Number(r?.no_candidates ?? 0),
+			ragErrors: Number(r?.errors ?? 0),
+			ragRerankerUnavailable: Number(r?.reranker_unavailable ?? 0),
 			ragRecommendationRate: rate(ragRecommendations, ragCompleted),
 			ragAbstentionRate: rate(ragAbstentions, ragCompleted),
 			ragFailureRate: rate(ragFailures, ragEvaluations),

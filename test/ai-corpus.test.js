@@ -69,6 +69,13 @@ test("mutable or partially grounded reviewed proposals are excluded", () => {
 	const missingFinalReview = reviewedRow();
 	missingFinalReview.proposals[0].finalSnapshot = null;
 	assert.equal(buildCorpusWindow(missingFinalReview), undefined);
+
+	const targetlessUpdate = reviewedRow();
+	targetlessUpdate.decision.candidateAssessments[0].proposedAction = "update";
+	targetlessUpdate.proposals[0].action = "update";
+	targetlessUpdate.proposals[0].initialSnapshot.action = "update";
+	targetlessUpdate.proposals[0].finalSnapshot.action = "update";
+	assert.equal(buildCorpusWindow(targetlessUpdate), undefined);
 });
 
 test("automatic events use their dedicated candidate assessments", () => {

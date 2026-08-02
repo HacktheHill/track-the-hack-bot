@@ -150,6 +150,7 @@ export function buildCorpusWindow(input: ExportRow) {
 			sourceMessageIds,
 		});
 		const targetWorkPackageId = numberValue(snapshot.targetWorkPackageId) ?? proposal.targetWorkPackageId ?? undefined;
+		if (action !== "create" && !targetWorkPackageId) return undefined;
 		if (action !== "create" && targetWorkPackageId) routingTargets.push(sourceMessageIds);
 	}
 	const metadata = row.decision?.extractionMetadata;
