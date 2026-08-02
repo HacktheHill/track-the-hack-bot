@@ -601,10 +601,14 @@ export function citesExtractionFocus(sourceMessageIds: readonly string[], focusI
 	return sourceMessageIds.some(id => focusIds.has(id));
 }
 
-export function manualProposalButtons(proposalId: string, _action: "create" | "update" | "complete" | "reopen", _suggestedWorkPackageId?: number) {
+export function reviewedProposalAllowsDuplicate(action: "create" | "update" | "complete" | "reopen") {
+	return action === "create";
+}
+
+export function manualProposalButtons(proposalId: string, action: "create" | "update" | "complete" | "reopen", _suggestedWorkPackageId?: number) {
 	return [new ButtonBuilder()
 		.setCustomId(`op-review:${proposalId}`)
-		.setLabel("Review")
+		.setLabel(action === "create" ? "Review new task" : "Review")
 		.setStyle(ButtonStyle.Primary),
 	new ButtonBuilder().setCustomId(`op-dismiss-no-task:${proposalId}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
 	new ButtonBuilder().setCustomId(`op-incorrect:${proposalId}`).setLabel("Incorrect").setStyle(ButtonStyle.Secondary)];
@@ -776,7 +780,7 @@ async function createAndAnnounce(args: {
 	validateDateOrder(args.startDate, args.dueDate);
 	const duplicate = await services.openProject.possibleDuplicate(projectId, args.title);
 	if (duplicate && !args.allowDuplicate) {
-		throw new Error(`A similar open task already exists: ${services.openProject.workPackageUrl(duplicate.id)}. Use allow_duplicate to create anyway.`);
+		throw new Error(`A similar open task already exists: ${services.openProject.workPackageUrl(duplicate.id)}. Run /task create with allow_duplicate enabled to create anyway.`);
 	}
 	const types = await services.openProject.types();
 	const type = types.find(item => item.name.toLowerCase() === services.config.OPENPROJECT_DEFAULT_TYPE_NAME.toLowerCase()) ?? types[0];
@@ -1832,7 +1836,7 @@ async function completeAiCandidate(
 		return;
 	}
 	const advisory = ragCandidates.length
-		? `${ragCandidates.length} existing OpenProject ${ragCandidates.length === 1 ? "task may" : "tasks may"} track the same or related work. This proposal will still create a new task unless you select one.`
+		? `${ragCandidates.length} existing OpenProject ${ragCandidates.length === 1 ? "task may" : "tasks may"} track the same or related work. Select one below, or choose Review new task to keep this as new work.`
 		: undefined;
 	const proposal = await services.db.createProposal({
 		requesterId: interaction.user.id, channelId: interaction.channelId, projectId,
@@ -2309,6 +2313,7 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 			estimateInferred: proposal.metadata_inference.estimate,
 			sourceLinks: proposal.source_links,
 			sourceAttachments: proposal.source_attachments,
+			allowDuplicate: reviewedProposalAllowsDuplicate(proposal.action),
 		};
 		if (!await services.db.claimProposal(proposal.id, interaction.user.id)) throw new Error("This proposal is already being handled.");
 		try {

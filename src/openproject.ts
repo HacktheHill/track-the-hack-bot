@@ -221,7 +221,15 @@ export class OpenProjectClient {
 			const form = new FormData();
 			form.append("metadata", new Blob([JSON.stringify({ fileName })], { type: "application/json" }));
 			form.append("file", new Blob([Uint8Array.from(attachment.bytes)], { type: attachment.detectedContentType }), fileName);
-			await this.request<Attachment>(`${containerPath}/attachments`, { method: "POST", body: form });
+			try {
+				await this.request<Attachment>(`${containerPath}/attachments`, { method: "POST", body: form });
+			} catch (error) {
+				// The upload may commit before a proxy or serializer fails to return its HAL response.
+				const recovered = await this.collection<Attachment>(`${containerPath}/attachments?pageSize=100`)
+					.then(current => current.some(item => item.fileName === fileName))
+					.catch(() => false);
+				if (!recovered) throw error;
+			}
 			existingNames.add(fileName);
 		}
 	}

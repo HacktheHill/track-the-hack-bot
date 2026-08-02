@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, directProposalDismissalReason, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, handleProposalButton, handleProposalTargetSelect, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, proposalReviewComponents, relevantImageAttachments, removeProposalReviewCard, taskCommand, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
+import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, directProposalDismissalReason, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, handleProposalButton, handleProposalTargetSelect, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, proposalReviewComponents, relevantImageAttachments, removeProposalReviewCard, reviewedProposalAllowsDuplicate, taskCommand, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
 import { formatProposalContent } from "../dist/task-proposals.js";
 import { normalizeTaskTitle, OpenProjectClient, openProjectAttachmentFileName, titlesLikelyDuplicate, workPackageMarkdownLink } from "../dist/openproject.js";
 
@@ -220,14 +220,15 @@ test("AI task descriptions omit URLs from cited messages", () => {
 	assert.equal(description, "Create the outreach tracker.");
 });
 
-test("proposal controls expose the three direct review outcomes", () => {
+test("proposal controls make reviewed create proposals an explicit new-task choice", () => {
 	for (const action of ["create", "update", "complete", "reopen"]) {
 		const buttons = manualProposalButtons("proposal", action).map(button => button.toJSON());
 		assert.deepEqual(buttons.map(button => [button.custom_id, button.label]), [
-			["op-review:proposal", "Review"],
+			["op-review:proposal", action === "create" ? "Review new task" : "Review"],
 			["op-dismiss-no-task:proposal", "Dismiss"],
 			["op-incorrect:proposal", "Incorrect"],
 		]);
+		assert.equal(reviewedProposalAllowsDuplicate(action), action === "create");
 	}
 	assert.equal(directProposalDismissalReason("op-dismiss-no-task:proposal"), "not_actionable");
 	assert.equal(directProposalDismissalReason("op-incorrect:proposal"), "incorrect_proposal");
@@ -271,6 +272,7 @@ test("RAG proposal candidates use a bounded single-choice target menu", () => {
 		{ workPackageId: 43, projectId: 7, lockVersion: 1, subject: "Sponsor outreach", retrievalRank: 1, relationship: "related", confidence: 0.8, similarity: 0.69 },
 	]);
 	const menu = rows[1].toJSON().components[0];
+	assert.equal(rows[0].toJSON().components[0].label, "Review new task");
 	assert.equal(menu.custom_id, "op-existing-target:proposal");
 	assert.deepEqual(menu.options.map(option => [option.value, option.label]), [
 		["42", "#42 Sponsor prospectus"],
@@ -521,6 +523,68 @@ test("OpenProject creation uploads Discord images and embeds native attachment r
 		assert.ok(upload);
 		assert.equal(JSON.parse(await upload.init.body.get("metadata").text()).fileName, "a1-schema.png");
 		assert.equal(upload.init.body.get("file").type, "image/png");
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("OpenProject creation recovers an attachment committed before a failed upload response", async () => {
+	const calls = [];
+	let attachmentLists = 0;
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init = {}) => {
+		calls.push({ url: String(url), init });
+		if (String(url).includes("cdn.discordapp.com")) {
+			return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+		}
+		if (String(url).endsWith("/attachments?pageSize=100")) {
+			attachmentLists++;
+			return Response.json({ _embedded: { elements: attachmentLists === 1 ? [] : [{ id: 8, fileName: "a1-schema.png" }] }, _links: {} });
+		}
+		if (String(url).endsWith("/attachments") && init.method === "POST") {
+			return new Response(JSON.stringify([{ code: "invalid_type", path: ["_type"], message: "Invalid input: expected string, received undefined" }]), { status: 500 });
+		}
+		if (String(url).endsWith("/form")) return Response.json({ _embedded: { validationErrors: {} } });
+		return Response.json({ id: 2186, subject: "Ship portal", lockVersion: 1, _links: {} });
+	};
+	try {
+		const client = new OpenProjectClient({ OPENPROJECT_BASE_URL: "https://project.example", OPENPROJECT_API_KEY: "test" });
+		assert.equal((await client.createWorkPackage({
+			projectId: 3, subject: "Ship portal", description: "Complete it",
+			attachments: [{ id: "a1", name: "schema.png", url: "https://cdn.discordapp.com/attachments/1/2/schema.png" }],
+		})).id, 2186);
+		assert.equal(calls.filter(call => call.url.endsWith("/attachments") && call.init.method === "POST").length, 1);
+		assert.equal(attachmentLists, 2);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("OpenProject creation still requires reconciliation when a failed upload did not commit", async () => {
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url, init = {}) => {
+		if (String(url).includes("cdn.discordapp.com")) {
+			return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+		}
+		if (String(url).endsWith("/attachments?pageSize=100")) return Response.json({ _embedded: { elements: [] }, _links: {} });
+		if (String(url).endsWith("/attachments") && init.method === "POST") {
+			return new Response(JSON.stringify([{ code: "invalid_type", path: ["_type"], message: "Invalid input: expected string, received undefined" }]), { status: 500 });
+		}
+		if (String(url).endsWith("/form")) return Response.json({ _embedded: { validationErrors: {} } });
+		return Response.json({ id: 2186, subject: "Ship portal", lockVersion: 1, _links: {} });
+	};
+	try {
+		const client = new OpenProjectClient({ OPENPROJECT_BASE_URL: "https://project.example", OPENPROJECT_API_KEY: "test" });
+		await assert.rejects(client.createWorkPackage({
+			projectId: 3, subject: "Ship portal", description: "Complete it",
+			attachments: [{ id: "a1", name: "schema.png", url: "https://cdn.discordapp.com/attachments/1/2/schema.png" }],
+		}), error => {
+			assert.equal(error.ambiguous, true);
+			assert.match(error.message, /task 2186 was created/);
+			assert.match(error.message, /OpenProject 500/);
+			assert.match(error.message, /_type/);
+			return true;
+		});
 	} finally {
 		globalThis.fetch = originalFetch;
 	}

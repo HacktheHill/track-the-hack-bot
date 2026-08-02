@@ -336,7 +336,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					continue;
 				}
 				const advisory = ragCandidates.length
-					? `${ragCandidates.length} existing OpenProject ${ragCandidates.length === 1 ? "task may" : "tasks may"} track the same or related work. This proposal will still create a new task unless a reviewer selects one.`
+					? `${ragCandidates.length} existing OpenProject ${ragCandidates.length === 1 ? "task may" : "tasks may"} track the same or related work. Select one below, or choose Review new task to keep this as new work.`
 					: undefined;
 				const citedIds = new Set(task.source_message_ids);
 				const reviewers = new Set<string>(source.filter(message => citedIds.has(message.id)).map(message => message.author.id));
