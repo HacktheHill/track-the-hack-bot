@@ -111,6 +111,19 @@ test("manual ambiguous drafts can be reconciled transactionally", async () => {
 	assert.equal(queries.some(({ sql }) => sql.includes("openproject_work_package_id,event")), true);
 });
 
+test("reconciliation loads pending proposal images before finalizing", async () => {
+	let query;
+	const attachments = [{ id: "image", name: "banner.png", contentType: "image/png", url: "https://cdn.discordapp.com/banner.png" }];
+	const db = databaseWithPool({ async query(sql, values) {
+		query = { sql, values };
+		return { rowCount: 1, rows: [{ attachments }] };
+	} });
+	assert.deepEqual(await db.reconciliationAttachments("proposal"), attachments);
+	assert.match(query.sql, /source_attachments AS attachments/);
+	assert.match(query.sql, /payload->'sourceAttachments'/);
+	assert.deepEqual(query.values, ["proposal"]);
+});
+
 test("AI proposal metadata is persisted for reviewed task creation", async () => {
 	let inserted;
 	const db = databaseWithPool({
