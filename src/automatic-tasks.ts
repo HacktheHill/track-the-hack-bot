@@ -1,5 +1,5 @@
 import { Client, Message, PermissionFlagsBits, type MessageCreateOptions } from "discord.js";
-import { automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, SensitiveContentError, StructuredOutputError, type ContextSelectionResult, type MinimizedMessage, type ProposalReconciliationResult, type TaskExtractor } from "./azure-openai.js";
+import { automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, SensitiveContentError, shouldReconcileTaskProposals, shouldSelectTaskContext, StructuredOutputError, type ContextSelectionResult, type MinimizedMessage, type ProposalReconciliationResult, type TaskExtractor } from "./azure-openai.js";
 import { isOrganizerGuild, type IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient, titlesLikelyDuplicate, workPackageMarkdownLink } from "./openproject.js";
@@ -227,10 +227,12 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				...window.messages.map(message => message.id),
 				...minimizedCandidates.filter(message => message.contextRole === "reply_target" || message.contextRole === "thread_root").map(message => message.id),
 			]);
+			const needsContextSelection = shouldSelectTaskContext(minimizedCandidates.length);
 			let contextSelection: ContextSelectionResult = {
-				messages: minimizedCandidates.filter(message => fallbackIds.has(message.id)), deployment: "deterministic", latencyMs: 0,
+				messages: needsContextSelection ? minimizedCandidates.filter(message => fallbackIds.has(message.id)) : minimizedCandidates,
+				deployment: "deterministic", latencyMs: 0,
 			};
-			if (services.extractor.selectContext) try {
+			if (services.extractor.selectContext && needsContextSelection) try {
 				contextSelection = await services.extractor.selectContext(minimizedCandidates, [primary.id]);
 			} catch (error) {
 				console.warn("Automatic AI context selection failed; using the bounded collected graph", { error: (error as Error).message });
@@ -278,7 +280,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				supersededPendingProposalIds: [], deployment: "deterministic", latencyMs: 0,
 			};
 			let reconciliationSucceeded = false;
-			if (services.extractor.reconcileProposals) try {
+			if (services.extractor.reconcileProposals && shouldReconcileTaskProposals(groupedTasks.length, pendingProposals.length)) try {
 				reconciliation = await services.extractor.reconcileProposals(extraction.inputMessages, groupedTasks, pendingProposals, affectedPendingProposalIds);
 				reconciliationSucceeded = true;
 			} catch (error) {
