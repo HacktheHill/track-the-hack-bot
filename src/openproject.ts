@@ -219,7 +219,7 @@ export class OpenProjectClient {
 			const { fileName } = attachment;
 			if (existingNames.has(fileName)) continue;
 			const form = new FormData();
-			form.append("metadata", new Blob([JSON.stringify({ fileName })], { type: "application/json" }));
+			form.append("metadata", JSON.stringify({ fileName }));
 			form.append("file", new Blob([Uint8Array.from(attachment.bytes)], { type: attachment.detectedContentType }), fileName);
 			try {
 				await this.request<Attachment>(`${containerPath}/attachments`, { method: "POST", body: form });

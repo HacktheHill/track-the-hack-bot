@@ -523,8 +523,12 @@ test("OpenProject creation uploads Discord images and embeds native attachment r
 		assert.equal(creationPayload.description.raw.includes("cdn.discordapp.com"), false);
 		const upload = calls.find(call => call.init.body instanceof FormData);
 		assert.ok(upload);
-		assert.equal(JSON.parse(await upload.init.body.get("metadata").text()).fileName, "a1-schema.png");
+		assert.equal(JSON.parse(upload.init.body.get("metadata")).fileName, "a1-schema.png");
 		assert.equal(upload.init.body.get("file").type, "image/png");
+		const multipart = await new Request("https://project.example/upload", { method: "POST", body: upload.init.body }).text();
+		assert.match(multipart, /name="metadata"\r\n\r\n\{"fileName":"a1-schema\.png"\}/);
+		assert.doesNotMatch(multipart, /name="metadata"; filename=/);
+		assert.match(multipart, /name="file"; filename="a1-schema\.png"/);
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
