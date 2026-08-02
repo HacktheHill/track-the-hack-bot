@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { corpusWindowSchema, optionalRatio, providerFailureCategory, retryableProviderFailure, runtimeProposalCandidates } from "../dist/evaluate-ai.js";
+import { corpusWindowSchema, evaluationTrace, optionalRatio, providerFailureCategory, retryableProviderFailure, runtimeProposalCandidates } from "../dist/evaluate-ai.js";
 import { OpenProjectClient, workPackageChangesApplied } from "../dist/openproject.js";
 import { explicitWorkPackageId, lexicalTitleSimilarity, OpenProjectRag, resolveProposalTarget, resolveProposedAction } from "../dist/rag.js";
 import { embeddingContentHash } from "../dist/embeddings.js";
@@ -30,6 +30,19 @@ test("AI evaluation retries transient provider failures but not deterministic ac
 test("AI evaluation reports unavailable ratios without comparisons", () => {
 	assert.equal(optionalRatio(0, 0), null);
 	assert.equal(optionalRatio(3, 4), 0.75);
+});
+
+test("AI evaluation traces extraction and gate rejection stages", () => {
+	assert.deepEqual(evaluationTrace(3, 2, [{
+		candidate_index: 0, has_activated_specific_work: false, has_remaining_work_or_trackable_transition: true,
+		is_durable: false, is_decision_ready: true, sensitivity: "safe", supporting_source_message_ids: ["m1"],
+	}, {
+		candidate_index: 1, has_activated_specific_work: true, has_remaining_work_or_trackable_transition: false,
+		is_durable: true, is_decision_ready: false, sensitivity: "uncertain", supporting_source_message_ids: ["m2"],
+	}], 0), {
+		extractedCandidates: 3, groundedCandidates: 2, finalCandidates: 0,
+		gateCriteriaFailures: { activation: 1, remainingWork: 1, durability: 1, decisionReadiness: 1, sensitivity: 1 },
+	});
 });
 
 test("exact OpenProject references are resolved without semantic phrase matching", () => {

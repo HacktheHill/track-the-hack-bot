@@ -75,26 +75,49 @@ function sleep(milliseconds: number) {
 	return new Promise(resolveSleep => setTimeout(resolveSleep, milliseconds));
 }
 
-const EVALUATOR_PIPELINE_VERSION = "automatic-v3.2";
+const EVALUATOR_PIPELINE_VERSION = "automatic-v3.3";
+const evaluationTraceSchema = z.object({
+	extractedCandidates: z.number().int().min(0),
+	groundedCandidates: z.number().int().min(0),
+	finalCandidates: z.number().int().min(0),
+	gateCriteriaFailures: z.object({ activation: z.number().int().min(0), remainingWork: z.number().int().min(0), durability: z.number().int().min(0), decisionReadiness: z.number().int().min(0), sensitivity: z.number().int().min(0) }),
+});
 const cachedCaseSchema = z.object({
 	version: z.literal(EVALUATOR_PIPELINE_VERSION),
 	predicted: z.array(z.unknown()),
+	trace: evaluationTraceSchema,
 });
+
+export function evaluationTrace(extractedCandidates: number, groundedCandidates: number, assessments: AutomaticCandidateAssessment[], finalCandidates: number) {
+	return evaluationTraceSchema.parse({
+		extractedCandidates,
+		groundedCandidates,
+		finalCandidates,
+		gateCriteriaFailures: {
+			activation: assessments.filter(item => !item.has_activated_specific_work).length,
+			remainingWork: assessments.filter(item => !item.has_remaining_work_or_trackable_transition).length,
+			durability: assessments.filter(item => !item.is_durable).length,
+			decisionReadiness: assessments.filter(item => !item.is_decision_ready).length,
+			sensitivity: assessments.filter(item => item.sensitivity !== "safe").length,
+		},
+	});
+}
 
 async function cachedPrediction(directory: string, key: string) {
 	try {
-		return cachedCaseSchema.parse(JSON.parse(await readFile(resolve(directory, `${key}.json`), "utf8"))).predicted as ExtractedTask[];
+		const cached = cachedCaseSchema.parse(JSON.parse(await readFile(resolve(directory, `${key}.json`), "utf8")));
+		return { predicted: cached.predicted as ExtractedTask[], trace: cached.trace };
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		return undefined;
 	}
 }
 
-async function storePrediction(directory: string, key: string, predicted: ExtractedTask[]) {
+async function storePrediction(directory: string, key: string, predicted: ExtractedTask[], trace: z.infer<typeof evaluationTraceSchema>) {
 	await mkdir(resolve(directory), { recursive: true, mode: 0o700 });
 	const target = resolve(directory, `${key}.json`);
 	const temporary = `${target}.${process.pid}.tmp`;
-	await writeFile(temporary, `${JSON.stringify({ version: EVALUATOR_PIPELINE_VERSION, predicted })}\n`, { mode: 0o600 });
+	await writeFile(temporary, `${JSON.stringify({ version: EVALUATOR_PIPELINE_VERSION, predicted, trace })}\n`, { mode: 0o600 });
 	await rename(temporary, target);
 	await chmod(target, 0o600);
 }
@@ -171,13 +194,19 @@ async function main() {
 	let lastRequestAt = 0;
 	const providerErrorCategories: Record<string, number> = {};
 	const cases: Array<Record<string, unknown>> = [];
+	const stageTotals = {
+		extractedCandidates: 0, groundedCandidates: 0, finalCandidates: 0,
+		gateCriteriaFailures: { activation: 0, remainingWork: 0, durability: 0, decisionReadiness: 0, sensitivity: 0 },
+	};
 
 	for (const item of selected) {
 		const { window } = item;
 		try {
 			let predicted: ExtractedTask[];
+			let trace: z.infer<typeof evaluationTraceSchema>;
 			if (item.cached) {
-				predicted = item.cached;
+				predicted = item.cached.predicted;
+				trace = item.cached.trace;
 				cacheHits++;
 				validOutputs++;
 			} else {
@@ -211,8 +240,15 @@ async function main() {
 				totalTokens += gate.usage?.totalTokens ?? 0;
 			}
 			predicted = runtimeProposalCandidates(extraction.result.tasks, window.messages as MinimizedMessage[], window.routing, window.mode, assessments);
-			await storePrediction(env.AI_EVAL_CACHE_DIR, item.key, predicted);
+			trace = evaluationTrace(extraction.result.tasks.length, grounded.length, assessments, predicted.length);
+			await storePrediction(env.AI_EVAL_CACHE_DIR, item.key, predicted, trace);
 			validOutputs++;
+			}
+			stageTotals.extractedCandidates += trace.extractedCandidates;
+			stageTotals.groundedCandidates += trace.groundedCandidates;
+			stageTotals.finalCandidates += trace.finalCandidates;
+			for (const key of Object.keys(stageTotals.gateCriteriaFailures) as Array<keyof typeof stageTotals.gateCriteriaFailures>) {
+				stageTotals.gateCriteriaFailures[key] += trace.gateCriteriaFailures[key];
 			}
 			const unmatched = new Set(predicted.map((_, index) => index));
 			let matched = 0;
@@ -244,7 +280,7 @@ async function main() {
 			truePositives += matched;
 			falseNegatives += window.expected.proposals.length - matched;
 			falsePositives += predicted.length - matched;
-			cases.push({ id: window.id, expectedProposals: window.expected.proposals.length, predictedProposals: predicted.length, matchedProposals: matched, validOutput: true, cached: Boolean(item.cached) });
+			cases.push({ id: window.id, expectedProposals: window.expected.proposals.length, predictedProposals: predicted.length, matchedProposals: matched, validOutput: true, cached: Boolean(item.cached), trace });
 		} catch (error) {
 			if (error instanceof StructuredOutputError) invalidOutputs++;
 			else {
@@ -278,6 +314,7 @@ async function main() {
 			uncachedCases: uncachedCount,
 		},
 		counts: { truePositives, falsePositives, falseNegatives },
+		stageTotals,
 		providerErrorCategories,
 		targets: { proposalPrecision: 0.95, ownerAccuracy: 0.90, deadlineAccuracy: 0.90, validOutputRate: 0.99 },
 		cases,
