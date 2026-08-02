@@ -66,7 +66,7 @@ export function createCorpusApp(options: {
 		try {
 			const status = z.enum(["pending", "included", "excluded"]).optional().parse(request.query.status);
 			const query = typeof request.query.query === "string" ? request.query.query.toLocaleLowerCase().trim() : "";
-			const cases = (await options.store.listCases()).filter(item => (!status || item.status === status) && (!query || `${item.id}\n${item.preview}`.toLocaleLowerCase().includes(query)));
+			const cases = (await options.store.listCases()).filter(item => (!status || item.status === status) && (!query || `${item.id}\n${item.originType}\n${item.reviewKind ?? ""}\n${item.preview}`.toLocaleLowerCase().includes(query)));
 			response.json({ cases });
 		} catch (error) { next(error); }
 	});

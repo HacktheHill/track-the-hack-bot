@@ -53,6 +53,25 @@ test("corpus exclusions require structured reasons and notes for other", () => {
 	assert.throws(() => corpusCaseSchema.parse({ ...sampleCase(), adjudication: { status: "approved", exclusionReasons: [], notes: "" } }));
 });
 
+test("correction cases require paired origin metadata and a changed expected value before inclusion", () => {
+	const pending = sampleCase();
+	pending.origin = {
+		type: "reviewed_proposal", reviewKind: "incorrect_proposal",
+		reviewFingerprint: contentHash(pending.window.expected.proposals),
+	};
+	assert.equal(corpusCaseSchema.parse(pending).adjudication.status, "pending");
+	assert.throws(() => corpusCaseSchema.parse({ ...pending, origin: { ...pending.origin, reviewFingerprint: undefined } }), /provided together/);
+	assert.throws(() => corpusCaseSchema.parse({ ...pending, adjudication: { ...pending.adjudication, status: "included" } }), /change or remove/);
+	const corrected = structuredClone(pending);
+	corrected.window.expected.proposals[0].titleIncludes = ["corrected"];
+	corrected.adjudication.status = "included";
+	assert.equal(corpusCaseSchema.parse(corrected).adjudication.status, "included");
+	const removed = structuredClone(pending);
+	removed.window.expected.proposals = [];
+	removed.adjudication.status = "included";
+	assert.equal(corpusCaseSchema.parse(removed).window.expected.proposals.length, 0);
+});
+
 test("Discord references remain review-only and use canonical message links", () => {
 	const value = sampleCase();
 	value.window.messages[0].channelId = "222";
@@ -91,6 +110,21 @@ test("Discord reference backfills preserve reviewed dispositions", async () => {
 	assert.deepEqual(written.value.window, existing.window);
 	assert.equal(written.value.reviewContext.discordMessages.m1.messageId, "111");
 	assert.equal(written.etag, '"one"');
+});
+
+test("idempotent correction sync preserves human expected output and disposition", async () => {
+	const seeded = sampleCase();
+	const reviewFingerprint = contentHash(seeded.window.expected.proposals);
+	seeded.origin = { type: "reviewed_proposal", fingerprint: "same-source", reviewKind: "incorrect_proposal", reviewFingerprint };
+	const existing = structuredClone(seeded);
+	existing.window.expected.proposals[0].titleIncludes = ["human", "correction"];
+	existing.adjudication.status = "included";
+	let written;
+	assert.equal(await reconcileCase({
+		async getCase() { return { case: existing, etag: '"one"' }; },
+		async putCase(value) { written = value; },
+	}, seeded), "unchanged");
+	assert.equal(written, undefined);
 });
 
 test("Discord reference backfills preserve reconstructed evidence", async () => {
@@ -184,7 +218,7 @@ test("localhost corpus API requires its session token and uses ETags", async () 
 	let value = sampleCase();
 	let etag = '"one"';
 	const store = {
-		async listCases() { return [{ id: value.id, status: value.adjudication.status, originType: value.origin.type, updatedAt: value.updatedAt, messageCount: 1, proposalCount: 1, preview: "sponsor" }]; },
+		async listCases() { return [{ id: value.id, status: value.adjudication.status, originType: value.origin.type, reviewKind: "incorrect_proposal", updatedAt: value.updatedAt, messageCount: 1, proposalCount: 1, preview: "sponsor" }]; },
 		async getCase() { return { case: value, etag }; },
 		async putCase(next, expected) {
 			if (expected && expected !== etag) throw Object.assign(new Error("conflict"), { statusCode: 412 });
@@ -211,6 +245,9 @@ test("localhost corpus API requires its session token and uses ETags", async () 
 		const summary = await fetch(`${base}/api/summary`, { headers: { Cookie: "corpus_session=secret" } });
 		assert.equal(summary.status, 200);
 		assert.equal((await summary.json()).pending, 1);
+		const correctionSearch = await fetch(`${base}/api/cases?query=incorrect_proposal`, { headers: { Cookie: "corpus_session=secret" } });
+		assert.equal(correctionSearch.status, 200);
+		assert.equal((await correctionSearch.json()).cases.length, 1);
 		const unauthorizedRecovery = await fetch(`${base}/api/cases/case-1/reconstruction-preview`, {
 			method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ etag: '"one"', messageUrls: ["url"] }),
 		});

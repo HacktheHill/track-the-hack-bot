@@ -35,7 +35,10 @@ The canonical corpus is stored as independently versioned case documents under
 `cases/` in the private `ai-evaluation` Blob container. The production sync job
 adds safe review-derived and sampled `no_task` cases as `pending`; it never
 admits a sampled negative without an explicit safe whole-window assessment.
-Review-derived windows retain only candidate source/support messages. Source
+Normal review-derived windows retain only candidate source/support messages.
+Incorrect-proposal dismissals are sync-only pending correction cases that retain
+the full safe bounded snapshot and seed the rejected output for editing. They
+cannot be included until that expected output is changed or removed. Source
 changes preserve notes but reset the case to `pending`; sensitive blocks,
 sensitive overrides, and unsafe input are not synchronized.
 

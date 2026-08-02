@@ -6,7 +6,7 @@ import { z } from "zod";
 import { AzureBlobCorpusStore } from "./ai-corpus-blob.js";
 import { contentHash, corpusCaseSchema, corpusWindowSchema, sanitizeCorpusCase, sanitizeCorpusWindow, type CorpusCase, type CorpusWindow } from "./ai-corpus.js";
 import { loadAiCorpusConfig } from "./ai-corpus-config.js";
-import { buildCorpusWindow, loadReviewedExtractionRows } from "./export-ai-corpus.js";
+import { buildCorpusWindow, buildPendingCorrectionWindow, loadReviewedExtractionRows } from "./export-ai-corpus.js";
 
 const { Pool } = pg;
 const databaseConfigSchema = z.object({ DATABASE_URL: z.string().min(1), ORGANIZER_GUILD_ID: z.string().regex(/^\d+$/) });
@@ -151,7 +151,10 @@ async function main() {
 			if (invalidated) await store.invalidateIncludedExports();
 		}
 		const rows = await loadReviewedExtractionRows(pool, corpusConfig.AI_CORPUS_SYNC_DAYS);
-		const reviewed = rows.map(row => ({ row, window: buildCorpusWindow(row) }));
+		const reviewed = rows.map(row => {
+			const correction = buildPendingCorrectionWindow(row);
+			return { row, window: buildCorpusWindow(row) ?? correction, correction: Boolean(correction) };
+		});
 		const queriedExtractionIds = await pool.query<{ id: string }>(
 			`SELECT id FROM ai_extraction_events WHERE schema_version='v3' AND input_snapshot IS NOT NULL
 			 AND created_at >= now() - ($1::text || ' days')::interval`,
@@ -163,9 +166,12 @@ async function main() {
 			await store.deleteCase(item.id);
 			excluded++;
 		}
-		for (const { row, window } of reviewed) {
+		for (const { row, window, correction } of reviewed) {
 			if (!window) { excluded++; continue; }
-			const value = caseFromWindow(window, { type: "reviewed_proposal", extractionEventId: row.id, fingerprint: contentHash(window) }, discordReviewContext(row.input_snapshot, window, databaseConfig.ORGANIZER_GUILD_ID));
+			const value = caseFromWindow(window, {
+				type: "reviewed_proposal", extractionEventId: row.id, fingerprint: contentHash(window),
+				...(correction ? { reviewKind: "incorrect_proposal" as const, reviewFingerprint: contentHash(window.expected.proposals) } : {}),
+			}, discordReviewContext(row.input_snapshot, window, databaseConfig.ORGANIZER_GUILD_ID));
 			const result = await reconcileCase(store, value);
 			if (result === "imported") imported++; else if (result === "updated") updated++; else unchanged++;
 		}

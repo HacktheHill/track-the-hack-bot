@@ -84,6 +84,8 @@ export const corpusCaseSchema = z.object({
 		type: z.enum(["reviewed_proposal", "sampled_no_task", "manual_scenario"]),
 		extractionEventId: z.string().optional(),
 		fingerprint: z.string().optional(),
+		reviewKind: z.literal("incorrect_proposal").optional(),
+		reviewFingerprint: z.string().length(64).regex(/^[a-f0-9]+$/).optional(),
 	}),
 	window: corpusWindowSchema,
 	reviewContext: z.object({
@@ -104,6 +106,15 @@ export const corpusCaseSchema = z.object({
 	createdAt: z.iso.datetime(),
 	updatedAt: z.iso.datetime(),
 }).superRefine((value, context) => {
+	if (Boolean(value.origin.reviewKind) !== Boolean(value.origin.reviewFingerprint)) {
+		context.addIssue({ code: "custom", message: "Correction review kind and fingerprint must be provided together." });
+	}
+	if (value.origin.reviewKind && value.origin.type !== "reviewed_proposal") {
+		context.addIssue({ code: "custom", message: "Correction reviews require a reviewed proposal origin." });
+	}
+	if (value.adjudication.status === "included" && value.origin.reviewFingerprint === contentHash(value.window.expected.proposals)) {
+		context.addIssue({ code: "custom", message: "Correction cases must change or remove the seeded expected proposals before inclusion." });
+	}
 	const messageIds = new Set(value.window.messages.map(message => message.id));
 	for (const [id, reference] of Object.entries(value.reviewContext?.discordMessages ?? {})) {
 		if (!messageIds.has(id)) context.addIssue({ code: "custom", message: `Discord reference points to unknown corpus message ${id}.` });
