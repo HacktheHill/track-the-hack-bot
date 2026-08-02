@@ -75,7 +75,7 @@ function sleep(milliseconds: number) {
 	return new Promise(resolveSleep => setTimeout(resolveSleep, milliseconds));
 }
 
-const EVALUATOR_PIPELINE_VERSION = "automatic-v3.3";
+const EVALUATOR_PIPELINE_VERSION = "automatic-v3.4";
 const evaluationTraceSchema = z.object({
 	extractedCandidates: z.number().int().min(0),
 	groundedCandidates: z.number().int().min(0),
