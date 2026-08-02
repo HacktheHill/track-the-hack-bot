@@ -437,6 +437,7 @@ test("AI metrics formatter reports operational quality without content", () => {
 		averageReviewDurationMs: 12000, averageExtractionLatencyMs: 950,
 		totalTokens: 4200, invalidOutputs: 1,
 		ragEvaluations: 20, ragRecommendations: 8, ragAbstentions: 10, ragFailures: 2,
+		ragReviewAbstentions: 6, ragNoCommonality: 3, ragNoCandidates: 1, ragErrors: 1, ragRerankerUnavailable: 1,
 		ragRecommendationRate: 8 / 18, ragAbstentionRate: 10 / 18, ragFailureRate: 0.1,
 		ragAverageLatencyMs: 325, ragSelections: 5, ragRecommendationAcceptanceRate: 0.6,
 		ragMeanReciprocalRank: 0.7, ragRecallAt3: 0.8, ragReviewedCandidates: 6,
@@ -448,6 +449,7 @@ test("AI metrics formatter reports operational quality without content", () => {
 	assert.match(text, /Assignee accepted: 90%/);
 	assert.match(text, /invalid outputs: 1/);
 	assert.match(text, /RAG: 20 evaluations/);
+	assert.match(text, /RAG outcomes: review: 6 · no commonality: 3 · no candidates: 1 · errors: 1 · reranker unavailable: 1/);
 	assert.match(text, /MRR: 0\.70/);
 	assert.match(text, /recall@3: 80%/);
 	assert.match(text, /keep new: 2\/6 \(33%\)/);

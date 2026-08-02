@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { corpusWindowSchema, providerFailureCategory, retryableProviderFailure, runtimeProposalCandidates } from "../dist/evaluate-ai.js";
+import { corpusWindowSchema, optionalRatio, providerFailureCategory, retryableProviderFailure, runtimeProposalCandidates } from "../dist/evaluate-ai.js";
 import { OpenProjectClient, workPackageChangesApplied } from "../dist/openproject.js";
 import { explicitWorkPackageId, lexicalTitleSimilarity, OpenProjectRag, resolveProposalTarget, resolveProposedAction } from "../dist/rag.js";
 import { embeddingContentHash } from "../dist/embeddings.js";
@@ -25,6 +25,11 @@ test("AI evaluation retries transient provider failures but not deterministic ac
 	assert.equal(retryableProviderFailure(new Error("azure:task-extractor 503: unavailable")), true);
 	assert.equal(providerFailureCategory(new TypeError("fetch failed")), "network_error");
 	assert.equal(retryableProviderFailure(new TypeError("fetch failed")), true);
+});
+
+test("AI evaluation reports unavailable ratios without comparisons", () => {
+	assert.equal(optionalRatio(0, 0), null);
+	assert.equal(optionalRatio(3, 4), 0.75);
 });
 
 test("exact OpenProject references are resolved without semantic phrase matching", () => {

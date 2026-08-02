@@ -59,6 +59,10 @@ function ratio(numerator: number, denominator: number) {
 	return denominator ? numerator / denominator : 0;
 }
 
+export function optionalRatio(numerator: number, denominator: number) {
+	return denominator ? numerator / denominator : null;
+}
+
 function sameSet(left: string[], right: string[]) {
 	return left.length === right.length && [...left].sort().every((value, index) => value === [...right].sort()[index]);
 }
@@ -260,8 +264,10 @@ async function main() {
 		metrics: {
 			proposalPrecision: ratio(truePositives, truePositives + falsePositives),
 			proposalRecall: ratio(truePositives, truePositives + falseNegatives),
-			ownerAccuracy: ratio(ownerCorrect, ownerCompared),
-			deadlineAccuracy: ratio(deadlineCorrect, deadlineCompared),
+			ownerAccuracy: optionalRatio(ownerCorrect, ownerCompared),
+			deadlineAccuracy: optionalRatio(deadlineCorrect, deadlineCompared),
+			ownerComparisons: ownerCompared,
+			deadlineComparisons: deadlineCompared,
 			validOutputRate: ratio(validOutputs, selected.length),
 			averageLatencyMs: ratio(totalLatencyMs, latencySamples),
 			totalTokens,
@@ -287,8 +293,8 @@ async function main() {
 		"| --- | ---: | ---: |",
 		`| Proposal precision | ${validOutputs ? percent(report.metrics.proposalPrecision) : "N/A"} | 95% |`,
 		`| Proposal recall | ${validOutputs ? percent(report.metrics.proposalRecall) : "N/A"} | — |`,
-		`| Owner accuracy | ${validOutputs ? percent(report.metrics.ownerAccuracy) : "N/A"} | 90% |`,
-		`| Deadline accuracy | ${validOutputs ? percent(report.metrics.deadlineAccuracy) : "N/A"} | 90% |`,
+		`| Owner accuracy | ${validOutputs && report.metrics.ownerAccuracy !== null ? percent(report.metrics.ownerAccuracy) : "N/A"} | 90% |`,
+		`| Deadline accuracy | ${validOutputs && report.metrics.deadlineAccuracy !== null ? percent(report.metrics.deadlineAccuracy) : "N/A"} | 90% |`,
 		`| Valid structured output | ${percent(report.metrics.validOutputRate)} | 99% |`,
 		`| Average latency | ${Math.round(report.metrics.averageLatencyMs)} ms | — |`,
 		`| Total tokens | ${report.metrics.totalTokens} | — |`,
