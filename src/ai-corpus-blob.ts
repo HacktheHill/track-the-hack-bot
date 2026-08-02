@@ -44,6 +44,11 @@ async function bodyText(body: NodeJS.ReadableStream | undefined) {
 	return Buffer.concat(chunks).toString("utf8");
 }
 
+export function blobEtagsEqual(left: string | undefined, right: string | undefined) {
+	const normalize = (value: string | undefined) => value?.replace(/^"|"$/g, "");
+	return normalize(left) === normalize(right);
+}
+
 export class AzureBlobCorpusStore implements CorpusStore {
 	private constructor(private readonly container: ContainerClient, private readonly prefix: string) {}
 
@@ -193,7 +198,7 @@ export class AzureBlobCorpusStore implements CorpusStore {
 		const actual = await this.includedCaseVersions();
 		const expected = manifest.caseVersions;
 		const ids = new Set([...Object.keys(actual), ...Object.keys(expected)]);
-		if ([...ids].some(id => actual[id] !== expected[id])) throw new Error("Included corpus changed after this export was created.");
+		if ([...ids].some(id => !blobEtagsEqual(actual[id], expected[id]))) throw new Error("Included corpus changed after this export was created.");
 	}
 
 	async assertExportCurrent(manifest: Pick<CorpusExportManifest, "caseVersions">) {

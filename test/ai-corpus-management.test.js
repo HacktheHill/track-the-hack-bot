@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { contentHash, corpusCaseSchema, corpusJsonl, parseCorpusJsonl } from "../dist/ai-corpus.js";
+import { blobEtagsEqual } from "../dist/ai-corpus-blob.js";
 import { createCorpusApp } from "../dist/ai-corpus-server.js";
 import { createDiscordCorpusRecovery, parseDiscordMessageUrl } from "../dist/discord-corpus-recovery.js";
 import { discordReviewContext, noTaskEventIsSafe, reconcileCase } from "../dist/sync-ai-corpus.js";
@@ -27,6 +28,13 @@ test("shared corpus JSONL parsing reports line numbers and stable hashes", () =>
 	assert.deepEqual(parseCorpusJsonl(corpusJsonl([value])), [value]);
 	assert.equal(contentHash({ b: 2, a: 1 }), contentHash({ a: 1, b: 2 }));
 	assert.throws(() => parseCorpusJsonl(`${JSON.stringify(value)}\n{"bad":true}\n`), /line 2/);
+});
+
+test("corpus export integrity accepts equivalent Azure ETag formats", () => {
+	assert.equal(blobEtagsEqual('"0x8DEF0678F8E6F23"', "0x8DEF0678F8E6F23"), true);
+	assert.equal(blobEtagsEqual('"0x1"', "0x2"), false);
+	assert.equal(blobEtagsEqual(undefined, undefined), true);
+	assert.equal(blobEtagsEqual(undefined, "0x1"), false);
 });
 
 test("corpus cases reject unknown sources and invalid focal windows", () => {
