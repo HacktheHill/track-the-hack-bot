@@ -1,9 +1,9 @@
-import { Client, Message, type MessageCreateOptions } from "discord.js";
-import { automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, SensitiveContentError, StructuredOutputError, type MinimizedMessage, type TaskExtractor } from "./azure-openai.js";
+import { Client, Message, PermissionFlagsBits, type MessageCreateOptions } from "discord.js";
+import { automaticCandidateEligible, containsSensitiveContent, extractionDiagnostics, mergeRelatedTaskCandidates, minimizeText, SensitiveContentError, StructuredOutputError, type ContextSelectionResult, type MinimizedMessage, type ProposalReconciliationResult, type TaskExtractor } from "./azure-openai.js";
 import { isOrganizerGuild, type IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient, titlesLikelyDuplicate, workPackageMarkdownLink } from "./openproject.js";
-import { AI_CONTEXT_GAP_MS, boundedDiscordContent, defaultAiDueDate, formatAiTaskDescription, inferCreationMetadata, proposalReviewComponents, relevantImageAttachments } from "./tasks.js";
+import { AI_CONTEXT_GAP_MS, boundedDiscordContent, defaultAiDueDate, formatAiTaskDescription, inferCreationMetadata, proposalReviewAllowed, proposalReviewComponents, relevantImageAttachments } from "./tasks.js";
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
 import { describeProposalOperations, formatProposalContent, planExistingTaskOperations, sourceContentHash, taskReferencesAreValid } from "./task-proposals.js";
 import { isExcludedChannel, projectIdForTeamRoles, projectIdFromChannelNames, resolveProjectId } from "./project-resolution.js";
@@ -56,6 +56,10 @@ export function automaticFocalWindows<T>(messages: readonly T[], limit = 30, gap
 	});
 }
 
+export function automaticBatchSource<T>(messages: readonly T[], limit = 6) {
+	return messages.slice(-limit);
+}
+
 export function proposalOwnerText(assigneeName?: string, accountableName?: string) {
 	const owners = [...new Set([
 		assigneeName ? `Assignee: ${assigneeName}` : undefined,
@@ -68,14 +72,55 @@ export function messageRevisionChanged(previousContent: string | undefined, curr
 	return previousContent === undefined || previousContent !== currentContent || previousAttachments !== currentAttachments;
 }
 
+export function reconciledSupersessionIds(input: {
+	reconciledCount: number;
+	eligibleCount: number;
+	extractedCount: number;
+	reconciliationSucceeded: boolean;
+	persistedProposalIds: ReadonlySet<string>;
+	recommendedSupersessionIds: string[];
+	invalidatableProposalIds: string[];
+}) {
+	if (input.reconciledCount === 1 && input.eligibleCount === 1 && input.persistedProposalIds.size > 0) {
+		return input.recommendedSupersessionIds.filter(id => !input.persistedProposalIds.has(id));
+	}
+	return [];
+}
+
 async function updateStoredReviewCard(primary: Message, services: AutomaticServices, proposalId: string, payload: ReviewCardPayload) {
 	const proposal = await services.db.proposal(proposalId);
 	if (!proposal?.review_message_id) return false;
 	const channel = await primary.client.channels.fetch(proposal.channel_id).catch(() => null);
-	if (!channel?.isTextBased() || !("messages" in channel)) return false;
-	const message = await channel.messages.fetch(proposal.review_message_id).catch(() => null);
-	if (!message) return false;
-	await message.edit(payload);
+	if (!channel?.isTextBased() || !("messages" in channel)) {
+		await services.db.markProposalDeliveryFailed(proposalId, "The revised proposal review channel is unavailable.");
+		throw new Error("The revised proposal review channel is unavailable.");
+	}
+	let message: Message | undefined;
+	try {
+		message = await channel.messages.fetch(proposal.review_message_id);
+	} catch (error) {
+		if (!(error && typeof error === "object" && "code" in error && error.code === 10008)) {
+			await services.db.markProposalDeliveryFailed(proposalId, `Could not fetch the revised proposal review card: ${(error as Error).message}`);
+			throw error;
+		}
+	}
+	if (message) {
+		try {
+			await message.edit(payload);
+			return true;
+		} catch (error) {
+			if (!(error && typeof error === "object" && "code" in error && error.code === 10008)) {
+				await services.db.markProposalDeliveryFailed(proposalId, `Could not update the revised proposal review card: ${(error as Error).message}`);
+				throw error;
+			}
+		}
+	}
+	if (!channel.isSendable()) throw new Error("The revised proposal review channel cannot accept a replacement card.");
+	const replacement = await channel.send(payload);
+	if (!await services.db.replaceProposalReviewMessage(proposalId, proposal.review_message_id, replacement.id)) {
+		await replacement.delete().catch(() => undefined);
+		throw new Error("The revised proposal was handled before its replacement review card could be attached.");
+	}
 	return true;
 }
 
@@ -86,22 +131,42 @@ async function enrichAutomaticContext(messages: Message[], focal: Message) {
 		roles.set(message.id, message.id === focal.id ? "primary" : index < focalIndex ? "preceding" : "subsequent");
 	}
 	const extras = new Map<string, Message>();
-	for (const message of messages) {
-		if (!message.reference?.messageId || roles.has(message.reference.messageId) || extras.has(message.reference.messageId)) continue;
-		const referenced = await message.fetchReference().catch(() => null);
-		if (referenced) {
-			extras.set(referenced.id, referenced);
-			roles.set(referenced.id, "reply_target");
-		}
-	}
+	const add = (message: Message, role: MinimizedMessage["contextRole"]) => {
+		if (roles.has(message.id) || extras.has(message.id) || extras.size + messages.length >= 60 || message.author.bot || message.system) return;
+		extras.set(message.id, message);
+		roles.set(message.id, role);
+	};
+	const queue = [focal];
 	if (focal.channel.isThread()) {
 		const starter = await focal.channel.fetchStarterMessage().catch(() => null);
-		if (starter && !roles.has(starter.id) && !extras.has(starter.id)) {
-			extras.set(starter.id, starter);
-			roles.set(starter.id, "thread_root");
+		if (starter) {
+			add(starter, "thread_root");
+			queue.push(starter);
 		}
 	}
-	return { messages: [...extras.values(), ...messages], roles };
+	let visited = 0;
+	for (const anchor of queue) {
+		if (visited++ >= 6 || extras.size + messages.length >= 60) break;
+		if (anchor.reference?.messageId) {
+			const referenced = await anchor.fetchReference().catch(() => null);
+			if (referenced && !roles.has(referenced.id) && !extras.has(referenced.id)) {
+				add(referenced, "reply_target");
+				queue.push(referenced);
+			}
+		}
+	}
+	for (const anchor of queue.slice(0, 6)) {
+		if (extras.size + messages.length >= 60) break;
+		if (!("messages" in anchor.channel)) continue;
+		const nearby = await anchor.channel.messages.fetch({ around: anchor.id, limit: 9 }).catch(() => null);
+		for (const message of [...(nearby?.values() ?? [])]
+			.filter(message => message.createdTimestamp < anchor.createdTimestamp)
+			.sort((left, right) => right.createdTimestamp - left.createdTimestamp)) add(message, "preceding");
+		for (const message of [...(nearby?.values() ?? [])]
+			.filter(message => message.createdTimestamp > anchor.createdTimestamp)
+			.sort((left, right) => left.createdTimestamp - right.createdTimestamp)) add(message, "subsequent");
+	}
+	return { messages: [...extras.values(), ...messages].sort((left, right) => left.createdTimestamp - right.createdTimestamp), roles };
 }
 
 export function registerAutomaticTaskDetection(client: Client, services: AutomaticServices) {
@@ -113,7 +178,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 		const batch = batches.get(channelId);
 		if (!batch) return;
 		batches.delete(channelId);
-		const batchSource = batch.messages.slice(-30);
+		const batchSource = automaticBatchSource(batch.messages);
 		if (batchSource[0] && await isExcludedChannel(batchSource[0].channelId, batchSource[0].guild!, services.config.excludedChannelIds)) return;
 		const seenCandidates: Array<{ title: string; action: string; projectId?: number; targetWorkPackageId?: number; assigneeId?: string }> = [];
 		for (const window of automaticFocalWindows(batchSource, 8)) {
@@ -131,7 +196,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			return alias;
 		};
 		const primary = window.focal;
-		const minimized: MinimizedMessage[] = source.map(message => {
+		const minimizedCandidates: MinimizedMessage[] = source.map(message => {
 			const raw = message.content.replace(/<@!?(\d+)>/g, (_, id: string) => aliasFor(id));
 			return {
 				id: message.id,
@@ -158,6 +223,19 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			const channelProjectId = await projectIdFromChannelNames(primary.channelId, primary.guild!, projects);
 			const priorities = await services.openProject.priorities();
 			const sizes = channelProjectId ? await services.openProject.sizeOptions(channelProjectId) : [];
+			const fallbackIds = new Set([
+				...window.messages.map(message => message.id),
+				...minimizedCandidates.filter(message => message.contextRole === "reply_target" || message.contextRole === "thread_root").map(message => message.id),
+			]);
+			let contextSelection: ContextSelectionResult = {
+				messages: minimizedCandidates.filter(message => fallbackIds.has(message.id)), deployment: "deterministic", latencyMs: 0,
+			};
+			if (services.extractor.selectContext) try {
+				contextSelection = await services.extractor.selectContext(minimizedCandidates, [primary.id]);
+			} catch (error) {
+				console.warn("Automatic AI context selection failed; using the bounded collected graph", { error: (error as Error).message });
+			}
+			const minimized = contextSelection.messages;
 			const extraction = completedExtraction = await services.extractor.extract(minimized, {
 				mode: "automatic",
 				metadata: { priorities: priorities.map(priority => priority.name), sizes: sizes.map(size => size.value), projects: projects.map(project => project.name) },
@@ -183,18 +261,41 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			const focalMessageIds = new Set(primary ? [primary.id] : []);
 			const validAttachmentIds = new Set(source.flatMap(message => [...message.attachments.keys()]));
 			const individuallyGroundedTasks = result.tasks.filter(task => taskReferencesAreValid(task, validMessageIds, focalMessageIds, validAttachmentIds));
-			const groundedTasks = mergeRelatedTaskCandidates(individuallyGroundedTasks);
-			const gate = completedGate = await services.extractor.assessAutomaticCandidates(extraction.inputMessages, groundedTasks);
-			const eligibleTasks = groundedTasks.filter((_, index) => automaticCandidateEligible(gate.assessments[index]));
-			const candidateAssessments = groundedTasks.map((task, index) => ({
+			const groupedTasks = mergeRelatedTaskCandidates(individuallyGroundedTasks);
+			const primaryMember = primary.member ?? await primary.guild!.members.fetch(primary.author.id).catch(() => null);
+			const pendingProposals = (await services.db.pendingProposalContexts(channelId)).filter(proposal => proposalReviewAllowed(
+				primary.author.id, proposal.permittedReviewerIds, proposal.requesterDiscordId ?? null,
+				primaryMember?.roles.cache.has(services.config.ORGANIZER_GUILD_ORGANIZER_ROLE_ID),
+				primaryMember?.permissions.has(PermissionFlagsBits.ManageGuild),
+			));
+			const permittedExistingProposalIds = pendingProposals.map(proposal => proposal.id);
+			const affectedPendingProposalIds = pendingProposals.filter(proposal => proposal.sourceMessageIds.includes(primary.id)).map(proposal => proposal.id);
+			const invalidatablePendingProposalIds = pendingProposals
+				.filter(proposal => proposal.sourceMessageIds.length === 1 && proposal.sourceMessageIds[0] === primary.id)
+				.map(proposal => proposal.id);
+			let reconciliation: ProposalReconciliationResult = {
+				proposals: groupedTasks.map(candidate => ({ candidate })),
+				supersededPendingProposalIds: [], deployment: "deterministic", latencyMs: 0,
+			};
+			let reconciliationSucceeded = false;
+			if (services.extractor.reconcileProposals) try {
+				reconciliation = await services.extractor.reconcileProposals(extraction.inputMessages, groupedTasks, pendingProposals, affectedPendingProposalIds);
+				reconciliationSucceeded = true;
+			} catch (error) {
+				console.warn("Automatic AI proposal reconciliation failed; using grounded candidates", { error: (error as Error).message });
+			}
+			const reconciledTasks = reconciliation.proposals;
+			const gate = completedGate = await services.extractor.assessAutomaticCandidates(extraction.inputMessages, reconciledTasks.map(item => item.candidate));
+			const eligibleTasks = reconciledTasks.filter((_, index) => automaticCandidateEligible(gate.assessments[index]));
+			const candidateAssessments = reconciledTasks.map(({ candidate: task }, index) => ({
 				...gate.assessments[index],
 				automaticEligibility: automaticCandidateEligible(gate.assessments[index]) ? "eligible" : "ineligible",
 				proposedAction: task.proposed_action,
 				sourceMessageIds: task.source_message_ids,
 			}));
-			let pipelineLatencyMs = extraction.latencyMs + gate.latencyMs;
-			let pipelineUsage = combinedUsage(extraction.usage, gate.usage);
-			for (const task of eligibleTasks) {
+			let pipelineLatencyMs = contextSelection.latencyMs + extraction.latencyMs + reconciliation.latencyMs + gate.latencyMs;
+			let pipelineUsage = combinedUsage(contextSelection.usage, extraction.usage, reconciliation.usage, gate.usage);
+			for (const { candidate: task, pendingProposalId } of eligibleTasks) {
 				const assigneeId = task.assignee_alias ? reverse.get(task.assignee_alias) : undefined;
 				const assignee = assigneeId ? await primary.guild!.members.fetch(assigneeId).catch(() => null) : null;
 				let projectId = await resolveProjectId(primary.channelId, primary.guild!, projects, {
@@ -284,6 +385,8 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					if (accountableId) reviewers.add(accountableId);
 					for (const reviewer of [...reviewers]) if (!await services.db.openProjectUserId(reviewer)) reviewers.delete(reviewer);
 					const proposal = await services.db.createProposal({
+						preferredProposalId: pendingProposalId,
+						permittedExistingProposalIds,
 						channelId, projectId, title: task.title, description, assigneeDiscordId: assigneeId, accountableDiscordId: accountableId,
 						priorityId: priority?.id, sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined,
 						startDate: task.start_date ?? undefined, dueDate, estimatedHours, metadataInference,
@@ -355,6 +458,8 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					continue;
 				}
 				const proposal = await services.db.createProposal({
+					preferredProposalId: pendingProposalId,
+					permittedExistingProposalIds,
 					channelId, projectId, title: task.title,
 						description, assigneeDiscordId: assigneeId, accountableDiscordId: accountableId,
 						priorityId: priority?.id, sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined,
@@ -408,6 +513,24 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					}
 				}
 			}
+			if (services.config.OPENPROJECT_AUTOMATION_MODE !== "shadow") {
+				const supersededIds = reconciledSupersessionIds({
+					reconciledCount: reconciledTasks.length, eligibleCount: eligibleTasks.length, extractedCount: result.tasks.length,
+					reconciliationSucceeded, persistedProposalIds: proposalIds,
+					recommendedSupersessionIds: reconciliation.supersededPendingProposalIds,
+					invalidatableProposalIds: invalidatablePendingProposalIds,
+				});
+				const superseded = proposalIds.size > 0 && supersededIds.length
+					? await services.db.mergeAndSupersedePendingProposals([...proposalIds][0]!, supersededIds)
+					: await services.db.supersedePendingProposals(supersededIds);
+				for (const proposal of superseded) {
+					if (!proposal.review_message_id) continue;
+					const reviewChannel = await primary.client.channels.fetch(proposal.channel_id).catch(() => null);
+					if (!reviewChannel?.isTextBased() || !("messages" in reviewChannel)) continue;
+					const reviewMessage = await reviewChannel.messages.fetch(proposal.review_message_id).catch(() => null);
+					if (reviewMessage) await reviewMessage.edit({ content: "This proposal is no longer active after the source discussion was reconciled.", components: [] }).catch(() => undefined);
+				}
+			}
 			await services.db.recordExtraction({
 				source: "automatic",
 				outcome: createdProposals || revisedProposals ? "proposal" : duplicates ? "duplicate" : "no_task",
@@ -422,18 +545,21 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				decision: {
 					taskCount: result.tasks.length,
 					groundedCount: individuallyGroundedTasks.length,
-					groupedCount: groundedTasks.length,
+					groupedCount: groupedTasks.length,
+					reconciledCount: reconciledTasks.length,
 					eligibleCount: eligibleTasks.length,
-					rejectedCount: groundedTasks.length - eligibleTasks.length,
+					rejectedCount: reconciledTasks.length - eligibleTasks.length,
 					invalidGroundingCount: result.tasks.length - individuallyGroundedTasks.length,
 					extractionMetadata: extraction.metadata,
 					extractionOptions: extraction.replayOptions,
 					windowSensitivity: gate.windowSensitivity,
-					pipelineVersion: "v4",
+					pipelineVersion: "v5",
 					extractionPromptVersion: "candidate-v4",
 					gatePromptVersion: "automatic-precision-v1",
 					stages: {
+						contextSelection: { deployment: contextSelection.deployment, latencyMs: contextSelection.latencyMs, candidateMessageCount: minimizedCandidates.length, selectedMessageCount: minimized.length },
 						extraction: { deployment: extraction.deployment, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage },
+						proposalReconciliation: { deployment: reconciliation.deployment, latencyMs: reconciliation.latencyMs, pendingProposalCount: pendingProposals.length },
 						precisionGate: { deployment: gate.deployment, latencyMs: gate.latencyMs, tokenUsage: gate.usage },
 					},
 					proposalCount: createdProposals,

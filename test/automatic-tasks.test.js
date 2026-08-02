@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { automaticFocalWindows, messageRevisionChanged, proposalOwnerText } from "../dist/automatic-tasks.js";
+import { automaticBatchSource, automaticFocalWindows, messageRevisionChanged, proposalOwnerText, reconciledSupersessionIds } from "../dist/automatic-tasks.js";
 
 test("automatic batches evaluate every message as its own focal window", () => {
 	assert.deepEqual(automaticFocalWindows(["a", "b", "c"]), [
@@ -8,6 +8,10 @@ test("automatic batches evaluate every message as its own focal window", () => {
 		{ messages: ["a", "b", "c"], focal: "b" },
 		{ messages: ["a", "b", "c"], focal: "c" },
 	]);
+});
+
+test("automatic batches enforce a hard focal-message budget", () => {
+	assert.deepEqual(automaticBatchSource(["a", "b", "c", "d", "e", "f", "g"]), ["b", "c", "d", "e", "f", "g"]);
 });
 
 test("automatic focal windows include subsequent context within their bound", () => {
@@ -46,4 +50,19 @@ test("message edits enqueue only content or attachment changes and partials fail
 	assert.equal(messageRevisionChanged("old", "new", "a:url", "a:url"), true);
 	assert.equal(messageRevisionChanged("same", "same", "a:url", "b:url"), true);
 	assert.equal(messageRevisionChanged(undefined, "current", "", ""), true);
+});
+
+test("proposal supersession requires an affirmative safe transition", () => {
+	assert.deepEqual(reconciledSupersessionIds({
+		reconciledCount: 0, eligibleCount: 0, extractedCount: 0, reconciliationSucceeded: true,
+		persistedProposalIds: new Set(), recommendedSupersessionIds: [], invalidatableProposalIds: ["old"],
+	}), []);
+	assert.deepEqual(reconciledSupersessionIds({
+		reconciledCount: 0, eligibleCount: 0, extractedCount: 0, reconciliationSucceeded: true,
+		persistedProposalIds: new Set(), recommendedSupersessionIds: ["old"], invalidatableProposalIds: ["old", "multi-source"],
+	}), []);
+	assert.deepEqual(reconciledSupersessionIds({
+		reconciledCount: 1, eligibleCount: 1, extractedCount: 1, reconciliationSucceeded: true,
+		persistedProposalIds: new Set(["survivor"]), recommendedSupersessionIds: ["survivor", "duplicate"], invalidatableProposalIds: [],
+	}), ["duplicate"]);
 });
