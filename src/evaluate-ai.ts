@@ -28,6 +28,24 @@ export const evaluationEnvSchema = z.object({
 });
 
 type ExtractedTask = ExtractedTasks["tasks"][number];
+type ExpectedProposal = z.infer<typeof corpusWindowSchema>["expected"]["proposals"][number];
+
+type ProposalPair = {
+	expectedIndex: number;
+	predictedIndex: number;
+	score: number;
+};
+
+type ProposalDiagnostics = {
+	alignedProposals: number;
+	detection: { truePositives: number; falsePositives: number; falseNegatives: number };
+	action: { correct: number; compared: number };
+	sources: { truePositives: number; falsePositives: number; falseNegatives: number };
+	titleConcepts: { matched: number; expected: number };
+	project: { correct: number; compared: number };
+	owner: { correct: number; compared: number };
+	deadline: { correct: number; compared: number };
+};
 
 export function runtimeProposalCandidates(
 	tasks: ExtractedTask[],
@@ -48,12 +66,16 @@ export function runtimeProposalCandidates(
 }
 
 export function runtimeGroundedCandidates(tasks: ExtractedTask[], messages: MinimizedMessage[]) {
+	return mergeRelatedTaskCandidates(runtimeReferenceValidCandidates(tasks, messages));
+}
+
+function runtimeReferenceValidCandidates(tasks: ExtractedTask[], messages: MinimizedMessage[]) {
 	const validMessageIds = new Set(messages.map(message => message.id));
 	const focalMessageIds = new Set(messages
 		.filter(message => message.contextRole === "primary" || message.priority)
 		.map(message => message.id));
 	const validAttachmentIds = new Set(messages.flatMap(message => (message.attachments ?? []).map(attachment => attachment.id)));
-	return mergeRelatedTaskCandidates(tasks.filter(task => taskReferencesAreValid(task, validMessageIds, focalMessageIds, validAttachmentIds)));
+	return tasks.filter(task => taskReferencesAreValid(task, validMessageIds, focalMessageIds, validAttachmentIds));
 }
 
 function ratio(numerator: number, denominator: number) {
@@ -68,6 +90,102 @@ function sameSet(left: string[], right: string[]) {
 	return left.length === right.length && [...left].sort().every((value, index) => value === [...right].sort()[index]);
 }
 
+function normalizedProject(value: string | null | undefined) {
+	return value ? normalizeProjectName(value) : null;
+}
+
+function proposalPairScore(expected: ExpectedProposal, predicted: ExtractedTask) {
+	const expectedSources = new Set(expected.sourceMessageIds);
+	const sharedSources = [...new Set(predicted.source_message_ids)].filter(id => expectedSources.has(id)).length;
+	const content = `${predicted.title}\n${predicted.description}`.toLocaleLowerCase();
+	const matchedTitleConcepts = expected.titleIncludes.filter(term => content.includes(term.toLocaleLowerCase())).length;
+	if (!sharedSources && !matchedTitleConcepts) return undefined;
+	return (sharedSources * 100) + matchedTitleConcepts;
+}
+
+function alignedProposalPairs(expected: ExpectedProposal[], predicted: ExtractedTask[]) {
+	let best: ProposalPair[] = [];
+	let bestScore = -1;
+	const visit = (expectedIndex: number, usedPredictions: Set<number>, pairs: ProposalPair[], score: number) => {
+		if (expectedIndex === expected.length) {
+			if (pairs.length > best.length || (pairs.length === best.length && score > bestScore)) {
+				best = [...pairs];
+				bestScore = score;
+			}
+			return;
+		}
+		visit(expectedIndex + 1, usedPredictions, pairs, score);
+		for (let predictedIndex = 0; predictedIndex < predicted.length; predictedIndex++) {
+			if (usedPredictions.has(predictedIndex)) continue;
+			const pairScore = proposalPairScore(expected[expectedIndex]!, predicted[predictedIndex]!);
+			if (pairScore === undefined) continue;
+			usedPredictions.add(predictedIndex);
+			pairs.push({ expectedIndex, predictedIndex, score: pairScore });
+			visit(expectedIndex + 1, usedPredictions, pairs, score + pairScore);
+			pairs.pop();
+			usedPredictions.delete(predictedIndex);
+		}
+	};
+	visit(0, new Set(), [], 0);
+	return best;
+}
+
+export function proposalDiagnostics(expected: ExpectedProposal[], predicted: ExtractedTask[]): ProposalDiagnostics {
+	const pairs = alignedProposalPairs(expected, predicted);
+	const diagnostics: ProposalDiagnostics = {
+		alignedProposals: pairs.length,
+		detection: { truePositives: pairs.length, falsePositives: predicted.length - pairs.length, falseNegatives: expected.length - pairs.length },
+		action: { correct: 0, compared: pairs.length },
+		sources: {
+			truePositives: 0,
+			falsePositives: predicted.reduce((total, proposal) => total + new Set(proposal.source_message_ids).size, 0),
+			falseNegatives: expected.reduce((total, proposal) => total + new Set(proposal.sourceMessageIds).size, 0),
+		},
+		titleConcepts: { matched: 0, expected: expected.reduce((total, proposal) => total + proposal.titleIncludes.length, 0) },
+		project: { correct: 0, compared: 0 },
+		owner: { correct: 0, compared: 0 },
+		deadline: { correct: 0, compared: 0 },
+	};
+	for (const pair of pairs) {
+		const expectedProposal = expected[pair.expectedIndex]!;
+		const predictedProposal = predicted[pair.predictedIndex]!;
+		if (predictedProposal.proposed_action === expectedProposal.action) diagnostics.action.correct++;
+		const expectedSources = new Set(expectedProposal.sourceMessageIds);
+		const predictedSources = new Set(predictedProposal.source_message_ids);
+		const sharedSources = [...predictedSources].filter(id => expectedSources.has(id)).length;
+		diagnostics.sources.truePositives += sharedSources;
+		diagnostics.sources.falsePositives -= sharedSources;
+		diagnostics.sources.falseNegatives -= sharedSources;
+		const content = `${predictedProposal.title}\n${predictedProposal.description}`.toLocaleLowerCase();
+		diagnostics.titleConcepts.matched += expectedProposal.titleIncludes.filter(term => content.includes(term.toLocaleLowerCase())).length;
+		if (expectedProposal.projectName !== undefined) {
+			diagnostics.project.compared++;
+			if (normalizedProject(predictedProposal.project_name) === normalizedProject(expectedProposal.projectName)) diagnostics.project.correct++;
+		}
+		if (expectedProposal.assigneeAlias !== undefined) {
+			diagnostics.owner.compared++;
+			if (predictedProposal.assignee_alias === expectedProposal.assigneeAlias) diagnostics.owner.correct++;
+		}
+		if (expectedProposal.dueDate !== undefined) {
+			diagnostics.deadline.compared++;
+			if (predictedProposal.due_date === expectedProposal.dueDate) diagnostics.deadline.correct++;
+		}
+	}
+	return diagnostics;
+}
+
+function addProposalDiagnostics(total: ProposalDiagnostics, diagnostics: ProposalDiagnostics) {
+	total.alignedProposals += diagnostics.alignedProposals;
+	for (const key of ["truePositives", "falsePositives", "falseNegatives"] as const) total.detection[key] += diagnostics.detection[key];
+	for (const key of ["truePositives", "falsePositives", "falseNegatives"] as const) total.sources[key] += diagnostics.sources[key];
+	for (const component of ["action", "project", "owner", "deadline"] as const) {
+		total[component].correct += diagnostics[component].correct;
+		total[component].compared += diagnostics[component].compared;
+	}
+	total.titleConcepts.matched += diagnostics.titleConcepts.matched;
+	total.titleConcepts.expected += diagnostics.titleConcepts.expected;
+}
+
 function percent(value: number) {
 	return `${(value * 100).toFixed(1)}%`;
 }
@@ -76,9 +194,10 @@ function sleep(milliseconds: number) {
 	return new Promise(resolveSleep => setTimeout(resolveSleep, milliseconds));
 }
 
-const EVALUATOR_PIPELINE_VERSION = "automatic-v3.5";
+const EVALUATOR_PIPELINE_VERSION = "automatic-v3.6";
 const evaluationTraceSchema = z.object({
 	extractedCandidates: z.number().int().min(0),
+	referenceValidCandidates: z.number().int().min(0),
 	groundedCandidates: z.number().int().min(0),
 	finalCandidates: z.number().int().min(0),
 	gateCriteriaFailures: z.object({ activation: z.number().int().min(0), remainingWork: z.number().int().min(0), durability: z.number().int().min(0), decisionReadiness: z.number().int().min(0), sensitivity: z.number().int().min(0) }),
@@ -89,9 +208,10 @@ const cachedCaseSchema = z.object({
 	trace: evaluationTraceSchema,
 });
 
-export function evaluationTrace(extractedCandidates: number, groundedCandidates: number, assessments: AutomaticCandidateAssessment[], finalCandidates: number) {
+export function evaluationTrace(extractedCandidates: number, referenceValidCandidates: number, groundedCandidates: number, assessments: AutomaticCandidateAssessment[], finalCandidates: number) {
 	return evaluationTraceSchema.parse({
 		extractedCandidates,
+		referenceValidCandidates,
 		groundedCandidates,
 		finalCandidates,
 		gateCriteriaFailures: {
@@ -195,8 +315,18 @@ async function main() {
 	let lastRequestAt = 0;
 	const providerErrorCategories: Record<string, number> = {};
 	const cases: Array<Record<string, unknown>> = [];
+	const diagnosticTotals: ProposalDiagnostics = {
+		alignedProposals: 0,
+		detection: { truePositives: 0, falsePositives: 0, falseNegatives: 0 },
+		action: { correct: 0, compared: 0 },
+		sources: { truePositives: 0, falsePositives: 0, falseNegatives: 0 },
+		titleConcepts: { matched: 0, expected: 0 },
+		project: { correct: 0, compared: 0 },
+		owner: { correct: 0, compared: 0 },
+		deadline: { correct: 0, compared: 0 },
+	};
 	const stageTotals = {
-		extractedCandidates: 0, groundedCandidates: 0, finalCandidates: 0,
+		extractedCandidates: 0, referenceValidCandidates: 0, groundedCandidates: 0, finalCandidates: 0,
 		gateCriteriaFailures: { activation: 0, remainingWork: 0, durability: 0, decisionReadiness: 0, sensitivity: 0 },
 	};
 
@@ -229,7 +359,8 @@ async function main() {
 			totalLatencyMs += extraction.latencyMs;
 			latencySamples++;
 			totalTokens += extraction.usage?.totalTokens ?? 0;
-			const grounded = runtimeGroundedCandidates(extraction.result.tasks, window.messages as MinimizedMessage[]);
+			const referenceValid = runtimeReferenceValidCandidates(extraction.result.tasks, window.messages as MinimizedMessage[]);
+			const grounded = mergeRelatedTaskCandidates(referenceValid);
 			let assessments: AutomaticCandidateAssessment[] = [];
 			let windowSensitivity: "safe" | "sensitive" | "uncertain" = window.mode === "manual" ? "safe" : "uncertain";
 			if (window.mode === "automatic" && grounded.length) {
@@ -243,27 +374,26 @@ async function main() {
 				totalTokens += gate.usage?.totalTokens ?? 0;
 			}
 			predicted = runtimeProposalCandidates(extraction.result.tasks, window.messages as MinimizedMessage[], window.routing, window.mode, assessments, windowSensitivity);
-			trace = evaluationTrace(extraction.result.tasks.length, grounded.length, assessments, predicted.length);
+			trace = evaluationTrace(extraction.result.tasks.length, referenceValid.length, grounded.length, assessments, predicted.length);
 			await storePrediction(env.AI_EVAL_CACHE_DIR, item.key, predicted, trace);
 			validOutputs++;
 			}
 			stageTotals.extractedCandidates += trace.extractedCandidates;
+			stageTotals.referenceValidCandidates += trace.referenceValidCandidates;
 			stageTotals.groundedCandidates += trace.groundedCandidates;
 			stageTotals.finalCandidates += trace.finalCandidates;
 			for (const key of Object.keys(stageTotals.gateCriteriaFailures) as Array<keyof typeof stageTotals.gateCriteriaFailures>) {
 				stageTotals.gateCriteriaFailures[key] += trace.gateCriteriaFailures[key];
 			}
+			const diagnostics = proposalDiagnostics(window.expected.proposals, predicted);
+			addProposalDiagnostics(diagnosticTotals, diagnostics);
 			const unmatched = new Set(predicted.map((_, index) => index));
 			let matched = 0;
 			for (const expected of window.expected.proposals) {
 				const index = [...unmatched].find(candidateIndex => {
 					const candidate = predicted[candidateIndex];
 					if (!candidate || candidate.proposed_action !== expected.action || !sameSet(candidate.source_message_ids, expected.sourceMessageIds)) return false;
-					if (expected.projectName !== undefined) {
-						const actualProject = candidate.project_name ? normalizeProjectName(candidate.project_name) : null;
-						const expectedProject = expected.projectName ? normalizeProjectName(expected.projectName) : null;
-						if (actualProject !== expectedProject) return false;
-					}
+					if (expected.projectName !== undefined && normalizedProject(candidate.project_name) !== normalizedProject(expected.projectName)) return false;
 					const content = `${candidate.title}\n${candidate.description}`.toLocaleLowerCase();
 					return expected.titleIncludes.every(term => content.includes(term.toLocaleLowerCase()));
 				});
@@ -283,7 +413,7 @@ async function main() {
 			truePositives += matched;
 			falseNegatives += window.expected.proposals.length - matched;
 			falsePositives += predicted.length - matched;
-			cases.push({ id: window.id, expectedProposals: window.expected.proposals.length, predictedProposals: predicted.length, matchedProposals: matched, validOutput: true, cached: Boolean(item.cached), trace });
+			cases.push({ id: window.id, expectedProposals: window.expected.proposals.length, predictedProposals: predicted.length, matchedProposals: matched, validOutput: true, cached: Boolean(item.cached), trace, diagnostics });
 		} catch (error) {
 			if (error instanceof StructuredOutputError) invalidOutputs++;
 			else {
@@ -291,10 +421,20 @@ async function main() {
 				const category = providerFailureCategory(error);
 				providerErrorCategories[category] = (providerErrorCategories[category] ?? 0) + 1;
 			}
+			const diagnostics = proposalDiagnostics(window.expected.proposals, []);
+			addProposalDiagnostics(diagnosticTotals, diagnostics);
 			falseNegatives += window.expected.proposals.length;
-			cases.push({ id: window.id, expectedProposals: window.expected.proposals.length, predictedProposals: 0, matchedProposals: 0, validOutput: false, errorType: providerFailureCategory(error) });
+			cases.push({ id: window.id, expectedProposals: window.expected.proposals.length, predictedProposals: 0, matchedProposals: 0, validOutput: false, errorType: providerFailureCategory(error), diagnostics });
 		}
 	}
+	const stageDiagnostics = {
+		groundingRejections: Math.max(0, stageTotals.extractedCandidates - stageTotals.referenceValidCandidates),
+		candidateMerges: Math.max(0, stageTotals.referenceValidCandidates - stageTotals.groundedCandidates),
+		finalizationRejections: Math.max(0, stageTotals.groundedCandidates - stageTotals.finalCandidates),
+		groundingRetention: optionalRatio(stageTotals.referenceValidCandidates, stageTotals.extractedCandidates),
+		mergeRetention: optionalRatio(stageTotals.groundedCandidates, stageTotals.referenceValidCandidates),
+		finalizationRetention: optionalRatio(stageTotals.finalCandidates, stageTotals.groundedCandidates),
+	};
 
 	const report = {
 		generatedAt: new Date().toISOString(),
@@ -317,7 +457,20 @@ async function main() {
 			uncachedCases: uncachedCount,
 		},
 		counts: { truePositives, falsePositives, falseNegatives },
+		diagnostics: {
+			detectionPrecision: ratio(diagnosticTotals.detection.truePositives, diagnosticTotals.detection.truePositives + diagnosticTotals.detection.falsePositives),
+			detectionRecall: ratio(diagnosticTotals.detection.truePositives, diagnosticTotals.detection.truePositives + diagnosticTotals.detection.falseNegatives),
+			actionAccuracy: optionalRatio(diagnosticTotals.action.correct, diagnosticTotals.action.compared),
+			sourcePrecision: optionalRatio(diagnosticTotals.sources.truePositives, diagnosticTotals.sources.truePositives + diagnosticTotals.sources.falsePositives),
+			sourceRecall: optionalRatio(diagnosticTotals.sources.truePositives, diagnosticTotals.sources.truePositives + diagnosticTotals.sources.falseNegatives),
+			titleConceptRecall: optionalRatio(diagnosticTotals.titleConcepts.matched, diagnosticTotals.titleConcepts.expected),
+			projectAccuracy: optionalRatio(diagnosticTotals.project.correct, diagnosticTotals.project.compared),
+			ownerAccuracy: optionalRatio(diagnosticTotals.owner.correct, diagnosticTotals.owner.compared),
+			deadlineAccuracy: optionalRatio(diagnosticTotals.deadline.correct, diagnosticTotals.deadline.compared),
+			counts: diagnosticTotals,
+		},
 		stageTotals,
+		stageDiagnostics,
 		providerErrorCategories,
 		targets: { proposalPrecision: 0.95, ownerAccuracy: 0.90, deadlineAccuracy: 0.90, validOutputRate: 0.99 },
 		cases,
@@ -333,6 +486,15 @@ async function main() {
 		"| --- | ---: | ---: |",
 		`| Proposal precision | ${validOutputs ? percent(report.metrics.proposalPrecision) : "N/A"} | 95% |`,
 		`| Proposal recall | ${validOutputs ? percent(report.metrics.proposalRecall) : "N/A"} | — |`,
+		`| Detection precision | ${validOutputs ? percent(report.diagnostics.detectionPrecision) : "N/A"} | — |`,
+		`| Detection recall | ${validOutputs ? percent(report.diagnostics.detectionRecall) : "N/A"} | — |`,
+		`| Action accuracy | ${validOutputs && report.diagnostics.actionAccuracy !== null ? percent(report.diagnostics.actionAccuracy) : "N/A"} | — |`,
+		`| Source precision | ${validOutputs && report.diagnostics.sourcePrecision !== null ? percent(report.diagnostics.sourcePrecision) : "N/A"} | — |`,
+		`| Source recall | ${validOutputs && report.diagnostics.sourceRecall !== null ? percent(report.diagnostics.sourceRecall) : "N/A"} | — |`,
+		`| Title concept recall | ${validOutputs && report.diagnostics.titleConceptRecall !== null ? percent(report.diagnostics.titleConceptRecall) : "N/A"} | — |`,
+		`| Aligned project accuracy | ${validOutputs && report.diagnostics.projectAccuracy !== null ? percent(report.diagnostics.projectAccuracy) : "N/A"} | — |`,
+		`| Aligned owner accuracy | ${validOutputs && report.diagnostics.ownerAccuracy !== null ? percent(report.diagnostics.ownerAccuracy) : "N/A"} | — |`,
+		`| Aligned deadline accuracy | ${validOutputs && report.diagnostics.deadlineAccuracy !== null ? percent(report.diagnostics.deadlineAccuracy) : "N/A"} | — |`,
 		`| Owner accuracy | ${validOutputs && report.metrics.ownerAccuracy !== null ? percent(report.metrics.ownerAccuracy) : "N/A"} | 90% |`,
 		`| Deadline accuracy | ${validOutputs && report.metrics.deadlineAccuracy !== null ? percent(report.metrics.deadlineAccuracy) : "N/A"} | 90% |`,
 		`| Valid structured output | ${percent(report.metrics.validOutputRate)} | 99% |`,
@@ -341,6 +503,7 @@ async function main() {
 		`| Provider retries | ${report.metrics.providerRetries} | — |`,
 		`| Cache hits | ${report.metrics.cacheHits} | — |`,
 		"",
+		`Pipeline changes: grounding rejections=${stageDiagnostics.groundingRejections}; candidate merges=${stageDiagnostics.candidateMerges}; finalization rejections=${stageDiagnostics.finalizationRejections}.`,
 		`Invalid outputs: ${invalidOutputs}; provider errors: ${providerErrors}.`,
 		providerErrors ? `Provider error categories: ${Object.entries(providerErrorCategories).map(([category, count]) => `${category}=${count}`).join(", ")}.` : "",
 		!validOutputs ? "\n> Evaluation incomplete: no valid model outputs were produced. Quality metrics are unavailable; fix provider access before using this report for a rollout decision." : "",
