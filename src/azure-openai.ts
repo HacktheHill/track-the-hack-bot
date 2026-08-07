@@ -1,4 +1,5 @@
 import { DefaultAzureCredential } from "@azure/identity";
+import { processAzureChatLimiter, retryAfterMilliseconds, type AzureChatLimiter } from "./azure-chat-limiter.js";
 import { z } from "zod";
 import type { IntegrationConfig } from "./config.js";
 import { titlesLikelyDuplicate } from "./openproject.js";
@@ -550,24 +551,14 @@ function addDeterministicAmbiguities(extraction: ExtractionResult, messages: Min
 }
 
 function providerRetryDelayMs(response: Response, attempt: number) {
-	const retryAfterMsHeader = response.headers.get("retry-after-ms") ?? response.headers.get("x-ms-retry-after-ms");
-	if (retryAfterMsHeader !== null) {
-		const retryAfterMs = Number(retryAfterMsHeader);
-		if (Number.isFinite(retryAfterMs)) return Math.min(30_000, Math.max(0, retryAfterMs));
-	}
-	const retryAfter = response.headers.get("retry-after");
-	if (retryAfter !== null) {
-		const seconds = Number(retryAfter);
-		if (Number.isFinite(seconds)) return Math.min(30_000, Math.max(0, seconds * 1000));
-		const date = Date.parse(retryAfter);
-		if (Number.isFinite(date)) return Math.min(30_000, Math.max(0, date - Date.now()));
-	}
+	const retryAfter = retryAfterMilliseconds(response);
+	if (retryAfter !== undefined) return retryAfter;
 	return 5000 * (attempt + 1);
 }
 
-async function fetchProviderWithRetry(url: string, init: RequestInit, attempts = 3) {
+async function fetchProviderWithRetry(url: string, init: RequestInit, limiter: AzureChatLimiter, limiterKey: string, attempts = 3) {
 	for (let attempt = 0; ; attempt++) {
-		const response = await fetch(url, init);
+		const response = await limiter.run(limiterKey, init.signal ?? undefined, () => fetch(url, init));
 		const retryable = response.status === 429 || response.status === 500 || response.status === 502 || response.status === 503 || response.status === 504;
 		if (!retryable || attempt + 1 >= attempts) return response;
 		await response.body?.cancel().catch(() => undefined);
@@ -594,6 +585,8 @@ async function invokeContextSelectionCompatible(options: {
 	provider: string;
 	token?: string;
 	timeoutMs?: number;
+	limiter: AzureChatLimiter;
+	limiterKey: string;
 }) {
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 120000);
@@ -619,7 +612,7 @@ async function invokeContextSelectionCompatible(options: {
 				max_completion_tokens: 1200,
 				response_format: { type: "json_schema", json_schema: { name: "discord_context_selection_v1", strict: true, schema: contextSelectionJsonSchema } },
 			}),
-		});
+		}, options.limiter, options.limiterKey);
 		if (!response.ok) throw new Error(`${options.provider} ${response.status}: ${(await response.text()).slice(0, 300)}`);
 		const json = await response.json() as { choices?: Array<{ finish_reason?: string; message?: { content?: string } }>; usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } };
 		const choice = json.choices?.[0];
@@ -651,6 +644,8 @@ async function invokeProposalReconciliationCompatible(options: {
 	provider: string;
 	token?: string;
 	timeoutMs?: number;
+	limiter: AzureChatLimiter;
+	limiterKey: string;
 }) {
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 120000);
@@ -686,7 +681,7 @@ async function invokeProposalReconciliationCompatible(options: {
 				max_completion_tokens: 4096,
 				response_format: { type: "json_schema", json_schema: { name: "discord_proposal_reconciliation_v1", strict: true, schema: proposalReconciliationJsonSchema } },
 			}),
-		});
+		}, options.limiter, options.limiterKey);
 		if (!response.ok) throw new Error(`${options.provider} ${response.status}: ${(await response.text()).slice(0, 300)}`);
 		const json = await response.json() as { choices?: Array<{ finish_reason?: string; message?: { content?: string } }>; usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } };
 		const choice = json.choices?.[0];
@@ -719,6 +714,8 @@ async function invokeCompatible(options: {
 	maxImages: number;
 	mode: "manual" | "automatic";
 	metadata?: ExtractionOptions["metadata"];
+	limiter: AzureChatLimiter;
+	limiterKey: string;
 }) {
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 120000);
@@ -778,7 +775,7 @@ async function invokeCompatible(options: {
 			max_completion_tokens: options.maxCompletionTokens,
 			response_format: { type: "json_schema", json_schema: { name: "discord_tasks", strict: true, schema: taskJsonSchema } },
 			}),
-		});
+		}, options.limiter, options.limiterKey);
 		if (!response.ok) throw new Error(`${options.provider} ${response.status}: ${(await response.text()).slice(0, 300)}`);
 		return {
 			...parseResponse(await response.json(), options.provider, Date.now() - started, options.maxCompletionTokens),
@@ -801,6 +798,8 @@ async function invokeAutomaticGateCompatible(options: {
 	timeoutMs?: number;
 	maxCompletionTokens: number;
 	maxImages: number;
+	limiter: AzureChatLimiter;
+	limiterKey: string;
 }) {
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 120000);
@@ -853,7 +852,7 @@ async function invokeAutomaticGateCompatible(options: {
 				max_completion_tokens: Math.min(options.maxCompletionTokens, 2048),
 				response_format: { type: "json_schema", json_schema: { name: "discord_automatic_precision_gate_v1", strict: true, schema: automaticGateJsonSchema } },
 			}),
-		});
+		}, options.limiter, options.limiterKey);
 		if (!response.ok) throw new Error(`${options.provider} ${response.status}: ${(await response.text()).slice(0, 300)}`);
 		return parseAutomaticGateResponse(await response.json(), options.provider, Date.now() - started, options.candidates, options.messages);
 	} finally {
@@ -869,6 +868,8 @@ async function invokeRagRerankerCompatible(options: {
 	provider: string;
 	token?: string;
 	timeoutMs?: number;
+	limiter: AzureChatLimiter;
+	limiterKey: string;
 }) {
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 120000);
@@ -904,7 +905,7 @@ async function invokeRagRerankerCompatible(options: {
 				max_completion_tokens: 1200,
 				response_format: { type: "json_schema", json_schema: { name: "openproject_rag_rerank_v1", strict: true, schema: ragRerankJsonSchema } },
 			}),
-		});
+		}, options.limiter, options.limiterKey);
 		if (!response.ok) throw new Error(`${options.provider} ${response.status}: ${(await response.text()).slice(0, 300)}`);
 		const json = await response.json() as { choices?: Array<{ finish_reason?: string; message?: { content?: string } }>; usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } };
 		const choice = json.choices?.[0];
@@ -933,6 +934,7 @@ async function invokeRagRerankerCompatible(options: {
 
 export class AzureTaskExtractor implements TaskExtractor {
 	private readonly tokenProvider: () => Promise<string>;
+	private readonly chatLimiter: AzureChatLimiter;
 
 	constructor(
 		private readonly config: IntegrationConfig,
@@ -943,6 +945,11 @@ export class AzureTaskExtractor implements TaskExtractor {
 			const token = await credential.getToken("https://cognitiveservices.azure.com/.default");
 			return token.token;
 		});
+		this.chatLimiter = processAzureChatLimiter(config);
+	}
+
+	private limiterKey(deployment: string) {
+		return `${this.config.AZURE_OPENAI_ENDPOINT!.replace(/\/$/, "")}/${deployment}`;
 	}
 
 	get enabled() {
@@ -967,6 +974,7 @@ export class AzureTaskExtractor implements TaskExtractor {
 				const selection = await invokeContextSelectionCompatible({
 					url, model: deployment, messages: selectedMessages, focalMessageIds: requiredIds,
 					provider: `azure:${deployment}`, token: await this.tokenProvider(),
+					limiter: this.chatLimiter, limiterKey: this.limiterKey(deployment),
 				});
 				const retained = new Set([...requiredIds, ...selection.selectedMessageIds.filter(id => availableIds.has(id))]);
 				const byId = new Map(selectedMessages.map(message => [message.id, message]));
@@ -1012,6 +1020,7 @@ export class AzureTaskExtractor implements TaskExtractor {
 				const result = await invokeProposalReconciliationCompatible({
 					url, model: deployment, messages: selectedMessages, candidates, pendingProposals: selectedPendingProposals,
 					affectedPendingProposalIds: [...affectedIds], provider: `azure:${deployment}`, token: await this.tokenProvider(),
+					limiter: this.chatLimiter, limiterKey: this.limiterKey(deployment),
 				});
 				const usedPendingIds = new Set<string>();
 				let proposals = result.parsed.proposals
@@ -1103,6 +1112,7 @@ export class AzureTaskExtractor implements TaskExtractor {
 						provider: `azure:${deployment}`, token,
 						maxCompletionTokens: this.config.AZURE_OPENAI_MAX_COMPLETION_TOKENS,
 						maxImages: this.config.OPENPROJECT_AI_MAX_IMAGE_ATTACHMENTS,
+						limiter: this.chatLimiter, limiterKey: this.limiterKey(deployment),
 					});
 				} catch (error) {
 					if (!(error instanceof StructuredOutputError) || attempt >= 1) throw error;
@@ -1130,6 +1140,7 @@ export class AzureTaskExtractor implements TaskExtractor {
 			try {
 				return await invokeRagRerankerCompatible({
 					url, model: deployment, query, candidates, provider: `azure:${deployment}`, token: await this.tokenProvider(),
+					limiter: this.chatLimiter, limiterKey: this.limiterKey(deployment),
 				});
 			} catch (error) {
 				if (!(error instanceof StructuredOutputError) || attempt >= 1) throw error;
@@ -1150,6 +1161,8 @@ export class AzureTaskExtractor implements TaskExtractor {
 			maxImages: this.config.OPENPROJECT_AI_MAX_IMAGE_ATTACHMENTS,
 			mode: options.mode ?? "automatic",
 			metadata: options.metadata,
+			limiter: this.chatLimiter,
+			limiterKey: this.limiterKey(deployment),
 		});
 	}
 }

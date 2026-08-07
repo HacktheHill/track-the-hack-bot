@@ -4,7 +4,7 @@ import { contentHash, corpusCaseSchema, corpusJsonl, parseCorpusJsonl } from "..
 import { blobEtagsEqual } from "../dist/ai-corpus-blob.js";
 import { createCorpusApp } from "../dist/ai-corpus-server.js";
 import { createDiscordCorpusRecovery, parseDiscordMessageUrl } from "../dist/discord-corpus-recovery.js";
-import { discordReviewContext, noTaskEventIsSafe, reconcileCase } from "../dist/sync-ai-corpus.js";
+import { discordReviewContext, noTaskEventIsSafe, noTaskEventSampleScore, reconcileCase, sampledSafeNoTaskEvents } from "../dist/sync-ai-corpus.js";
 
 function sampleCase(status = "pending") {
 	const now = "2026-07-29T12:00:00.000Z";
@@ -212,6 +212,19 @@ test("no-task sampling excludes contextual sensitivity and manual overrides", ()
 	assert.equal(noTaskEventIsSafe({ message_assessments: [{}], decision: {} }), false);
 	assert.equal(noTaskEventIsSafe({ message_assessments: [{ sensitivity: "uncertain" }], decision: {} }), false);
 	assert.equal(noTaskEventIsSafe({ message_assessments: [], decision: { extractionOptions: { allowSensitiveContent: true } } }), false);
+});
+
+test("no-task sampling is stable, seeded, and applies safety before its cap", () => {
+	const safe = id => ({ id, message_assessments: [{ sensitivity: "safe" }], decision: { windowSensitivity: "safe" } });
+	const unsafe = { id: "unsafe", message_assessments: [{ sensitivity: "uncertain" }], decision: { windowSensitivity: "safe" } };
+	const rows = [safe("3"), unsafe, safe("1"), safe("2")];
+	const selected = sampledSafeNoTaskEvents(rows, 1, "seed-a", 2);
+	assert.equal(selected.length, 2);
+	assert.equal(selected.some(row => row.id === "unsafe"), false);
+	assert.deepEqual(sampledSafeNoTaskEvents([...rows].reverse(), 1, "seed-a", 2).map(row => row.id), selected.map(row => row.id));
+	assert.equal(noTaskEventSampleScore("1", "seed-a"), noTaskEventSampleScore("1", "seed-a"));
+	assert.notEqual(noTaskEventSampleScore("1", "seed-a"), noTaskEventSampleScore("1", "seed-b"));
+	assert.deepEqual(sampledSafeNoTaskEvents(rows, 0, "seed-a", 2), []);
 });
 
 test("localhost corpus API requires its session token and uses ETags", async () => {

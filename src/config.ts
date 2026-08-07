@@ -24,6 +24,8 @@ const envSchema = z.object({
 	AZURE_OPENAI_EMBEDDING_DEPLOYMENT: z.string().optional(),
 	AZURE_OPENAI_EMBEDDING_DIMENSIONS: z.coerce.number().int().positive().max(4096).optional(),
 	AZURE_OPENAI_MAX_COMPLETION_TOKENS: z.coerce.number().int().min(64).max(4096).default(4096),
+	AZURE_OPENAI_CHAT_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(1),
+	AZURE_OPENAI_CHAT_MIN_INTERVAL_MS: z.coerce.number().int().min(0).max(60000).default(1000),
 	OPENPROJECT_AI_MAX_CONTEXT_CHARS: z.coerce.number().int().min(2000).max(100000).default(16000),
 	OPENPROJECT_AUTOMATION_MODE: z.enum(["off", "shadow", "review"]).default("off"),
 	OPENPROJECT_RAG_MODE: z.enum(["off", "shadow", "review"]).default("off"),

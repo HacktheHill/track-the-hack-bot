@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { pathToFileURL } from "node:url";
 import { resolve } from "node:path";
+import { createHash } from "node:crypto";
 import pg from "pg";
 import { z } from "zod";
 import { AzureBlobCorpusStore } from "./ai-corpus-blob.js";
@@ -108,6 +109,21 @@ export function noTaskEventIsSafe(row: { message_assessments: unknown; decision:
 		&& assessments.every(assessment => assessment && typeof assessment === "object" && "sensitivity" in assessment && assessment.sensitivity === "safe");
 }
 
+export function noTaskEventSampleScore(id: string, seed: string) {
+	const digest = createHash("sha256").update(`${seed}\0${id}`).digest();
+	return Number(digest.readBigUInt64BE()) / 2 ** 64;
+}
+
+export function sampledSafeNoTaskEvents<T extends { id: string; message_assessments: unknown; decision: unknown }>(rows: T[], rate: number, seed: string, limit: number) {
+	return rows
+		.filter(noTaskEventIsSafe)
+		.map(row => ({ row, score: noTaskEventSampleScore(String(row.id), seed) }))
+		.filter(item => item.score < rate)
+		.sort((left, right) => left.score - right.score || String(left.row.id).localeCompare(String(right.row.id)))
+		.slice(0, limit)
+		.map(item => item.row);
+}
+
 async function main() {
 	const corpusConfig = loadAiCorpusConfig();
 	const databaseConfig = databaseConfigSchema.parse(process.env);
@@ -132,6 +148,7 @@ async function main() {
 			sanitized++;
 		}
 		const existingNoTaskCases = (await store.listCases()).filter(item => item.originType === "sampled_no_task");
+		const deletedNoTaskCaseIds = new Set<string>();
 		if (existingNoTaskCases.length) {
 			const existing = await Promise.all(existingNoTaskCases.map(item => store.getCase(item.id)));
 			const eventIds = existing.map(item => item.case.origin.extractionEventId).filter((id): id is string => Boolean(id));
@@ -145,6 +162,7 @@ async function main() {
 				const eventId = item.case.origin.extractionEventId;
 				if (eventId && safety.get(eventId) === true) continue;
 				await store.deleteCase(item.case.id);
+				deletedNoTaskCaseIds.add(item.case.id);
 				excluded++;
 				invalidated = true;
 			}
@@ -175,20 +193,28 @@ async function main() {
 			const result = await reconcileCase(store, value);
 			if (result === "imported") imported++; else if (result === "updated") updated++; else unchanged++;
 		}
-		if (corpusConfig.AI_CORPUS_NO_TASK_SAMPLE_LIMIT) {
+		if (existingNoTaskCases.length || (corpusConfig.AI_CORPUS_NO_TASK_SAMPLE_LIMIT && corpusConfig.AI_CORPUS_NO_TASK_SAMPLE_RATE)) {
 			const noTasks = await pool.query<{ id: string; input_snapshot: unknown; message_assessments: unknown; decision: unknown }>(
 				`SELECT id,input_snapshot,message_assessments,decision FROM ai_extraction_events
 				 WHERE schema_version='v3' AND source='automatic' AND outcome='no_task' AND input_snapshot IS NOT NULL
 				 AND created_at >= now() - ($1::text || ' days')::interval
-				 ORDER BY md5(id::text) LIMIT $2`,
-				[corpusConfig.AI_CORPUS_SYNC_DAYS, corpusConfig.AI_CORPUS_NO_TASK_SAMPLE_LIMIT],
+				 ORDER BY id`,
+				[corpusConfig.AI_CORPUS_SYNC_DAYS],
 			);
-			for (const row of noTasks.rows) {
-				if (!noTaskEventIsSafe(row)) {
-					await store.deleteCase(`no-task-${row.id}`);
-					excluded++;
-					continue;
-				}
+			const sampled = sampledSafeNoTaskEvents(noTasks.rows, corpusConfig.AI_CORPUS_NO_TASK_SAMPLE_RATE, corpusConfig.AI_CORPUS_NO_TASK_SAMPLE_SEED, corpusConfig.AI_CORPUS_NO_TASK_SAMPLE_LIMIT);
+			const queriedIds = new Set(noTasks.rows.map(row => String(row.id)));
+			const sampledIds = new Set(sampled.map(row => String(row.id)));
+			let invalidated = false;
+			for (const item of existingNoTaskCases) {
+				if (deletedNoTaskCaseIds.has(item.id)) continue;
+				const eventId = item.id.replace(/^no-task-/, "");
+				if (!queriedIds.has(eventId) || sampledIds.has(eventId)) continue;
+				await store.deleteCase(item.id);
+				excluded++;
+				invalidated = true;
+			}
+			if (invalidated) await store.invalidateIncludedExports();
+			for (const row of sampled) {
 				const window = noTaskWindow(row);
 				if (!window) { excluded++; continue; }
 				const snapshot = discordSnapshotSchema.safeParse(row.input_snapshot).data ?? [];

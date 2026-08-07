@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { corpusWindowSchema, evaluationTrace, optionalRatio, providerFailureCategory, retryableProviderFailure, runtimeProposalCandidates } from "../dist/evaluate-ai.js";
+import { corpusWindowSchema, evaluationTrace, optionalRatio, providerFailureCategory, releaseThresholdFailures, retryableProviderFailure, runtimeProposalCandidates } from "../dist/evaluate-ai.js";
 import { OpenProjectClient, workPackageChangesApplied } from "../dist/openproject.js";
 import { explicitWorkPackageId, lexicalTitleSimilarity, OpenProjectRag, resolveProposalTarget, resolveProposedAction } from "../dist/rag.js";
 import { embeddingContentHash } from "../dist/embeddings.js";
@@ -30,6 +30,14 @@ test("AI evaluation retries transient provider failures but not deterministic ac
 test("AI evaluation reports unavailable ratios without comparisons", () => {
 	assert.equal(optionalRatio(0, 0), null);
 	assert.equal(optionalRatio(3, 4), 0.75);
+});
+
+test("release thresholds enforce only window count, precision, and valid output", () => {
+	const thresholds = { minimumWindows: 100, proposalPrecision: 0.95, validOutputRate: 0.99 };
+	assert.deepEqual(releaseThresholdFailures({ corpusWindows: 99, proposalPrecision: 0.94, validOutputRate: 0.98 }, thresholds).map(item => item.metric), [
+		"corpusWindows", "proposalPrecision", "validOutputRate",
+	]);
+	assert.deepEqual(releaseThresholdFailures({ corpusWindows: 100, proposalPrecision: 0.95, validOutputRate: 0.99 }, thresholds), []);
 });
 
 test("AI evaluation traces extraction and gate rejection stages", () => {
