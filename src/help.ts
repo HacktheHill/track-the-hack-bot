@@ -1,245 +1,134 @@
 import { Client, EmbedBuilder } from "discord.js";
-import { config } from "dotenv";
 
-config();
+const EMBED_COLOR = 0xea885f;
 
-const { ORGANIZER_GUILD_ID, COMMUNITY_GUILD_ID } = process.env;
+type HelpEmbedOptions = {
+	guildId: string | null;
+	organizerGuildId: string;
+	communityGuildId: string;
+	uptimeSeconds: number;
+	serverCount: number;
+};
 
-if (!ORGANIZER_GUILD_ID || !COMMUNITY_GUILD_ID) {
-	console.error("Missing environment variables for help");
-	process.exit(1);
+function uptimeText(totalSeconds: number) {
+	const uptime = Math.max(0, Math.floor(totalSeconds));
+	const hours = Math.floor(uptime / 3600);
+	const minutes = Math.floor((uptime % 3600) / 60);
+	const seconds = uptime % 60;
+	return `${hours}h ${minutes}m ${seconds}s`;
 }
 
-const registerHelpCommand = async (client: Client) => {
+export function buildHelpEmbeds(options: HelpEmbedOptions) {
+	const isOrganizer = options.guildId === options.organizerGuildId;
+	const isCommunity = options.guildId === options.communityGuildId;
+	const status = [
+		{ name: "Uptime", value: uptimeText(options.uptimeSeconds), inline: true },
+		{ name: "Servers", value: String(options.serverCount), inline: true },
+	];
+
+	const english = new EmbedBuilder()
+		.setColor(EMBED_COLOR)
+		.setTitle("Help")
+		.setDescription("Track the Hack Discord commands. Commands shown below depend on this server.")
+		.addFields(...status);
+	const french = new EmbedBuilder()
+		.setColor(EMBED_COLOR)
+		.setTitle("Aide")
+		.setDescription("Commandes Discord de Track the Hack. Les commandes ci-dessous dépendent de ce serveur.")
+		.addFields(
+			{ name: "Temps d’activité", value: uptimeText(options.uptimeSeconds), inline: true },
+			{ name: "Serveurs", value: String(options.serverCount), inline: true },
+		);
+
+	if (isCommunity) {
+		english.addFields({
+			name: "Community",
+			value: "`/verify` sends a private Track the Hack link used to receive the Hacker role after verification.",
+		});
+		french.addFields({
+			name: "Communauté",
+			value: "`/verify` envoie un lien privé Track the Hack permettant de recevoir le rôle Hacker après vérification.",
+		});
+	}
+
+	if (isOrganizer) {
+		english.addFields(
+			{
+				name: "Create and find tasks",
+				value: [
+					"`/task create` prepares a private preview before creating an OpenProject task. Project defaults come from the channel/category or an unambiguous owner team.",
+					"Message → Apps → `Create OpenProject task` starts from one message. `Draft OpenProject task with AI` creates an editable proposal for review.",
+					"`/task extract [message_count]` runs AI extraction on recent channel messages (20 by default, up to 50). It proposes tasks for review; it does not create them immediately.",
+				].join("\n"),
+			},
+			{
+				name: "Dates",
+				value: "Use `YYYY-MM-DD`. Create uses configured start/due defaults when omitted. Start-date autocomplete includes past and future dates; due-date autocomplete includes today through the next 30 days. `/task reschedule` changes dates; enter `clear` to remove one.",
+			},
+			{
+				name: "Manage tasks",
+				value: "`/task view`, `assign`, `reschedule`, `close`, `reopen`, and `announce` manage an existing task. `metrics`, `link-user`, and `reconcile` are organizer maintenance commands.",
+			},
+			{
+				name: "Other organizer commands",
+				value: "`/schedule create|list|cancel` manages scheduled channel messages. `/sync` synchronizes organizer roles and nicknames to the community server.",
+			},
+		);
+		french.addFields(
+			{
+				name: "Créer et trouver des tâches",
+				value: [
+					"`/task create` prépare un aperçu privé avant de créer une tâche OpenProject. Le projet par défaut vient du canal, de sa catégorie ou de l’équipe non ambiguë du responsable.",
+					"Message → Applications → `Create OpenProject task` part d’un message. `Draft OpenProject task with AI` crée une proposition modifiable à réviser.",
+					"`/task extract [message_count]` analyse les messages récents par IA (20 par défaut, jusqu’à 50). Les tâches sont proposées pour révision, sans création immédiate.",
+				].join("\n"),
+			},
+			{
+				name: "Dates",
+				value: "Utilisez `AAAA-MM-JJ`. Les valeurs configurées sont utilisées si les dates sont omises. L’autocomplétion du début inclut le passé et le futur; celle de l’échéance couvre aujourd’hui et les 30 prochains jours. `/task reschedule` modifie les dates; `clear` en supprime une.",
+			},
+			{
+				name: "Gérer les tâches",
+				value: "`/task view`, `assign`, `reschedule`, `close`, `reopen` et `announce` gèrent une tâche existante. `metrics`, `link-user` et `reconcile` servent à la maintenance par les organisateurs.",
+			},
+			{
+				name: "Autres commandes d’organisation",
+				value: "`/schedule create|list|cancel` gère les messages planifiés. `/sync` synchronise les rôles et surnoms vers le serveur communautaire.",
+			},
+		);
+	}
+
+	english.addFields({ name: "Everywhere", value: "`/help` displays this private help message." });
+	french.addFields({ name: "Partout", value: "`/help` affiche ce message d’aide privé." });
+	return [english, french];
+}
+
+const registerHelpCommand = (client: Client) => {
+	const organizerGuildId = process.env.ORGANIZER_GUILD_ID;
+	const communityGuildId = process.env.COMMUNITY_GUILD_ID;
+	if (!organizerGuildId || !communityGuildId) throw new Error("Missing environment variables for help");
+
 	client.on("interactionCreate", async interaction => {
-		if (!interaction.isCommand()) return;
-
-		const { commandName, guildId } = interaction;
-
-		if (commandName === "help") {
+		if (!interaction.isCommand() || interaction.commandName !== "help") return;
+		try {
+			await interaction.deferReply({ ephemeral: true });
+			await interaction.editReply({
+				embeds: buildHelpEmbeds({
+					guildId: interaction.guildId,
+					organizerGuildId,
+					communityGuildId,
+					uptimeSeconds: (client.uptime ?? 0) / 1000,
+					serverCount: client.guilds.cache.size,
+				}),
+			});
+		} catch (error) {
+			console.error("Error providing help information:", error);
+			const content = "Could not provide help. Please try again later. | Impossible d’afficher l’aide. Veuillez réessayer plus tard.";
 			try {
-				await interaction.deferReply({ ephemeral: true });
-
-				const organizerGuild = await client.guilds.fetch(
-					ORGANIZER_GUILD_ID,
-				);
-				const communityGuild = await client.guilds.fetch(
-					COMMUNITY_GUILD_ID,
-				);
-				const permissions = {
-					organizer: organizerGuild.members.me?.permissions.toArray(),
-					community: communityGuild.members.me?.permissions.toArray(),
-				};
-
-				const uptime = Math.floor((client.uptime ?? 0) / 1000);
-				const uptimeHours = Math.floor(uptime / 3600);
-				const uptimeMinutes = Math.floor((uptime % 3600) / 60);
-				const uptimeSeconds = uptime % 60;
-
-				const embedColor = 0xea885f;
-				const helpEmbeds = [
-					{
-						language: "en",
-						title: "Help & Information",
-						description: `
-This bot helps manage and coordinate activities across Hack the Hill's Discord servers and integrates with the Track the Hack app.
-                        `,
-						baseFields: [
-							{
-								name: "Uptime",
-								value: `${uptimeHours}h ${uptimeMinutes}m ${uptimeSeconds}s`,
-								inline: true,
-							},
-							{
-								name: "Servers",
-								value: `${client.guilds.cache.size}`,
-								inline: true,
-							},
-						],
-						community: [
-							{
-								name: "Permissions",
-								value:
-									permissions.community?.join(", ") ??
-									"Unknown",
-								inline: false,
-							},
-							{
-								name: "Commands",
-								value: `
-\`/verify\`: Get a verification link to verify your account in the community server.
-- Users interact with the bot on Discord with \`/verify\` or the button in [this channel](https://discord.com/channels/1214618719507058739/1263275546633044032/126696769226342406).
-- The bot sends a unique verification link (\`tracker.hackthehill.com/discord?id=<Discord User ID>\`).
-- Users follow the link to the Track the Hack app, log in, and complete the verification process.
-- The Track the Hack app checks the user's identity and sends a POST request to the bot's secure API endpoint with the user's Discord ID and a secret key.
-- The bot verifies the request using the secret key to ensure it's from the Track the Hack app.
-- Upon successful verification, the bot retrieves the user's information from Discord and assigns them the "Hacker" role in the server.
-`,
-								inline: false,
-							},
-						],
-						organizer: [
-							{
-								name: "Permissions",
-								value:
-									permissions.organizer?.join(", ") ??
-									"Unknown",
-								inline: false,
-							},
-							{
-								name: "OpenProject tasks",
-								value: `
-	Members can use task commands only in this Organizer server. \`/task create\` matches the channel name, then its category name, to an active OpenProject project; if neither matches, one unambiguous project from the assignee's team (or an explicitly selected accountable person's team when there is no assignee) is used. Choose a project manually when no deterministic default exists. Dates offer Today and the next 30 days as autocomplete suggestions (Discord has no native date picker).
-	\`/task view|assign|reschedule|close|reopen|announce\`: Manage or re-post an existing task without opening OpenProject.
-	Message → Apps → \`Create OpenProject task\`: Start a task from a message, choose a project/assignee, and include its backlink.
-	Message → Apps → \`Draft OpenProject task with AI\`: Create an editable, private proposal in an AI-enabled channel; it never creates a task without review.
-	\`/task link-user\` and \`/task reconcile\` are organizer-only setup/recovery commands.
-	\`/task metrics\`: Show organizer-only AI proposal quality for the last 7, 30, or 90 days without exposing message content.
-	\`/schedule create|list|cancel\`: Schedule a message in the current channel using your saved display name and avatar. Time examples: \`2 hours\`, \`10am\`, \`tomorrow 10am\`, or an ISO timestamp.
-`,
-								inline: false,
-							},
-							{
-								name: "Commands",
-								value: `
-\`/sync\`: Synchronize roles and nicknames from the organizer guild to the community guild.
-- The bot fetches all members from the organizer guild.
-- It then fetches all members from the community guild.
-- For each member present in both guilds, the bot syncs their roles from the organizer guild to the community guild.
-- The bot also updates their nickname in the community guild to match the nickname in the organizer guild.
-`,
-								inline: false,
-							},
-						],
-						common: [
-							{
-								name: "Global Commands",
-								value: `\`/help\`: Display this help message.`,
-								inline: false,
-							},
-						],
-					},
-					{
-						language: "fr",
-						title: "Aide et informations",
-						description: `
-Ce bot aide à gérer et coordonner les activités sur les serveurs Discord de Hack the Hill et s'intègre avec l'application Track the Hack.
-                        `,
-						baseFields: [
-							{
-								name: "Temps d'activité",
-								value: `${uptimeHours}h ${uptimeMinutes}m ${uptimeSeconds}s`,
-								inline: true,
-							},
-							{
-								name: "Serveurs",
-								value: `${client.guilds.cache.size}`,
-								inline: true,
-							},
-						],
-						community: [
-							{
-								name: "Autorisations",
-								value:
-									permissions.community?.join(", ") ??
-									"Inconnu",
-								inline: false,
-							},
-							{
-								name: "Commandes",
-								value: `
-\`/verify\`: Obtenez un lien de vérification pour vérifier votre compte sur le serveur communautaire.
-- Les utilisateurs interagissent avec le bot sur Discord avec \`/verify\` ou le bouton dans [ce canal](https://discord.com/channels/1214618719507058739/1263275546633044032/126696769226342406).
-- Le bot envoie un lien de vérification unique (\`tracker.hackthehill.com/discord?id=<ID Utilisateur Discord>\`).
-- Les utilisateurs suivent le lien vers l'application Track the Hack, se connectent et complètent le processus de vérification.
-- L'application Track the Hack vérifie l'identité de l'utilisateur et envoie une requête POST à l'API sécurisée du bot avec l'ID Discord de l'utilisateur et une clé secrète.
-- Le bot vérifie la requête en utilisant la clé secrète pour s'assurer qu'elle provient de l'application Track the Hack.
-- Après vérification réussie, le bot récupère les informations de l'utilisateur sur Discord et lui attribue le rôle "Hacker" sur le serveur.
-`,
-								inline: false,
-							},
-						],
-						organizer: [
-							{
-								name: "Autorisations",
-								value:
-									permissions.organizer?.join(", ") ??
-									"Inconnu",
-								inline: false,
-							},
-							{
-								name: "Tâches OpenProject",
-								value: `
-Les membres de ce serveur d'organisateurs peuvent utiliser les commandes de tâches. \`/task create\` cherche d'abord un projet OpenProject portant le nom du canal, puis celui de sa catégorie; sinon, un seul projet non ambigu associé à l'équipe de la personne assignée (ou de la personne explicitement responsable en l'absence d'assignation) est utilisé. Choisissez le projet manuellement si aucun défaut déterministe n'existe. Les dates proposent aujourd'hui et les 30 prochains jours par autocomplétion (sans sélecteur de date natif).
-	\`/task view|assign|reschedule|close|reopen|announce\`: Gère ou republie une tâche existante sans ouvrir OpenProject.
-	Message → Applications → \`Create OpenProject task\`: Démarre une tâche à partir d'un message, permet de choisir le projet/l'assigné et ajoute son lien.
-	Message → Applications → \`Draft OpenProject task with AI\`: Produit une proposition privée et modifiable dans un canal autorisé; aucune tâche n'est créée sans révision.
-	\`/task link-user\` et \`/task reconcile\` sont des commandes réservées aux organisateurs.
-	\`/task metrics\`: Affiche aux organisateurs les mesures de qualité des propositions IA des 7, 30 ou 90 derniers jours, sans contenu des messages.
-	\`/schedule create|list|cancel\`: Planifie un message dans le canal actuel avec votre nom d'affichage et votre avatar enregistrés. Exemples: \`2 hours\`, \`10am\`, \`tomorrow 10am\` ou une date ISO.
-`,
-								inline: false,
-							},
-							{
-								name: "Commandes",
-								value: `
-\`/sync\`: Synchroniser les rôles et les surnoms du serveur des organisateurs avec le serveur communautaire.
-- Le bot récupère tous les membres du serveur des organisateurs.
-- Il récupère ensuite tous les membres du serveur communautaire.
-- Pour chaque membre présent dans les deux serveurs, le bot synchronise leurs rôles du serveur des organisateurs avec le serveur communautaire.
-- Le bot met également à jour leur surnom dans le serveur communautaire pour qu'il corresponde au surnom dans le serveur des organisateurs.
-`,
-								inline: false,
-							},
-						],
-						common: [
-							{
-								name: "Commandes Globales",
-								value: `\`/help\`: Affiche ce message d'aide.`,
-								inline: false,
-							},
-						],
-					},
-				];
-
-				await interaction.editReply({
-					embeds: helpEmbeds.map(content => {
-						const embed = new EmbedBuilder()
-							.setColor(embedColor)
-							.setTitle(content.title)
-							.setDescription(content.description)
-							.addFields(...content.baseFields);
-
-						if (guildId === COMMUNITY_GUILD_ID) {
-							embed.addFields(...content.community);
-						} else if (guildId === ORGANIZER_GUILD_ID) {
-							embed.addFields(...content.organizer);
-						}
-						embed.addFields(...content.common);
-						return embed;
-					}),
-				});
-			} catch (error) {
-				console.error("Error providing help information:", error);
-				try {
-					const errorMessage =
-						"An error occurred while providing help information. Please try again later. | Une erreur s'est produite lors de la fourniture des informations d'aide. Veuillez réessayer plus tard.";
-					if (interaction.replied || interaction.deferred) {
-						await interaction.editReply({
-							content: errorMessage,
-						});
-					} else {
-						await interaction.reply({
-							content: errorMessage,
-							ephemeral: true,
-						});
-					}
-				} catch (editError) {
-					console.error(
-						"Failed to send error message to the user:",
-						editError,
-					);
-				}
+				if (interaction.replied || interaction.deferred) await interaction.editReply({ content, embeds: [] });
+				else await interaction.reply({ content, ephemeral: true });
+			} catch (replyError) {
+				console.error("Failed to send help error message:", replyError);
 			}
 		}
 	});
