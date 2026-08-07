@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, directProposalDismissalReason, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, handleProposalButton, handleProposalTargetSelect, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, proposalReviewComponents, relevantImageAttachments, removeProposalReviewCard, reviewedProposalAllowsDuplicate, taskCommand, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
+import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, directProposalDismissalReason, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, handleProposalButton, handleProposalTargetSelect, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, proposalReviewCardContent, proposalReviewComponents, proposalReviewExplanation, relevantImageAttachments, removeProposalReviewCard, reviewedProposalAllowsDuplicate, taskCommand, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
 import { formatProposalContent } from "../dist/task-proposals.js";
 import { normalizeTaskTitle, OpenProjectClient, openProjectAttachmentFileName, titlesLikelyDuplicate, workPackageMarkdownLink } from "../dist/openproject.js";
 
@@ -386,6 +386,17 @@ test("proposal card truncation preserves Markdown boundaries", () => {
 
 	const doubleBackticks = boundedDiscordContent(`${"Context ".repeat(5)}\`\`code ** ${"detail ".repeat(20)}`, 120);
 	assert.match(doubleBackticks, /``\n\n\[Preview truncated\]$/);
+});
+
+test("proposal review cards explain direct outcomes within Discord limits", () => {
+	const content = proposalReviewCardContent("Task details");
+	assert.match(content, /Task details/);
+	assert.equal(content.split(proposalReviewExplanation).length - 1, 1);
+
+	const truncated = proposalReviewCardContent("x".repeat(4000));
+	assert.equal(truncated.length <= 2000, true);
+	assert.match(truncated, /\[Preview truncated\]/);
+	assert.equal(truncated.split(proposalReviewExplanation).length - 1, 1);
 });
 
 test("work package proposal links include the ID and title", () => {
