@@ -20,6 +20,8 @@ test("AI review automation remains disabled by default", () => {
 		assert.equal(config?.OPENPROJECT_DRAFT_TTL_MINUTES, 1440);
 		assert.equal(config?.OPENPROJECT_RUN_MIGRATIONS, false);
 		assert.equal(config?.BOT_TIME_ZONE, "America/Toronto");
+		assert.equal(config?.AZURE_OPENAI_CHAT_MAX_CONCURRENCY, 1);
+		assert.equal(config?.AZURE_OPENAI_CHAT_MIN_INTERVAL_MS, 1000);
 		assert.equal("aiChannels" in config, false);
 		assert.equal("categoryProjects" in config, false);
 	} finally {

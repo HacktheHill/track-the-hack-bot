@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { automaticCandidateEligible, AzureTaskExtractor, containsSensitiveContent, mergeRelatedTaskCandidates, minimizeText, normalizeExtractedDate, sensitiveContentReasons, shouldReconcileTaskProposals, shouldSelectTaskContext } from "../dist/azure-openai.js";
+import { AzureChatLimiter } from "../dist/azure-chat-limiter.js";
 
 test("minimizeText removes common credentials and personal contact data", () => {
 	const value = minimizeText(
@@ -41,7 +42,58 @@ const config = {
 	AZURE_OPENAI_ENDPOINT: "https://azure.example",
 	AZURE_OPENAI_DEPLOYMENT: "task-extractor",
 	AZURE_OPENAI_API_VERSION: "v1",
+	AZURE_OPENAI_CHAT_MAX_CONCURRENCY: 10,
+	AZURE_OPENAI_CHAT_MIN_INTERVAL_MS: 0,
 };
+
+test("Azure chat limiter is FIFO, bounds concurrency, and removes queued aborts", async () => {
+	const limiter = new AzureChatLimiter(1, 0);
+	const order = [];
+	let releaseFirst;
+	let markFirstStarted;
+	const firstStarted = new Promise(resolve => { markFirstStarted = resolve; });
+	const first = limiter.run("deployment", undefined, async () => {
+		order.push("first");
+		markFirstStarted();
+		await new Promise(resolve => { releaseFirst = resolve; });
+		return "first";
+	});
+	await firstStarted;
+	const aborted = new AbortController();
+	const second = limiter.run("deployment", aborted.signal, async () => { order.push("second"); return "second"; });
+	const third = limiter.run("deployment", undefined, async () => { order.push("third"); return "third"; });
+	aborted.abort();
+	releaseFirst();
+	assert.equal(await first, "first");
+	await assert.rejects(second, error => error.name === "AbortError");
+	assert.equal(await third, "third");
+	assert.deepEqual(order, ["first", "third"]);
+});
+
+test("Azure chat limiter applies Retry-After cooldown across queued attempts", async () => {
+	const limiter = new AzureChatLimiter(1, 0);
+	const started = [];
+	const first = limiter.run("deployment", undefined, async () => {
+		started.push(Date.now());
+		return new Response(null, { status: 429, headers: { "retry-after-ms": "30" } });
+	});
+	const second = limiter.run("deployment", undefined, async () => {
+		started.push(Date.now());
+		return new Response(null, { status: 200 });
+	});
+	await Promise.all([first, second]);
+	assert.ok(started[1] - started[0] >= 25);
+});
+
+test("Azure chat limiter spaces attempt starts by the configured interval", async () => {
+	const limiter = new AzureChatLimiter(2, 25);
+	const started = [];
+	await Promise.all([1, 2].map(() => limiter.run("deployment", undefined, async () => {
+		started.push(Date.now());
+		return "ok";
+	})));
+	assert.ok(started[1] - started[0] >= 20);
+});
 
 test("Azure extractor authenticates, bounds output, and uses the configured deployment", async () => {
 	const originalFetch = globalThis.fetch;
