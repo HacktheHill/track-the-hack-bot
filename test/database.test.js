@@ -356,13 +356,25 @@ test("proposal insertion and its initial revision commit atomically", async () =
 	assert.ok(revisionIndex > -1 && commitIndex > revisionIndex);
 });
 
-test("existing-task proposals require a target and lock version", async () => {
-	const db = databaseWithPool({ async query() { throw new Error("should not query"); } });
-	await assert.rejects(db.createProposal({
+test("unresolved existing-task proposals persist with nullable target operations", async () => {
+	const queries = [];
+	const db = databaseWithPool({ async query(sql, values) {
+		queries.push({ sql, values });
+		return sql.includes("INSERT INTO task_proposals") ? { rowCount: 1, rows: [{ id: "proposal" }] } : { rowCount: 0, rows: [] };
+	} });
+	await db.createProposal({
 		channelId: "channel", projectId: 3, title: "Update wording", description: "Add revisions",
 		sourceMessageIds: ["message"], modelDeployment: "model", action: "update",
 		contentOperation: "postComment", contentMarkdown: "- Change wording",
-	}), /require a target task and lock version/);
+	});
+	const insert = queries.find(query => query.sql.includes("INSERT INTO task_proposals"));
+	assert.equal(insert.values[23], null);
+	assert.equal(insert.values[24], null);
+	assert.equal(insert.values[29], null);
+	await assert.rejects(db.createProposal({
+		channelId: "channel", title: "Bad target", description: "Bad", sourceMessageIds: ["other"], modelDeployment: "model",
+		action: "update", targetWorkPackageId: 42,
+	}), /targets require a lock version/);
 });
 
 test("reviewers can safely retarget a create proposal as an update", async () => {
@@ -377,8 +389,65 @@ test("reviewers can safely retarget a create proposal as an update", async () =>
 		id: "proposal", projectId: 7, targetWorkPackageId: 42, targetLockVersion: 3,
 		metadataPatch: {}, contentOperation: "postComment", contentMarkdown: "## Update\n\n- Revise it.",
 	});
-	assert.match(updated.sql, /action='update'/);
-	assert.deepEqual(updated.values, ["proposal", 42, 3, "{}", "postComment", "## Update\n\n- Revise it.", 7]);
+	assert.match(updated.sql, /CASE WHEN action='create' THEN 'update'/);
+	assert.deepEqual(updated.values, ["proposal", "create", 7, 42, 3, "{}", "postComment", "## Update\n\n- Revise it.", null]);
+});
+
+test("target resolution CASes action, prior target, project, lock, and operations together", async () => {
+	let updated;
+	const db = databaseWithPool({ async query(sql, values) { updated = { sql, values }; return { rowCount: 1, rows: [] }; } });
+	await db.resolveProposalTarget({
+		id: "proposal", expectedAction: "complete", expectedTargetWorkPackageId: undefined,
+		projectId: 9, targetWorkPackageId: 42, targetLockVersion: 5,
+		metadataPatch: { status: "complete" }, contentOperation: "none", contentMarkdown: null,
+	});
+	assert.match(updated.sql, /action=\$2/);
+	assert.match(updated.sql, /target_work_package_id IS NOT DISTINCT FROM \$9/);
+	assert.deepEqual(updated.values, ["proposal", "complete", 9, 42, 5, '{"status":"complete"}', "none", null, null]);
+});
+
+test("proposal claims require resolved operations for existing-task actions", async () => {
+	let query;
+	const db = databaseWithPool({ async query(sql, values) { query = { sql, values }; return { rowCount: 0, rows: [] }; } });
+	assert.equal(await db.claimProposal("proposal", "reviewer"), false);
+	assert.match(query.sql, /action='create' OR \(target_work_package_id IS NOT NULL/);
+});
+
+test("create-proposal detail edits commit inference, correction flags, and revision atomically", async () => {
+	const queries = [];
+	const db = databaseWithPool({ async query(sql, values) {
+		queries.push({ sql, values });
+		if (sql.includes("RETURNING *")) return { rowCount: 1, rows: [{
+			revision: 2, title: "Task", description: "Details", project_id: 7,
+			assignee_discord_id: null, accountable_discord_id: "owner", priority_id: 2,
+			size_href: "/api/v3/custom_options/3", start_date: "2026-08-10", due_date: null,
+			estimated_hours: 4, action: "create", target_work_package_id: null,
+			source_message_ids: ["message"], source_links: [],
+		}] };
+		return { rowCount: 1, rows: [] };
+	} });
+	await db.updateProposalMetadata("proposal", "reviewer", {
+		accountableId: "owner", priorityId: 2, sizeHref: "/api/v3/custom_options/3", startDate: "2026-08-10", estimatedHours: 4,
+	});
+	assert.equal(queries[0].sql, "BEGIN");
+	assert.match(queries[1].sql, /metadata_inference=metadata_inference \|\|/);
+	assert.match(queries[1].sql, /correction_flags=correction_flags \|\|/);
+	assert.match(queries[2].sql, /task_proposal_revisions/);
+	assert.equal(queries[3].sql, "COMMIT");
+});
+
+test("deleted cited sources supersede only pending proposals transactionally", async () => {
+	const queries = [];
+	const db = databaseWithPool({ async query(sql, values) {
+		queries.push({ sql, values });
+		if (sql.includes("RETURNING id,channel_id")) return { rowCount: 1, rows: [{ id: "proposal", channel_id: "channel", review_message_id: "card" }] };
+		return { rowCount: 1, rows: [] };
+	} });
+	const rows = await db.supersedePendingProposalsForDeletedSource("message");
+	assert.equal(rows.length, 1);
+	assert.match(queries[1].sql, /WHERE status='pending_review'/);
+	assert.match(queries[2].sql, /source_deleted/);
+	assert.equal(queries.at(-1).sql, "COMMIT");
 });
 
 test("existing proposals retarget only before any operation is applied", async () => {

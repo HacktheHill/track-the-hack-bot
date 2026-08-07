@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { automaticBatchSource, automaticFocalWindows, messageRevisionChanged, proposalOwnerText, reconciledSupersessionIds } from "../dist/automatic-tasks.js";
+import { automaticBatchSource, automaticFocalWindows, messageRevisionChanged, proposalOwnerText, reconciledSupersessionIds, registerAutomaticTaskDetection, sourceEditShouldReconcile } from "../dist/automatic-tasks.js";
 
 test("automatic batches evaluate every message as its own focal window", () => {
 	assert.deepEqual(automaticFocalWindows(["a", "b", "c"]), [
@@ -50,6 +50,24 @@ test("message edits enqueue only content or attachment changes and partials fail
 	assert.equal(messageRevisionChanged("old", "new", "a:url", "a:url"), true);
 	assert.equal(messageRevisionChanged("same", "same", "a:url", "b:url"), true);
 	assert.equal(messageRevisionChanged(undefined, "current", "", ""), true);
+});
+
+test("off and shadow source maintenance is limited to cited pending proposals", () => {
+	assert.equal(sourceEditShouldReconcile("off", []), false);
+	assert.equal(sourceEditShouldReconcile("shadow", []), false);
+	assert.equal(sourceEditShouldReconcile("off", ["proposal"]), true);
+	assert.equal(sourceEditShouldReconcile("shadow", ["proposal"]), true);
+	assert.equal(sourceEditShouldReconcile("review", []), true);
+});
+
+test("source update and delete listeners register even when automatic creation is off", () => {
+	const listeners = new Map();
+	const client = { on(event, listener) { listeners.set(event, listener); } };
+	registerAutomaticTaskDetection(client, {
+		config: { OPENPROJECT_AUTOMATION_MODE: "off" },
+		extractor: { enabled: false }, db: {}, openProject: {},
+	});
+	assert.deepEqual([...listeners.keys()], ["messageCreate", "messageUpdate", "messageDelete"]);
 });
 
 test("proposal supersession requires an affirmative safe transition", () => {

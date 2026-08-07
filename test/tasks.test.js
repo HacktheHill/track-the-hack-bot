@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, directProposalDismissalReason, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, handleProposalButton, handleProposalTargetSelect, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, proposalReviewCardContent, proposalReviewComponents, proposalReviewExplanation, relevantImageAttachments, removeProposalReviewCard, resolveOptionalOwner, reviewedProposalAllowsDuplicate, taskCommand, taskIdentityGuidance, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
+import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, directProposalDismissalReason, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, handleProposalButton, handleProposalTargetSelect, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, proposalReviewCardContent, proposalReviewComponents, proposalReviewExplanation, recentExtractionMessages, relevantImageAttachments, removeProposalReviewCard, resolveOptionalOwner, reviewedProposalAllowsDuplicate, taskCommand, taskIdentityGuidance, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
 import { formatProposalContent } from "../dist/task-proposals.js";
 import { normalizeTaskTitle, OpenProjectClient, openProjectAttachmentFileName, titlesLikelyDuplicate, workPackageMarkdownLink } from "../dist/openproject.js";
 
@@ -193,6 +193,17 @@ test("forced extraction requires evidence from its newest-message focus", () => 
 	assert.equal(citesExtractionFocus(["supporting"], focusIds), false);
 });
 
+test("forced extraction takes the requested eligible human messages as focal evidence", () => {
+	const messages = [
+		{ id: "old", createdTimestamp: 1, author: { bot: false }, system: false, content: "old" },
+		{ id: "bot", createdTimestamp: 2, author: { bot: true }, system: false, content: "noise" },
+		{ id: "command", createdTimestamp: 3, author: { bot: false }, system: false, content: "/task" },
+		{ id: "middle", createdTimestamp: 4, author: { bot: false }, system: false, content: "middle" },
+		{ id: "new", createdTimestamp: 5, author: { bot: false }, system: false, content: "new" },
+	];
+	assert.deepEqual(recentExtractionMessages(messages, 2).map(message => message.id), ["middle", "new"]);
+});
+
 test("proposal review permits participants, organizers, and server managers", () => {
 	assert.equal(proposalReviewAllowed("participant", ["participant"], null), true);
 	assert.equal(proposalReviewAllowed("requester", [], "requester"), true);
@@ -253,12 +264,15 @@ test("proposal controls make reviewed create proposals an explicit new-task choi
 	for (const action of ["create", "update", "complete", "reopen"]) {
 		const buttons = manualProposalButtons("proposal", action).map(button => button.toJSON());
 		assert.deepEqual(buttons.map(button => [button.custom_id, button.label]), [
-			["op-review:proposal", action === "create" ? "Review new task" : "Review"],
+			...(action === "create" ? [["op-review:proposal", "Review new task"]] : []),
+			...(action === "create" ? [["op-edit-details:proposal", "Edit details"]] : []),
+			["op-choose-target:proposal", "Choose task by ID"],
 			["op-dismiss-no-task:proposal", "Dismiss"],
 			["op-incorrect:proposal", "Incorrect"],
 		]);
 		assert.equal(reviewedProposalAllowsDuplicate(action), action === "create");
 	}
+	assert.deepEqual(manualProposalButtons("proposal", "update", false).map(button => button.toJSON().label), ["Choose task by ID", "Dismiss", "Incorrect"]);
 	assert.equal(directProposalDismissalReason("op-dismiss-no-task:proposal"), "not_actionable");
 	assert.equal(directProposalDismissalReason("op-incorrect:proposal"), "incorrect_proposal");
 	assert.equal(directProposalDismissalReason("op-review:proposal"), undefined);
@@ -331,6 +345,7 @@ test("reviewers can retarget a nominated update through its allowlisted menu", a
 		ambiguities: ["Confirm the final deadline"],
 		rag_candidates: [candidate], review_message_id: null,
 	};
+	let currentProposal = proposal;
 	const interaction = {
 		customId: "op-existing-target:proposal", values: ["42"], user: { id: "reviewer" },
 		message: { id: "message", flags: { has: () => true } },
@@ -339,20 +354,27 @@ test("reviewers can retarget a nominated update through its allowlisted menu", a
 	};
 	const services = {
 		db: {
-			proposal: async () => proposal,
-			retargetProposal: async input => { retargeted = input; },
+			proposal: async () => currentProposal,
+			resolveProposalTarget: async input => {
+				retargeted = input;
+				currentProposal = { ...proposal, action: "update", target_work_package_id: input.targetWorkPackageId,
+					project_id: input.projectId, content_operation: input.contentOperation, content_markdown: input.contentMarkdown,
+					metadata_patch: input.metadataPatch };
+			},
 			logTaskEvent: async () => {},
 		},
 		openProject: {
-			workPackage: async id => ({ id, subject: "Sponsor prospectus", description: "Existing scope", lockVersion: 4, project: { id: 7 }, _links: {} }),
-			projects: async () => [{ id: 7 }],
+			workPackage: async id => ({ id, subject: "Sponsor prospectus", description: "Existing scope", lockVersion: 4, project: { id: 9 }, _links: {} }),
+			projects: async () => [{ id: 9 }],
 			workPackageUrl: id => `https://openproject.test/work_packages/${id}`,
 		},
 	};
 	assert.equal(await handleProposalTargetSelect(interaction, services), true);
 	assert.equal(deferred, true);
 	assert.equal(retargeted.expectedTargetWorkPackageId, 41);
+	assert.equal(retargeted.expectedAction, "update");
 	assert.equal(retargeted.targetWorkPackageId, 42);
+	assert.equal(retargeted.projectId, 9);
 	assert.deepEqual(retargeted.metadataPatch, { dueDate: "2026-08-01" });
 	assert.deepEqual(edited.allowedMentions, { parse: [] });
 	assert.match(edited.content, /\*\*Proposed comment\*\*\nApply the revisions/);

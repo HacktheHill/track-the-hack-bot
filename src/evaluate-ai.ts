@@ -6,7 +6,6 @@ import { z } from "zod";
 import { automaticCandidateEligible, AzureTaskExtractor, mergeRelatedTaskCandidates, StructuredOutputError, type AutomaticCandidateAssessment, type ExtractedTasks, type MinimizedMessage } from "./azure-openai.js";
 import { contentHash, corpusWindowSchema, parseCorpusJsonl } from "./ai-corpus.js";
 import type { IntegrationConfig } from "./config.js";
-import { resolveProposedAction } from "./rag.js";
 import { taskReferencesAreValid } from "./task-proposals.js";
 import { normalizeProjectName } from "./project-resolution.js";
 
@@ -64,10 +63,8 @@ export function runtimeProposalCandidates(
 	const eligible = mode === "automatic"
 		? grounded.filter((_, index) => automaticCandidateEligible(automaticAssessments[index], windowSensitivity))
 		: grounded;
-	return eligible.filter(task => {
-		const targetAvailable = routing.availableTargetSourceMessageIds?.some(ids => ids.every(id => task.source_message_ids.includes(id))) ?? false;
-		return resolveProposedAction(task.proposed_action, targetAvailable) !== "no_action";
-	});
+	void routing;
+	return eligible;
 }
 
 export function runtimeGroundedCandidates(tasks: ExtractedTask[], messages: MinimizedMessage[]) {
