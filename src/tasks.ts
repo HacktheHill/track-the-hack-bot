@@ -1798,9 +1798,9 @@ async function completeAiContext(
 			proposedAction: task.proposed_action,
 			sourceMessageIds: task.source_message_ids,
 		})),
-		pipelineVersion: "v6",
+		pipelineVersion: "v7",
 		extractionPromptVersion: "candidate-v4",
-		gatePromptVersion: "automatic-precision-v2",
+		gatePromptVersion: "automatic-precision-v3",
 		stages: {
 			contextSelection: { deployment: contextSelection.deployment, latencyMs: contextSelection.latencyMs, candidateMessageCount: context.messages.length, selectedMessageCount: contextSelection.messages.length },
 			extraction: { deployment: extraction.deployment, latencyMs: extraction.latencyMs - gate.latencyMs - contextSelection.latencyMs - reconciliation.latencyMs },
