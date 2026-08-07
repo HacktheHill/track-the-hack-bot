@@ -400,13 +400,33 @@ export class Database {
 		return new Map(result.rows.map(row => [row.discord_user_id, row.openproject_user_id]));
 	}
 
-	async setOpenProjectUser(discordId: string, openProjectId: number) {
-		await this.pool.query(
-			`INSERT INTO discord_openproject_users(discord_user_id, openproject_user_id)
-			 VALUES ($1,$2) ON CONFLICT(discord_user_id) DO UPDATE
-			 SET openproject_user_id=excluded.openproject_user_id, updated_at=now()`,
-			[discordId, openProjectId],
-		);
+	async claimOpenProjectUser(discordId: string, openProjectId: number) {
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			await client.query("SELECT pg_advisory_xact_lock(hashtext('track-the-hack-openproject-identity'))");
+			const collision = await client.query(
+				"SELECT 1 FROM discord_openproject_users WHERE openproject_user_id=$1 AND discord_user_id<>$2 LIMIT 1",
+				[openProjectId, discordId],
+			);
+			if (collision.rowCount) {
+				await client.query("ROLLBACK");
+				return false;
+			}
+			await client.query(
+				`INSERT INTO discord_openproject_users(discord_user_id, openproject_user_id)
+				 VALUES ($1,$2) ON CONFLICT(discord_user_id) DO UPDATE
+				 SET openproject_user_id=excluded.openproject_user_id, updated_at=now()`,
+				[discordId, openProjectId],
+			);
+			await client.query("COMMIT");
+			return true;
+		} catch (error) {
+			await client.query("ROLLBACK").catch(() => undefined);
+			throw error;
+		} finally {
+			client.release();
+		}
 	}
 
 	async createScheduledMessage(input: {

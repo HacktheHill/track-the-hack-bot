@@ -3,7 +3,7 @@ import { automaticCandidateEligible, containsSensitiveContent, extractionDiagnos
 import { isOrganizerGuild, type IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient, titlesLikelyDuplicate, workPackageMarkdownLink } from "./openproject.js";
-import { AI_CONTEXT_GAP_MS, boundedDiscordContent, defaultAiDueDate, formatAiTaskDescription, inferCreationMetadata, proposalReviewAllowed, proposalReviewComponents, relevantImageAttachments } from "./tasks.js";
+import { AI_CONTEXT_GAP_MS, boundedDiscordContent, defaultAiDueDate, formatAiTaskDescription, inferCreationMetadata, proposalReviewAllowed, proposalReviewComponents, relevantImageAttachments, resolveOptionalOwner } from "./tasks.js";
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
 import { describeProposalOperations, formatProposalContent, planExistingTaskOperations, sourceContentHash, taskReferencesAreValid } from "./task-proposals.js";
 import { isExcludedChannel, projectIdForTeamRoles, projectIdFromChannelNames, resolveProjectId } from "./project-resolution.js";
@@ -298,16 +298,24 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			let pipelineLatencyMs = contextSelection.latencyMs + extraction.latencyMs + reconciliation.latencyMs + gate.latencyMs;
 			let pipelineUsage = combinedUsage(contextSelection.usage, extraction.usage, reconciliation.usage, gate.usage);
 			for (const { candidate: task, pendingProposalId } of eligibleTasks) {
-				const assigneeId = task.assignee_alias ? reverse.get(task.assignee_alias) : undefined;
-				const assignee = assigneeId ? await primary.guild!.members.fetch(assigneeId).catch(() => null) : null;
+				const inferredAssigneeId = task.assignee_alias ? reverse.get(task.assignee_alias) : undefined;
+				const inferredAccountableId = source.find(message => task.source_message_ids.includes(message.id))?.author.id;
+				const [assigneeResolution, accountableResolution] = await Promise.all([
+					resolveOptionalOwner(inferredAssigneeId, "assignee", primary.guild!, services),
+					resolveOptionalOwner(inferredAccountableId, "accountable user", primary.guild!, services),
+				]);
+				const assigneeId = assigneeResolution.discordId;
+				const accountableId = accountableResolution.discordId;
+				const identityAmbiguities = [assigneeResolution.ambiguity, accountableResolution.ambiguity].filter((value): value is string => Boolean(value));
+				const ambiguities = [...result.ambiguities, ...identityAmbiguities];
+				const assignee = inferredAssigneeId ? await primary.guild!.members.fetch(inferredAssigneeId).catch(() => null) : null;
 				let projectId = await resolveProjectId(primary.channelId, primary.guild!, projects, {
 					teamProjectId: projectIdForTeamRoles(assignee, services.config.teamRoles),
 					inferredProjectName: task.project_name,
 				});
-				const accountableId = source.find(message => task.source_message_ids.includes(message.id))?.author.id;
-				const accountableName = source.find(message => message.author.id === accountableId)?.member?.displayName
-					?? source.find(message => message.author.id === accountableId)?.author.username;
-				const ownerText = proposalOwnerText(assignee?.displayName ?? assignee?.user.username, accountableName);
+				const accountableName = accountableId ? source.find(message => message.author.id === accountableId)?.member?.displayName
+					?? source.find(message => message.author.id === accountableId)?.author.username : undefined;
+				const ownerText = proposalOwnerText(assigneeId ? assignee?.displayName ?? assignee?.user.username : undefined, accountableName);
 				let priority = task.priority_name ? priorities.find(item => item.name.toLocaleLowerCase() === task.priority_name!.toLocaleLowerCase()) : undefined;
 				let estimatedHours = task.estimated_hours ?? undefined;
 				const sourceLinks = task.source_message_ids.map(id => `https://discord.com/channels/${primary.guildId}/${source.find(item => item.id === id)?.channelId ?? channelId}/${id}`);
@@ -396,7 +404,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						sourceAttachments,
 						ragCandidates,
 						modelDeployment: deployment, permittedReviewerIds: [...reviewers], evidence: task.evidence,
-						ambiguities: [...result.ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: pipelineLatencyMs, tokenUsage: pipelineUsage,
+						ambiguities: [...ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: pipelineLatencyMs, tokenUsage: pipelineUsage,
 						action, targetWorkPackageId: match.workPackageId, targetLockVersion: target!.lockVersion,
 						metadataPatch: operations.metadataPatch, contentOperation: operations.contentOperation,
 						contentMarkdown: operations.contentMarkdown,
@@ -413,7 +421,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS,
 					});
 					const reviewPayload: ReviewCardPayload = {
-						content: boundedDiscordContent(`${ownerText}Proposed ${action} for OpenProject task ${workPackageMarkdownLink(target!.id, target!.subject, services.openProject.workPackageUrl(target!.id))}\nProposed title: **${task.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch, { assignee: assignee?.displayName ?? assignee?.user.username, priority: priority?.name, size: size?.value }).map(item => `- ${item}`).join("\n")}${operations.contentOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : ""}${formatProposalContent(operations.contentOperation, operations.contentMarkdown)}${result.ambiguities.length ? `\n\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`),
+						content: boundedDiscordContent(`${ownerText}Proposed ${action} for OpenProject task ${workPackageMarkdownLink(target!.id, target!.subject, services.openProject.workPackageUrl(target!.id))}\nProposed title: **${task.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch, { assignee: assigneeId ? assignee?.displayName ?? assignee?.user.username : undefined, priority: priority?.name, size: size?.value }).map(item => `- ${item}`).join("\n")}${operations.contentOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : ""}${formatProposalContent(operations.contentOperation, operations.contentMarkdown)}${ambiguities.length ? `\n\nAmbiguities: ${ambiguities.join("; ")}` : ""}`),
 						components: proposalReviewComponents(proposal.id, action, ragCandidates),
 						allowedMentions: { parse: [] },
 					};
@@ -470,7 +478,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						sourceAttachments,
 					modelDeployment: deployment,
 					permittedReviewerIds: [...reviewers],
-					evidence: task.evidence, ambiguities: [...result.ambiguities, ...(advisory ? [advisory] : [])],
+					evidence: task.evidence, ambiguities: [...ambiguities, ...(advisory ? [advisory] : [])],
 					latencyMs: pipelineLatencyMs, tokenUsage: pipelineUsage,
 						escalationReason: extraction.escalationReason,
 						workItemKey: task.work_item_key,
@@ -487,7 +495,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						ragCandidates,
 				});
 				const reviewPayload: ReviewCardPayload = {
-					content: boundedDiscordContent(`${ownerText}Proposed OpenProject task: **${task.title}**\n${description}\n\nProject: ${projects.find(item => item.id === projectId)?.name ?? "Not resolved"}\nPriority: ${priority?.name ?? "Not inferred"}\nSize: ${size?.value ?? "Not inferred"}\nDates: ${task.start_date ?? "Not set"} → ${dueDate}\nEstimate: ${estimatedHours !== undefined ? `${estimatedHours}h` : "Not inferred"}${advisory ? `\n\n${advisory}` : ""}${result.ambiguities.length ? `\n\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`),
+					content: boundedDiscordContent(`${ownerText}Proposed OpenProject task: **${task.title}**\n${description}\n\nProject: ${projects.find(item => item.id === projectId)?.name ?? "Not resolved"}\nPriority: ${priority?.name ?? "Not inferred"}\nSize: ${size?.value ?? "Not inferred"}\nDates: ${task.start_date ?? "Not set"} → ${dueDate}\nEstimate: ${estimatedHours !== undefined ? `${estimatedHours}h` : "Not inferred"}${advisory ? `\n\n${advisory}` : ""}${ambiguities.length ? `\n\nAmbiguities: ${ambiguities.join("; ")}` : ""}`),
 					components: proposalReviewComponents(proposal.id, "create", ragCandidates),
 					allowedMentions: { parse: [] },
 				};
