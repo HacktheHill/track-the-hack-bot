@@ -7,7 +7,7 @@ participant identifiers, or per-case model output.
 ## Current schema v3
 
 Automatic evaluation mirrors the production two-stage pipeline. The first model
-call extracts recall-oriented candidates. The second independently assesses each
+call extracts recall-oriented candidates. The second separately assesses each
 candidate for activated specific work, remaining work or a trackable transition,
 durability, decision readiness, contextual sensitivity, and supporting source
 message IDs. It also classifies the sensitivity of the complete message window.
@@ -26,8 +26,9 @@ concept recall, project routing, owner, and deadline results. Reports also count
 grounding rejections, related-candidate merges, finalization rejections, and each
 automatic gate criterion failure.
 Case-level diagnostics contain counts only, never proposal content or source IDs.
-Keep independently adjudicated v3 cases outside source control. Legacy events
-and corpora that contain extraction-time
+Current corpus inclusion records one human review, not independent or double
+adjudication. Keep v3 cases outside
+source control. Legacy events and corpora that contain extraction-time
 `automatic_eligibility`, `trigger_kind`, or `lifecycle` labels are not directly
 comparable to v3 gate results.
 
@@ -102,7 +103,12 @@ excluded with `missing_attachment` whenever attachment contents are necessary to
 establish the expected outcome.
 
 Start `tth-bot-ai-evaluate` manually before release decisions; reports are
-written under `reports/<run-id>/` and corpus text is not printed to logs.
+written under `reports/<run-id>/` and corpus text is not printed to logs. Full
+runs fail unless they meet the configured minimum window count, proposal
+precision, and valid-output rate. Proposal recall, owner accuracy, and deadline
+accuracy remain reported diagnostics and are not release thresholds. The JSON
+report records `passed` and `thresholdFailures`; the Azure job publishes both
+reports before returning a failed status for a threshold miss.
 
 ## Cost controls
 
@@ -144,9 +150,13 @@ conversion, incomplete final snapshots, source IDs absent from the exact input,
 superseded extraction links, and multi-candidate manual extractions are also
 excluded rather than assigned potentially incorrect labels. The
 generated corpus therefore provides useful decision, source-grounding, and
-routing coverage, but owner/deadline labels still require deliberate enrichment
-and randomly sampled `no_task` windows still need human review for an unbiased
-recall estimate.
+routing coverage, but owner/deadline labels still require deliberate enrichment.
+Safe automatic model abstentions are selected with stable seeded Bernoulli
+sampling before the sample cap and still require human review. This negative-only
+sample does not estimate overall recall.
+Configure selection with `AI_CORPUS_NO_TASK_SAMPLE_RATE` and
+`AI_CORPUS_NO_TASK_SAMPLE_SEED`; `AI_CORPUS_NO_TASK_SAMPLE_LIMIT` remains the
+post-safety hard cap.
 
 ## 2026-07-17 baseline
 
@@ -168,7 +178,7 @@ This baseline validates the evaluation pipeline and its current known
 scenarios. It is not a fully independent production-quality estimate: the 13
 production windows use stored model telemetry labels and the remaining windows
 are synthetic. Continue collecting human review outcomes and replace synthetic
-cases with independently annotated, representative production windows over
+cases with human-reviewed, representative production windows over
 time. AI remains limited to human-reviewed proposals and cannot create an
 OpenProject task without reviewer approval.
 
@@ -190,6 +200,9 @@ have been retained. Replays wait eight seconds between requests by default;
 different rate limit.
 
 The successful run used an eight-second minimum interval between provider
-requests. Set `AI_EVAL_MIN_INTERVAL_MS` and `AI_EVAL_PROVIDER_RETRIES` for
-future batch runs when the Azure deployment has limited request or token
-capacity.
+requests. All chat stages and retries share the process-wide FIFO limiter;
+`AZURE_OPENAI_CHAT_MAX_CONCURRENCY` and
+`AZURE_OPENAI_CHAT_MIN_INTERVAL_MS` default to 1 and 1000. A 429 Retry-After
+applies a shared endpoint/deployment cooldown. Evaluation can add slower pacing
+with `AI_EVAL_MIN_INTERVAL_MS` and tune outer retries with
+`AI_EVAL_PROVIDER_RETRIES`.

@@ -7,6 +7,8 @@ export const aiCorpusConfigSchema = z.object({
 	AI_CORPUS_UI_PORT: z.coerce.number().int().min(1024).max(65535).default(4178),
 	AI_CORPUS_SYNC_DAYS: z.coerce.number().int().min(1).max(365).default(90),
 	AI_CORPUS_NO_TASK_SAMPLE_LIMIT: z.coerce.number().int().min(0).max(500).default(25),
+	AI_CORPUS_NO_TASK_SAMPLE_RATE: z.coerce.number().min(0).max(1).default(0.1),
+	AI_CORPUS_NO_TASK_SAMPLE_SEED: z.string().min(1).default("no-task-v1"),
 });
 
 export type AiCorpusConfig = z.infer<typeof aiCorpusConfigSchema>;

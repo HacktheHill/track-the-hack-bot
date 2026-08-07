@@ -19,12 +19,17 @@ export const evaluationEnvSchema = z.object({
 	AZURE_OPENAI_DEPLOYMENT: z.string().min(1),
 	AZURE_OPENAI_API_VERSION: z.string().default("v1"),
 	AZURE_OPENAI_MAX_COMPLETION_TOKENS: z.coerce.number().int().min(64).max(4096).default(4096),
+	AZURE_OPENAI_CHAT_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(1),
+	AZURE_OPENAI_CHAT_MIN_INTERVAL_MS: z.coerce.number().int().min(0).max(60000).default(1000),
 	OPENPROJECT_AI_MAX_CONTEXT_CHARS: z.coerce.number().int().min(2000).max(100000).default(16000),
 	OPENPROJECT_AI_MAX_IMAGE_ATTACHMENTS: z.coerce.number().int().min(0).max(20).default(0),
 	AI_EVAL_MIN_INTERVAL_MS: z.coerce.number().int().min(0).max(60000).default(0),
 	AI_EVAL_PROVIDER_RETRIES: z.coerce.number().int().min(0).max(10).default(3),
 	AI_EVAL_CACHE_DIR: z.string().default(".private/ai-eval-cache"),
 	AI_EVAL_MAX_UNCACHED_CASES: z.coerce.number().int().min(1).max(10000).default(25),
+	AI_EVAL_RELEASE_MIN_WINDOWS: z.coerce.number().int().min(1).max(100000).default(100),
+	AI_EVAL_RELEASE_MIN_PROPOSAL_PRECISION: z.coerce.number().min(0).max(1).default(0.95),
+	AI_EVAL_RELEASE_MIN_VALID_OUTPUT_RATE: z.coerce.number().min(0).max(1).default(0.99),
 });
 
 type ExtractedTask = ExtractedTasks["tasks"][number];
@@ -270,6 +275,19 @@ export function retryableProviderFailure(error: unknown) {
 	return category === "timeout" || category === "network_error" || ["http_408", "http_409", "http_425", "http_429", "http_500", "http_502", "http_503", "http_504"].includes(category);
 }
 
+export type ReleaseThresholdFailure = { metric: "corpusWindows" | "proposalPrecision" | "validOutputRate"; actual: number; threshold: number };
+
+export function releaseThresholdFailures(
+	metrics: { corpusWindows: number; proposalPrecision: number; validOutputRate: number },
+	thresholds: { minimumWindows: number; proposalPrecision: number; validOutputRate: number },
+) {
+	const failures: ReleaseThresholdFailure[] = [];
+	if (metrics.corpusWindows < thresholds.minimumWindows) failures.push({ metric: "corpusWindows", actual: metrics.corpusWindows, threshold: thresholds.minimumWindows });
+	if (metrics.proposalPrecision < thresholds.proposalPrecision) failures.push({ metric: "proposalPrecision", actual: metrics.proposalPrecision, threshold: thresholds.proposalPrecision });
+	if (metrics.validOutputRate < thresholds.validOutputRate) failures.push({ metric: "validOutputRate", actual: metrics.validOutputRate, threshold: thresholds.validOutputRate });
+	return failures;
+}
+
 async function main() {
 	const inputPath = process.argv[2];
 	if (!inputPath) throw new Error("Usage: npm run evaluate:ai -- <private-corpus.jsonl> [output-prefix] [--case <id>] [--changed] [--fresh] [--full]");
@@ -436,6 +454,16 @@ async function main() {
 		finalizationRetention: optionalRatio(stageTotals.finalCandidates, stageTotals.groundedCandidates),
 	};
 
+	const thresholds = {
+		minimumWindows: env.AI_EVAL_RELEASE_MIN_WINDOWS,
+		proposalPrecision: env.AI_EVAL_RELEASE_MIN_PROPOSAL_PRECISION,
+		validOutputRate: env.AI_EVAL_RELEASE_MIN_VALID_OUTPUT_RATE,
+	};
+	const thresholdFailures = releaseThresholdFailures({
+		corpusWindows: selected.length,
+		proposalPrecision: ratio(truePositives, truePositives + falsePositives),
+		validOutputRate: ratio(validOutputs, selected.length),
+	}, thresholds);
 	const report = {
 		generatedAt: new Date().toISOString(),
 		corpusWindows: selected.length,
@@ -472,7 +500,9 @@ async function main() {
 		stageTotals,
 		stageDiagnostics,
 		providerErrorCategories,
-		targets: { proposalPrecision: 0.95, ownerAccuracy: 0.90, deadlineAccuracy: 0.90, validOutputRate: 0.99 },
+		thresholds,
+		passed: thresholdFailures.length === 0,
+		thresholdFailures,
 		cases,
 	};
 	const markdown = [
@@ -480,11 +510,12 @@ async function main() {
 		"",
 		`Generated: ${report.generatedAt}`,
 		`Model: ${report.model}`,
-		`Corpus windows: ${report.corpusWindows} (${cacheHits} cached; ${uncachedCount} requiring Azure calls)`,
+		`Corpus windows: ${report.corpusWindows} (${cacheHits} cached; ${uncachedCount} requiring Azure calls; minimum ${thresholds.minimumWindows})`,
+		`Release thresholds: ${report.passed ? "PASSED" : "FAILED"}`,
 		"",
 		"| Metric | Result | Target |",
 		"| --- | ---: | ---: |",
-		`| Proposal precision | ${validOutputs ? percent(report.metrics.proposalPrecision) : "N/A"} | 95% |`,
+		`| Proposal precision | ${validOutputs ? percent(report.metrics.proposalPrecision) : "N/A"} | ${percent(thresholds.proposalPrecision)} |`,
 		`| Proposal recall | ${validOutputs ? percent(report.metrics.proposalRecall) : "N/A"} | — |`,
 		`| Detection precision | ${validOutputs ? percent(report.diagnostics.detectionPrecision) : "N/A"} | — |`,
 		`| Detection recall | ${validOutputs ? percent(report.diagnostics.detectionRecall) : "N/A"} | — |`,
@@ -495,9 +526,9 @@ async function main() {
 		`| Aligned project accuracy | ${validOutputs && report.diagnostics.projectAccuracy !== null ? percent(report.diagnostics.projectAccuracy) : "N/A"} | — |`,
 		`| Aligned owner accuracy | ${validOutputs && report.diagnostics.ownerAccuracy !== null ? percent(report.diagnostics.ownerAccuracy) : "N/A"} | — |`,
 		`| Aligned deadline accuracy | ${validOutputs && report.diagnostics.deadlineAccuracy !== null ? percent(report.diagnostics.deadlineAccuracy) : "N/A"} | — |`,
-		`| Owner accuracy | ${validOutputs && report.metrics.ownerAccuracy !== null ? percent(report.metrics.ownerAccuracy) : "N/A"} | 90% |`,
-		`| Deadline accuracy | ${validOutputs && report.metrics.deadlineAccuracy !== null ? percent(report.metrics.deadlineAccuracy) : "N/A"} | 90% |`,
-		`| Valid structured output | ${percent(report.metrics.validOutputRate)} | 99% |`,
+		`| Owner accuracy | ${validOutputs && report.metrics.ownerAccuracy !== null ? percent(report.metrics.ownerAccuracy) : "N/A"} | — |`,
+		`| Deadline accuracy | ${validOutputs && report.metrics.deadlineAccuracy !== null ? percent(report.metrics.deadlineAccuracy) : "N/A"} | — |`,
+		`| Valid structured output | ${percent(report.metrics.validOutputRate)} | ${percent(thresholds.validOutputRate)} |`,
 		`| Average latency | ${Math.round(report.metrics.averageLatencyMs)} ms | — |`,
 		`| Total tokens | ${report.metrics.totalTokens} | — |`,
 		`| Provider retries | ${report.metrics.providerRetries} | — |`,
@@ -506,13 +537,15 @@ async function main() {
 		`Pipeline changes: grounding rejections=${stageDiagnostics.groundingRejections}; candidate merges=${stageDiagnostics.candidateMerges}; finalization rejections=${stageDiagnostics.finalizationRejections}.`,
 		`Invalid outputs: ${invalidOutputs}; provider errors: ${providerErrors}.`,
 		providerErrors ? `Provider error categories: ${Object.entries(providerErrorCategories).map(([category, count]) => `${category}=${count}`).join(", ")}.` : "",
+		thresholdFailures.length ? `Release threshold failures: ${thresholdFailures.map(failure => `${failure.metric}=${failure.actual} (minimum ${failure.threshold})`).join("; ")}.` : "",
 		!validOutputs ? "\n> Evaluation incomplete: no valid model outputs were produced. Quality metrics are unavailable; fix provider access before using this report for a rollout decision." : "",
-		selected.length < 100 ? "\n> Warning: this run has fewer than the planned 100 representative windows." : "",
+		selected.length < thresholds.minimumWindows ? `\n> Warning: this run has fewer than the required ${thresholds.minimumWindows} representative windows.` : "",
 	].join("\n");
 	await writeFile(`${outputPrefix}.json`, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
 	await writeFile(`${outputPrefix}.md`, `${markdown}\n`, { mode: 0o600 });
 	console.log(markdown);
 	console.log(`\nReports written to ${outputPrefix}.json and ${outputPrefix}.md`);
+	if (full && !report.passed) throw new Error("AI evaluation failed release thresholds; reports were written.");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

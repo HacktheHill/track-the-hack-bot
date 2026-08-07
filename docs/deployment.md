@@ -65,7 +65,7 @@ Key Vault access should likewise be granted only to the identity that needs
 them.
 
 Evaluate at least 100 representative pseudonymized conversation windows through
-both extraction and the schema-v4 precision gate. Record per-stage latency and
+both extraction and the structured precision gate. Record per-stage latency and
 tokens, valid-output rate, false-task rate, assignee accuracy, deadline accuracy,
 source-ID accuracy, sensitivity outcomes, and routing accuracy. Start with
 `OPENPROJECT_AUTOMATION_MODE=shadow`, which records extraction and gate telemetry
@@ -73,6 +73,12 @@ without persisting proposals or posting review cards. Move to `review` only afte
 the private corpus and retained-event replay meet the rollout targets; every
 proposal still requires a permitted human reviewer and the bot never creates
 tasks automatically. `off` remains the emergency kill switch.
+
+All Azure OpenAI chat attempts, including retries, context selection,
+reconciliation, the automatic gate, and RAG reranking, share one process-wide
+FIFO limiter. Keep `AZURE_OPENAI_CHAT_MAX_CONCURRENCY=1` and
+`AZURE_OPENAI_CHAT_MIN_INTERVAL_MS=1000` unless deployment capacity supports a
+different limit; Retry-After throttling pauses that endpoint/deployment globally.
 
 Normal proposal reviews seed the private corpus after migrations have created
 the proposal-to-extraction linkage and dismissal-reason fields. The canonical
@@ -88,6 +94,9 @@ message links; those references remain outside evaluation windows.
 low-cost resources, reaches Azure OpenAI through the existing private network,
 and persists cache/report blobs. Neither job prints corpus content. The
 localhost UI is not deployed and adds no always-on compute cost.
+The release job enforces only minimum corpus windows, proposal precision, and
+valid structured-output rate. It still publishes failed reports. Recall, owner,
+and deadline metrics are diagnostic and do not fail a release run.
 
 RAG requires separate Azure OpenAI embedding configuration and the PostgreSQL
 `vector` extension. Set `OPENPROJECT_RAG_MODE=shadow` to synchronize vectors

@@ -281,6 +281,10 @@ npm run evaluate:ai -- .private/reviewed-corpus.jsonl --full
 
 Without `--full`, more than `AI_EVAL_MAX_UNCACHED_CASES` cache misses fail before
 any provider request. Use `--fresh` only for a deliberately uncached run.
+Full release runs enforce only the configured minimum corpus size, proposal
+precision, and valid structured-output rate. JSON reports contain `passed` and
+`thresholdFailures`; recall, owner, and deadline metrics are reported but do not
+fail the run.
 
 The legacy file exporter builds an initial corpus from normal proposal reviews. Accepted
 manual extractions are evaluated in automatic mode as examples the automatic
@@ -300,10 +304,9 @@ and may include `assigneeAlias` and `dueDate`. Existing-task cases can list
 candidate-specific `routing.availableTargetSourceMessageIds` to model the
 validated project/RAG state. Use an empty
 proposal list for a no-action window. The command writes mode-0600 JSON and
-Markdown reports next to the corpus. Use 100
-representative windows and track 95% proposal precision,
-90% owner/deadline accuracy, and 99% valid structured output as improvement
-targets rather than automatic activation gates.
+Markdown reports next to the corpus. Use 100 representative windows. Release
+runs require 95% proposal precision and 99% valid structured output by default;
+owner/deadline accuracy and recall are diagnostics rather than release gates.
 Aggregate baselines and their limitations are recorded in
 [docs/ai-evaluation.md](docs/ai-evaluation.md).
 

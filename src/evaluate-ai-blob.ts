@@ -21,10 +21,10 @@ async function streamText(stream: NodeJS.ReadableStream | undefined) {
 }
 
 function run(command: string, args: string[], environment: NodeJS.ProcessEnv) {
-	return new Promise<void>((resolveRun, reject) => {
+	return new Promise<number>((resolveRun, reject) => {
 		const child = spawn(command, args, { stdio: "inherit", env: environment });
 		child.once("error", reject);
-		child.once("exit", code => code === 0 ? resolveRun() : reject(new Error(`Evaluation exited with status ${code ?? "unknown"}.`)));
+		child.once("exit", code => resolveRun(code ?? 1));
 	});
 }
 
@@ -55,7 +55,7 @@ async function main() {
 			await writeFile(join(cacheDirectory, `${key}.json`), await streamText((await blob.download()).readableStreamBody), { mode: 0o600 });
 		}
 		const reportPrefix = join(directory, `report-${Date.now()}`);
-		await run(process.execPath, [resolve("dist/evaluate-ai.js"), corpusPath, reportPrefix, "--full"], { ...process.env, AI_EVAL_CACHE_DIR: cacheDirectory });
+		const evaluationStatus = await run(process.execPath, [resolve("dist/evaluate-ai.js"), corpusPath, reportPrefix, "--full"], { ...process.env, AI_EVAL_CACHE_DIR: cacheDirectory });
 		for (const file of await readdir(cacheDirectory)) {
 			if (!file.endsWith(".json")) continue;
 			if (existing.has(file.slice(0, -5))) continue;
@@ -66,6 +66,7 @@ async function main() {
 		const runId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID()}`;
 		await store.publishEvaluationReports(manifest, runId, await Promise.all((["json", "md"] as const).map(async extension => ({ extension, content: await readFile(`${reportPrefix}.${extension}`) }))));
 		console.log(JSON.stringify({ runId, corpus: manifest.blobName, reports: 2, cacheHitsAvailable: existing.size }));
+		if (evaluationStatus !== 0) throw new Error(`Evaluation exited with status ${evaluationStatus}; reports were published under ${runId}.`);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
