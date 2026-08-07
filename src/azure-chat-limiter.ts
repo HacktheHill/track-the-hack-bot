@@ -7,7 +7,7 @@ type QueuedAttempt<T> = {
 	onAbort?: () => void;
 };
 
-const MAX_PROVIDER_COOLDOWN_MS = 30_000;
+const MAX_PROVIDER_COOLDOWN_MS = 120_000;
 
 export function boundedProviderCooldown(milliseconds: number) {
 	return Math.min(Math.max(0, milliseconds), MAX_PROVIDER_COOLDOWN_MS);

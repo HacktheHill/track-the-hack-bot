@@ -69,7 +69,9 @@ both extraction and the structured precision gate. Record per-stage latency and
 tokens, valid-output rate, false-task rate, assignee accuracy, deadline accuracy,
 source-ID accuracy, sensitivity outcomes, and routing accuracy. Start with
 `OPENPROJECT_AUTOMATION_MODE=shadow`, which records extraction and gate telemetry
-without persisting proposals or posting review cards. Move to `review` only after
+without creating proposals or posting review cards. `off` and `shadow` can still
+maintain already-pending proposals when their cited messages change; this never
+creates proposals for unrelated messages. Move to `review` only after
 the private corpus and retained-event replay meet the rollout targets; every
 proposal still requires a permitted human reviewer and the bot never creates
 tasks automatically. `off` remains the emergency kill switch.
@@ -78,7 +80,8 @@ All Azure OpenAI chat attempts, including retries, context selection,
 reconciliation, the automatic gate, and RAG reranking, share one process-wide
 FIFO limiter. Keep `AZURE_OPENAI_CHAT_MAX_CONCURRENCY=1` and
 `AZURE_OPENAI_CHAT_MIN_INTERVAL_MS=1000` unless deployment capacity supports a
-different limit; Retry-After throttling pauses that endpoint/deployment globally.
+different limit; Retry-After throttling pauses that endpoint/deployment globally
+for up to the 120-second request timeout while other deployments may proceed.
 
 Normal proposal reviews seed the private corpus after migrations have created
 the proposal-to-extraction linkage and dismissal-reason fields. The canonical
