@@ -35,10 +35,11 @@ export function runtimeProposalCandidates(
 	routing: { availableTargetSourceMessageIds?: string[][] } = {},
 	mode: "manual" | "automatic" = "automatic",
 	automaticAssessments: AutomaticCandidateAssessment[] = [],
+	windowSensitivity: "safe" | "sensitive" | "uncertain" = "uncertain",
 ) {
 	const grounded = runtimeGroundedCandidates(tasks, messages);
 	const eligible = mode === "automatic"
-		? grounded.filter((_, index) => automaticCandidateEligible(automaticAssessments[index]))
+		? grounded.filter((_, index) => automaticCandidateEligible(automaticAssessments[index], windowSensitivity))
 		: grounded;
 	return eligible.filter(task => {
 		const targetAvailable = routing.availableTargetSourceMessageIds?.some(ids => ids.every(id => task.source_message_ids.includes(id))) ?? false;
@@ -75,7 +76,7 @@ function sleep(milliseconds: number) {
 	return new Promise(resolveSleep => setTimeout(resolveSleep, milliseconds));
 }
 
-const EVALUATOR_PIPELINE_VERSION = "automatic-v3.4";
+const EVALUATOR_PIPELINE_VERSION = "automatic-v3.5";
 const evaluationTraceSchema = z.object({
 	extractedCandidates: z.number().int().min(0),
 	groundedCandidates: z.number().int().min(0),
@@ -230,16 +231,18 @@ async function main() {
 			totalTokens += extraction.usage?.totalTokens ?? 0;
 			const grounded = runtimeGroundedCandidates(extraction.result.tasks, window.messages as MinimizedMessage[]);
 			let assessments: AutomaticCandidateAssessment[] = [];
+			let windowSensitivity: "safe" | "sensitive" | "uncertain" = window.mode === "manual" ? "safe" : "uncertain";
 			if (window.mode === "automatic" && grounded.length) {
 				const waitForGate = Math.max(0, env.AI_EVAL_MIN_INTERVAL_MS - (Date.now() - lastRequestAt));
 				if (waitForGate) await sleep(waitForGate);
 				lastRequestAt = Date.now();
 				const gate = await extractor.assessAutomaticCandidates(extraction.inputMessages, grounded);
 				assessments = gate.assessments;
+				windowSensitivity = gate.windowSensitivity;
 				totalLatencyMs += gate.latencyMs;
 				totalTokens += gate.usage?.totalTokens ?? 0;
 			}
-			predicted = runtimeProposalCandidates(extraction.result.tasks, window.messages as MinimizedMessage[], window.routing, window.mode, assessments);
+			predicted = runtimeProposalCandidates(extraction.result.tasks, window.messages as MinimizedMessage[], window.routing, window.mode, assessments, windowSensitivity);
 			trace = evaluationTrace(extraction.result.tasks.length, grounded.length, assessments, predicted.length);
 			await storePrediction(env.AI_EVAL_CACHE_DIR, item.key, predicted, trace);
 			validOutputs++;

@@ -72,7 +72,7 @@ async function main() {
 				const validAttachmentIds = new Set(messages.flatMap(message => (message.attachments ?? []).map(attachment => attachment.id)));
 				const candidates = mergeRelatedTaskCandidates(extraction.result.tasks.filter(task => taskReferencesAreValid(task, validMessageIds, focalMessageIds, validAttachmentIds)));
 				if (candidates.length) await new Promise(resolve => setTimeout(resolve, config.AI_REPLAY_MIN_INTERVAL_MS));
-				const gate = candidates.length ? await extractor.assessAutomaticCandidates(extraction.inputMessages, candidates) : { assessments: [] };
+				const gate = candidates.length ? await extractor.assessAutomaticCandidates(extraction.inputMessages, candidates) : { windowSensitivity: "uncertain" as const, assessments: [] };
 				console.log(JSON.stringify({
 					id: row.id,
 					source: row.source,
@@ -81,7 +81,7 @@ async function main() {
 					candidates: candidates.map((task, index) => ({
 						title: task.title,
 						action: task.proposed_action,
-						automaticEligibility: automaticCandidateEligible(gate.assessments[index]) ? "eligible" : "ineligible",
+						automaticEligibility: automaticCandidateEligible(gate.assessments[index], gate.windowSensitivity) ? "eligible" : "ineligible",
 						assessment: gate.assessments[index],
 						sourceMessageIds: task.source_message_ids,
 					})),

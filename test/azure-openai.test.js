@@ -309,10 +309,11 @@ test("automatic eligibility requires every precision check and safe context", ()
 		candidate_index: 0, has_activated_specific_work: true, has_remaining_work_or_trackable_transition: true,
 		is_durable: true, is_decision_ready: true, sensitivity: "safe", supporting_source_message_ids: ["m1"],
 	};
-	assert.equal(automaticCandidateEligible(eligible), true);
-	assert.equal(automaticCandidateEligible({ ...eligible, is_decision_ready: false }), false);
-	assert.equal(automaticCandidateEligible({ ...eligible, sensitivity: "uncertain" }), false);
-	assert.equal(automaticCandidateEligible(undefined), false);
+	assert.equal(automaticCandidateEligible(eligible, "safe"), true);
+	assert.equal(automaticCandidateEligible(eligible, "uncertain"), false);
+	assert.equal(automaticCandidateEligible({ ...eligible, is_decision_ready: false }, "safe"), false);
+	assert.equal(automaticCandidateEligible({ ...eligible, sensitivity: "uncertain" }, "safe"), false);
+	assert.equal(automaticCandidateEligible(undefined, "safe"), false);
 });
 
 test("related corrections with one work item key are merged", () => {
@@ -371,7 +372,7 @@ test("automatic precision gate judges raw evidence and validates complete candid
 		const gate = await new AzureTaskExtractor(config, async () => "token").assessAutomaticCandidates([
 			{ id: "m1", authorAlias: "USER_1", text: "I have a reel ready. How does Instagram access work?", timestamp: "2026-07-13T00:00:00Z", contextRole: "primary" },
 		], [candidate]);
-		assert.equal(automaticCandidateEligible(gate.assessments[0]), false);
+		assert.equal(automaticCandidateEligible(gate.assessments[0], gate.windowSensitivity), false);
 		assert.equal(gate.windowSensitivity, "safe");
 		assert.equal(gate.usage.totalTokens, 42);
 		assert.equal(request.response_format.json_schema.name, "discord_automatic_precision_gate_v1");

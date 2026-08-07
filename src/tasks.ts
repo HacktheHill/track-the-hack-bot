@@ -1656,8 +1656,9 @@ async function completeAiContext(
 	extraction.usage = combinedTokenUsage(extraction.usage, reconciliation.usage);
 	const gate = await services.extractor.assessAutomaticCandidates(extraction.inputMessages, candidates.map(item => item.candidate));
 	const contextualSensitivity = gate.assessments.filter(assessment => assessment.sensitivity !== "safe");
-	if (contextualSensitivity.length && !allowSensitiveContent) {
+	if ((gate.windowSensitivity !== "safe" || contextualSensitivity.length) && !allowSensitiveContent) {
 		throw attachExtractionDiagnostics(new SensitiveContentError([
+			...(gate.windowSensitivity !== "safe" ? [`Window sensitivity: ${gate.windowSensitivity}`] : []),
 			...new Set(contextualSensitivity.map(assessment => `Contextual sensitivity: ${assessment.sensitivity}`)),
 		]), {
 			inputMessages: extraction.inputMessages,
@@ -1670,7 +1671,7 @@ async function completeAiContext(
 	extraction.usage = combinedTokenUsage(extraction.usage, gate.usage);
 	const decisionTelemetry = {
 		taskCount: result.tasks.length,
-		automaticEligibleCount: candidates.filter((_, index) => automaticCandidateEligible(gate.assessments[index])).length,
+		automaticEligibleCount: candidates.filter((_, index) => automaticCandidateEligible(gate.assessments[index], gate.windowSensitivity)).length,
 		invalidGroundingCount: result.tasks.length - individuallyGroundedCandidates.length,
 		groupedCount: groupedCandidates.length,
 		reconciledCount: candidates.length,
@@ -1679,7 +1680,7 @@ async function completeAiContext(
 		primaryMessageIds: [...context.focusIds],
 		candidateAssessments: candidates.map(({ candidate: task }, index) => ({
 			...gate.assessments[index],
-			automaticEligibility: automaticCandidateEligible(gate.assessments[index]) ? "eligible" : "ineligible",
+			automaticEligibility: automaticCandidateEligible(gate.assessments[index], gate.windowSensitivity) ? "eligible" : "ineligible",
 			proposedAction: task.proposed_action,
 			sourceMessageIds: task.source_message_ids,
 		})),

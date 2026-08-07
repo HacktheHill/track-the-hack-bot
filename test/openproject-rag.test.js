@@ -464,10 +464,11 @@ test("AI evaluator uses production grounding and target semantics for every acti
 		is_durable: true, is_decision_ready: true, sensitivity: "safe", supporting_source_message_ids: ["m1"],
 	};
 	const messages = [{ id: "m1", authorAlias: "USER_1", text: "Update it", timestamp: "2026-07-16T00:00:00Z", priority: true }];
-	assert.deepEqual(runtimeProposalCandidates([candidate], messages, {}, "automatic", [eligible]), [candidate]);
-	assert.deepEqual(runtimeProposalCandidates([candidate], messages, { availableTargetSourceMessageIds: [["m1"]] }, "automatic", [eligible]), [candidate]);
-	assert.deepEqual(runtimeProposalCandidates([{ ...candidate, source_message_ids: ["other"] }], messages, {}, "automatic", [eligible]), []);
-	assert.deepEqual(runtimeProposalCandidates([candidate], messages, { availableTargetSourceMessageIds: [["m1"]] }, "automatic", [{ ...eligible, is_durable: false }]), []);
+	assert.deepEqual(runtimeProposalCandidates([candidate], messages, {}, "automatic", [eligible], "safe"), [candidate]);
+	assert.deepEqual(runtimeProposalCandidates([candidate], messages, {}, "automatic", [eligible], "sensitive"), []);
+	assert.deepEqual(runtimeProposalCandidates([candidate], messages, { availableTargetSourceMessageIds: [["m1"]] }, "automatic", [eligible], "safe"), [candidate]);
+	assert.deepEqual(runtimeProposalCandidates([{ ...candidate, source_message_ids: ["other"] }], messages, {}, "automatic", [eligible], "safe"), []);
+	assert.deepEqual(runtimeProposalCandidates([candidate], messages, { availableTargetSourceMessageIds: [["m1"]] }, "automatic", [{ ...eligible, is_durable: false }], "safe"), []);
 	assert.deepEqual(runtimeProposalCandidates([candidate], messages, {}, "manual"), [candidate]);
 });
 
