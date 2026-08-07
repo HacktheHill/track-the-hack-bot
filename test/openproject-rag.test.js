@@ -129,8 +129,8 @@ test("AI evaluation caches count only real extracted-task predictions as valid",
 		source_message_ids: ["m1"], relevant_attachment_ids: [], evidence: "Approved", proposed_action: "create",
 		content_intent: "none", metadata_change_fields: [],
 	};
-	assert.equal(validEvaluationCacheEntry(JSON.stringify({ version: "automatic-v3.7", predicted: [task], trace })), true);
-	assert.equal(validEvaluationCacheEntry(JSON.stringify({ version: "automatic-v3.7", predicted: [{ title: "partial" }], trace })), false);
+	assert.equal(validEvaluationCacheEntry(JSON.stringify({ version: "automatic-v3.8", predicted: [task], trace })), true);
+	assert.equal(validEvaluationCacheEntry(JSON.stringify({ version: "automatic-v3.8", predicted: [{ title: "partial" }], trace })), false);
 	assert.equal(validEvaluationCacheEntry("not json"), false);
 });
 

@@ -468,6 +468,8 @@ test("automatic precision gate judges raw evidence and validates complete candid
 		assert.equal(gate.usage.totalTokens, 42);
 		assert.equal(request.response_format.json_schema.name, "discord_automatic_precision_gate_v2");
 		assert.match(request.messages[0].content, /focal_transition_kind/);
+		assert.match(request.messages[0].content, /tracker outcome is clear enough to review/);
+		assert.match(request.messages[0].content, /brief focal acknowledgement/);
 		assert.match(request.messages[0].content, /untrusted hypothesis/);
 		assert.match(request.messages[0].content, /How does Instagram access work/);
 		assert.match(request.messages[0].content, /already present in a tracker is not activation/);
@@ -475,10 +477,10 @@ test("automatic precision gate judges raw evidence and validates complete candid
 		assert.match(request.messages[0].content, /Choosing a meeting time/);
 		assert.match(request.messages[0].content, /Short duration alone/);
 		assert.match(request.messages[0].content, /Do not require implementation details/);
-		assert.match(request.messages[0].content, /merely sharing the artifact is not/);
+		assert.match(request.messages[0].content, /merely sharing it is not/);
 		assert.match(request.messages[0].content, /Accepted review feedback/);
 		assert.match(request.messages[0].content, /reply chain/);
-		assert.match(request.messages[0].content, /focal rationale/);
+		assert.match(request.messages[0].content, /neutral acknowledgement/);
 		assert.match(request.messages[0].content, /follow-up email/);
 		const input = JSON.parse(request.messages[1].content[0].text);
 		assert.equal(input.messages[0].text.includes("How does Instagram access work"), true);
