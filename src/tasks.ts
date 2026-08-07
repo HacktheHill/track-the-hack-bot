@@ -261,6 +261,13 @@ export function boundedDiscordContent(value: string, limit = 2000) {
 	return `${body}${closers}${suffix}`.slice(0, limit);
 }
 
+export const proposalReviewExplanation = "`Review` opens editing and approval. `Dismiss` means no task exists. `Incorrect` means work exists, but this proposal is wrong.";
+
+export function proposalReviewCardContent(value: string) {
+	const separator = "\n\n";
+	return `${boundedDiscordContent(value, 2000 - separator.length - proposalReviewExplanation.length)}${separator}${proposalReviewExplanation}`;
+}
+
 type ProposalReviewMessage = { id: string; channel_id: string; review_message_id: string | null };
 
 function discordErrorCode(error: unknown) {
@@ -1933,7 +1940,7 @@ async function completeAiCandidate(
 		const displayedAmbiguities = redisplayed?.ambiguities ?? result.ambiguities;
 		const warning = displayedOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : "";
 		const reviewPayload: InteractionEditReplyOptions = {
-			content: boundedDiscordContent(`**Possible ${displayedAction} for ${displayedWorkPackageLink}**\n${operationSummary.map(item => `- ${item}`).join("\n")}${warning}${formatProposalContent(displayedOperation, displayedContent)}${redisplayed ? "" : `\n\nSimilarity: ${Math.round(match.similarity * 100)}%`}${displayedAmbiguities.length ? `\nAmbiguities: ${displayedAmbiguities.join("; ")}` : ""}`),
+			content: proposalReviewCardContent(`**Possible ${displayedAction} for ${displayedWorkPackageLink}**\n${operationSummary.map(item => `- ${item}`).join("\n")}${warning}${formatProposalContent(displayedOperation, displayedContent)}${redisplayed ? "" : `\n\nSimilarity: ${Math.round(match.similarity * 100)}%`}${displayedAmbiguities.length ? `\nAmbiguities: ${displayedAmbiguities.join("; ")}` : ""}`),
 			components: proposalReviewComponents(proposal.id, displayedAction, redisplayed?.rag_candidates ?? ragCandidates),
 		};
 		if (proposal.revised) await updateProposalReviewCard(interaction, services, proposal.id, reviewPayload);
@@ -2038,7 +2045,7 @@ async function completeAiCandidate(
 		cardBody = `**${redisplayed?.title ?? candidate.title}**\n${redisplayed?.description ?? description}\n\n${details}`;
 	}
 	const reviewPayload: InteractionEditReplyOptions = {
-		content: boundedDiscordContent(`${cardBody}${displayedAmbiguities.length ? `\n\nAmbiguities: ${displayedAmbiguities.join("; ")}` : ""}`),
+		content: proposalReviewCardContent(`${cardBody}${displayedAmbiguities.length ? `\n\nAmbiguities: ${displayedAmbiguities.join("; ")}` : ""}`),
 		components: proposalReviewComponents(proposal.id, displayedAction, displayedAction === "create" ? redisplayed?.rag_candidates ?? ragCandidates : []),
 	};
 	if (proposal.revised) await updateProposalReviewCard(interaction, services, proposal.id, reviewPayload);
@@ -2128,7 +2135,7 @@ async function applyExistingProposalTarget(
 	const resultingAction = proposal.action === "create" ? "update" : proposal.action;
 	const buttons = manualProposalButtons(proposal.id, resultingAction);
 	await interaction.editReply({
-		content: boundedDiscordContent(`Proposal will ${resultingAction} OpenProject task ${workPackageMarkdownLink(target.id, target.subject, services.openProject.workPackageUrl(target.id))}\nProposed title: **${proposal.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch, await proposalMetadataDisplayNames(interaction.guild!, services, operations.metadataPatch, targetProjectId)).map(item => `- ${item}`).join("\n")}${formatProposalContent(operations.contentOperation, operations.contentMarkdown)}${proposal.ambiguities.length ? `\n\nAmbiguities: ${proposal.ambiguities.join("; ")}` : ""}`),
+		content: proposalReviewCardContent(`Proposal will ${resultingAction} OpenProject task ${workPackageMarkdownLink(target.id, target.subject, services.openProject.workPackageUrl(target.id))}\nProposed title: **${proposal.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch, await proposalMetadataDisplayNames(interaction.guild!, services, operations.metadataPatch, targetProjectId)).map(item => `- ${item}`).join("\n")}${formatProposalContent(operations.contentOperation, operations.contentMarkdown)}${proposal.ambiguities.length ? `\n\nAmbiguities: ${proposal.ambiguities.join("; ")}` : ""}`),
 		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons)],
 		allowedMentions: { parse: [] },
 	});

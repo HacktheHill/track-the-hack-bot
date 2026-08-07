@@ -3,7 +3,7 @@ import { automaticCandidateEligible, containsSensitiveContent, extractionDiagnos
 import { isOrganizerGuild, type IntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient, titlesLikelyDuplicate, workPackageMarkdownLink } from "./openproject.js";
-import { AI_CONTEXT_GAP_MS, boundedDiscordContent, defaultAiDueDate, formatAiTaskDescription, inferCreationMetadata, proposalReviewAllowed, proposalReviewComponents, relevantImageAttachments } from "./tasks.js";
+import { AI_CONTEXT_GAP_MS, defaultAiDueDate, formatAiTaskDescription, inferCreationMetadata, proposalReviewAllowed, proposalReviewCardContent, proposalReviewComponents, relevantImageAttachments } from "./tasks.js";
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
 import { describeProposalOperations, formatProposalContent, planExistingTaskOperations, sourceContentHash, taskReferencesAreValid } from "./task-proposals.js";
 import { isExcludedChannel, projectIdForTeamRoles, projectIdFromChannelNames, resolveProjectId } from "./project-resolution.js";
@@ -413,7 +413,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS,
 					});
 					const reviewPayload: ReviewCardPayload = {
-						content: boundedDiscordContent(`${ownerText}Proposed ${action} for OpenProject task ${workPackageMarkdownLink(target!.id, target!.subject, services.openProject.workPackageUrl(target!.id))}\nProposed title: **${task.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch, { assignee: assignee?.displayName ?? assignee?.user.username, priority: priority?.name, size: size?.value }).map(item => `- ${item}`).join("\n")}${operations.contentOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : ""}${formatProposalContent(operations.contentOperation, operations.contentMarkdown)}${result.ambiguities.length ? `\n\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`),
+						content: proposalReviewCardContent(`${ownerText}Proposed ${action} for OpenProject task ${workPackageMarkdownLink(target!.id, target!.subject, services.openProject.workPackageUrl(target!.id))}\nProposed title: **${task.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch, { assignee: assignee?.displayName ?? assignee?.user.username, priority: priority?.name, size: size?.value }).map(item => `- ${item}`).join("\n")}${operations.contentOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : ""}${formatProposalContent(operations.contentOperation, operations.contentMarkdown)}${result.ambiguities.length ? `\n\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`),
 						components: proposalReviewComponents(proposal.id, action, ragCandidates),
 						allowedMentions: { parse: [] },
 					};
@@ -487,7 +487,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						ragCandidates,
 				});
 				const reviewPayload: ReviewCardPayload = {
-					content: boundedDiscordContent(`${ownerText}Proposed OpenProject task: **${task.title}**\n${description}\n\nProject: ${projects.find(item => item.id === projectId)?.name ?? "Not resolved"}\nPriority: ${priority?.name ?? "Not inferred"}\nSize: ${size?.value ?? "Not inferred"}\nDates: ${task.start_date ?? "Not set"} → ${dueDate}\nEstimate: ${estimatedHours !== undefined ? `${estimatedHours}h` : "Not inferred"}${advisory ? `\n\n${advisory}` : ""}${result.ambiguities.length ? `\n\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`),
+					content: proposalReviewCardContent(`${ownerText}Proposed OpenProject task: **${task.title}**\n${description}\n\nProject: ${projects.find(item => item.id === projectId)?.name ?? "Not resolved"}\nPriority: ${priority?.name ?? "Not inferred"}\nSize: ${size?.value ?? "Not inferred"}\nDates: ${task.start_date ?? "Not set"} → ${dueDate}\nEstimate: ${estimatedHours !== undefined ? `${estimatedHours}h` : "Not inferred"}${advisory ? `\n\n${advisory}` : ""}${result.ambiguities.length ? `\n\nAmbiguities: ${result.ambiguities.join("; ")}` : ""}`),
 					components: proposalReviewComponents(proposal.id, "create", ragCandidates),
 					allowedMentions: { parse: [] },
 				};
