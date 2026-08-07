@@ -86,7 +86,8 @@ test("Azure chat limiter applies Retry-After cooldown across queued attempts", a
 });
 
 test("Azure chat limiter bounds provider cooldown and lets another deployment bypass a cooled key", async () => {
-	assert.equal(boundedProviderCooldown(90_000), 30_000);
+	assert.equal(boundedProviderCooldown(90_000), 90_000);
+	assert.equal(boundedProviderCooldown(180_000), 120_000);
 	const limiter = new AzureChatLimiter(1, 0);
 	const order = [];
 	const first = limiter.run("cooled", undefined, async () => {

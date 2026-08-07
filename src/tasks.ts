@@ -422,7 +422,15 @@ function messageUrl(guildId: string, channelId: string, messageId: string) {
 export async function missingProposalSourceMessageIds(
 	client: Pick<Client, "channels">,
 	guildId: string,
-	proposal: { channel_id: string; source_message_ids: readonly string[]; source_links: readonly string[] },
+	proposal: { channel_id: string; source_message_ids: readonly string[]; source_links: readonly string[]; source_content_hash?: string | null },
+) {
+	return (await proposalSourcePreflight(client, guildId, proposal)).invalidMessageIds;
+}
+
+export async function proposalSourcePreflight(
+	client: Pick<Client, "channels">,
+	guildId: string,
+	proposal: { channel_id: string; source_message_ids: readonly string[]; source_links: readonly string[]; source_content_hash?: string | null },
 ) {
 	const channelByMessageId = new Map<string, string>();
 	for (const link of proposal.source_links) {
@@ -430,28 +438,51 @@ export async function missingProposalSourceMessageIds(
 		if (match?.[1] === guildId) channelByMessageId.set(match[3], match[2]);
 	}
 	const channels = new Map<string, Awaited<ReturnType<Client["channels"]["fetch"]>>>();
-	const missing: string[] = [];
+	const invalidMessageIds: string[] = [];
+	const transientFailures: string[] = [];
+	const messages: Array<{ id: string; text: string; attachments: Array<{ id: string; url: string }> }> = [];
 	for (const messageId of proposal.source_message_ids) {
 		const channelId = channelByMessageId.get(messageId) ?? proposal.channel_id;
 		let channel = channels.get(channelId);
 		if (!channels.has(channelId)) {
-			channel = await client.channels.fetch(channelId).catch(() => null);
+			try {
+				channel = await client.channels.fetch(channelId);
+			} catch {
+				channel = null;
+			}
 			channels.set(channelId, channel);
 		}
-		if (!channel?.isTextBased() || !("messages" in channel)
-			|| !await channel.messages.fetch(messageId).then(() => true, () => false)) missing.push(messageId);
+		if (!channel?.isTextBased() || !("messages" in channel)) {
+			transientFailures.push(`${messageId}: source channel is unavailable`);
+			continue;
+		}
+		try {
+			const message = await channel.messages.fetch(messageId);
+			messages.push({
+				id: message.id,
+				text: message.content,
+				attachments: [...message.attachments.values()].map(attachment => ({ id: attachment.id, url: attachment.url })),
+			});
+		} catch (error) {
+			if (discordErrorCode(error) === 10008) invalidMessageIds.push(messageId);
+			else transientFailures.push(`${messageId}: ${(error as Error).message}`);
+		}
 	}
-	return missing;
+	if (invalidMessageIds.length) return { invalidMessageIds, contentChanged: false };
+	if (transientFailures.length) {
+		throw new Error(`Could not revalidate all cited Discord sources; try again without applying the proposal. (${transientFailures.join("; ")})`);
+	}
+	return { invalidMessageIds, contentChanged: sourceContentHash(messages) !== proposal.source_content_hash };
 }
 
 async function requireCurrentProposalSources(interaction: TaskInteraction, services: Services, proposal: {
-	id: string; channel_id: string; source_message_ids: string[]; source_links: string[];
+	id: string; channel_id: string; source_message_ids: string[]; source_links: string[]; source_content_hash: string | null;
 }) {
-	const missing = await missingProposalSourceMessageIds(interaction.client, interaction.guildId!, proposal);
-	if (!missing.length) return;
-	const superseded = await services.db.supersedePendingProposalForInvalidSources(proposal.id, missing);
+	const preflight = await proposalSourcePreflight(interaction.client, interaction.guildId!, proposal);
+	if (!preflight.invalidMessageIds.length && !preflight.contentChanged) return;
+	const superseded = await services.db.supersedePendingProposalForInvalidSources(proposal.id, preflight.invalidMessageIds, preflight.contentChanged);
 	throw new Error(superseded
-		? "This proposal was superseded because cited source evidence was deleted or became inaccessible."
+		? `This proposal was superseded because cited source evidence was ${preflight.contentChanged ? "changed" : "deleted"}.`
 		: "This proposal is already being handled and its cited source evidence could not be revalidated. Check OpenProject before retrying.");
 }
 

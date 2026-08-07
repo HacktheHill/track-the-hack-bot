@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, directProposalDismissalReason, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, handleProposalButton, handleProposalTargetSelect, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, missingProposalSourceMessageIds, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, proposalReviewCardContent, proposalReviewComponents, proposalReviewExplanation, recentExtractionMessages, relevantImageAttachments, removeProposalReviewCard, resolveOptionalOwner, reviewedProposalAllowsDuplicate, taskCommand, taskIdentityGuidance, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
-import { formatProposalContent } from "../dist/task-proposals.js";
+import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, directProposalDismissalReason, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, handleProposalButton, handleProposalTargetSelect, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, missingProposalSourceMessageIds, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, proposalReviewCardContent, proposalReviewComponents, proposalReviewExplanation, proposalSourcePreflight, recentExtractionMessages, relevantImageAttachments, removeProposalReviewCard, resolveOptionalOwner, reviewedProposalAllowsDuplicate, taskCommand, taskIdentityGuidance, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
+import { formatProposalContent, sourceContentHash } from "../dist/task-proposals.js";
 import { normalizeTaskTitle, OpenProjectClient, openProjectAttachmentFileName, titlesLikelyDuplicate, workPackageMarkdownLink } from "../dist/openproject.js";
 
 test("proposal source preflight refetches every citation and reports deleted evidence", async () => {
@@ -10,8 +10,8 @@ test("proposal source preflight refetches every citation and reports deleted evi
 		isTextBased: () => true,
 		messages: { fetch: async id => {
 			fetched.push(id);
-			if (id === "444") throw new Error("Unknown Message");
-			return { id };
+			if (id === "444") throw Object.assign(new Error("Unknown Message"), { code: 10008 });
+			return { id, content: "current", attachments: new Map() };
 		} },
 	};
 	const client = { channels: { fetch: async id => {
@@ -26,6 +26,40 @@ test("proposal source preflight refetches every citation and reports deleted evi
 			"https://discord.com/channels/111/222/444",
 		],
 	}), ["444"]);
+	assert.deepEqual(fetched, ["333", "444"]);
+});
+
+test("proposal source preflight detects changed raw content and attachment evidence", async () => {
+	const messages = new Map([
+		["333", { id: "333", content: "edited", attachments: new Map([["file", { id: "file", url: "https://cdn.test/new" }]]) }],
+	]);
+	const client = { channels: { fetch: async () => ({ isTextBased: () => true, messages: { fetch: async id => messages.get(id) } }) } };
+	const result = await proposalSourcePreflight(client, "111", {
+		channel_id: "222", source_message_ids: ["333"], source_links: [],
+		source_content_hash: sourceContentHash([{ id: "333", text: "original", attachments: [{ id: "file", url: "https://cdn.test/old" }] }]),
+	});
+	assert.deepEqual(result, { invalidMessageIds: [], contentChanged: true });
+});
+
+test("proposal source preflight classifies only Discord Unknown Message as confirmed deletion", async () => {
+	const client = { channels: { fetch: async () => ({ isTextBased: () => true, messages: { fetch: async () => {
+		throw Object.assign(new Error("Unknown Message"), { code: 10008 });
+	} } }) } };
+	assert.deepEqual(await proposalSourcePreflight(client, "111", {
+		channel_id: "222", source_message_ids: ["333"], source_links: [], source_content_hash: "stored",
+	}), { invalidMessageIds: ["333"], contentChanged: false });
+});
+
+test("proposal source preflight leaves transient fetch failures retryable", async () => {
+	const fetched = [];
+	const client = { channels: { fetch: async () => ({ isTextBased: () => true, messages: { fetch: async id => {
+		fetched.push(id);
+		if (id === "333") throw new Error("socket timeout");
+		return { id, content: "current", attachments: new Map() };
+	} } }) } };
+	await assert.rejects(proposalSourcePreflight(client, "111", {
+		channel_id: "222", source_message_ids: ["333", "444"], source_links: [], source_content_hash: "stored",
+	}), /try again without applying/);
 	assert.deepEqual(fetched, ["333", "444"]);
 });
 

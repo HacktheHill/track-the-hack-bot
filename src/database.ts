@@ -30,6 +30,32 @@ export function assertUniqueConfiguredUserMappings(userMap: Record<string, numbe
 
 export const openProjectUserUniqueIndexSql = "CREATE UNIQUE INDEX IF NOT EXISTS discord_openproject_users_openproject_user_id_uidx ON discord_openproject_users(openproject_user_id)";
 
+export const configuredUserMappingsSql = `WITH deleted_configured_mappings AS (
+	DELETE FROM discord_openproject_users WHERE discord_user_id=ANY($1::text[])
+)
+INSERT INTO discord_openproject_users(discord_user_id, openproject_user_id)
+SELECT * FROM unnest($1::text[],$2::integer[])`;
+
+export async function replaceConfiguredUserMappings(
+	query: (sql: string, values: unknown[]) => Promise<unknown>,
+	userMap: Record<string, number>,
+) {
+	assertUniqueConfiguredUserMappings(userMap);
+	const mappings = Object.entries(userMap);
+	if (!mappings.length) return;
+	try {
+		await query(configuredUserMappingsSql, [
+			mappings.map(([discordId]) => discordId),
+			mappings.map(([, openProjectId]) => openProjectId),
+		]);
+	} catch (error) {
+		if (error && typeof error === "object" && "code" in error && error.code === "23505") {
+			throw new Error("Configured OpenProject user mappings collide with existing mappings. Resolve the ambiguity before migrating.", { cause: error });
+		}
+		throw error;
+	}
+}
+
 function embeddingTableSql(dimensions: number) {
 	return `CREATE TABLE IF NOT EXISTS openproject_embeddings (
 		work_package_id INTEGER PRIMARY KEY,
@@ -397,23 +423,7 @@ export class Database {
 			await this.pool.query("CREATE INDEX IF NOT EXISTS openproject_embeddings_project_idx ON openproject_embeddings(project_id)");
 			await this.pool.query("CREATE TABLE IF NOT EXISTS openproject_embedding_sync (id BOOLEAN PRIMARY KEY DEFAULT TRUE, last_run_at TIMESTAMPTZ, last_error TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())");
 		}
-		const configuredMappings = Object.entries(config.userMap);
-		if (configuredMappings.length) {
-			try {
-				await this.pool.query(
-					`INSERT INTO discord_openproject_users(discord_user_id, openproject_user_id)
-					 SELECT * FROM unnest($1::text[],$2::integer[])
-					 ON CONFLICT(discord_user_id) DO UPDATE
-					 SET openproject_user_id=excluded.openproject_user_id, updated_at=now()`,
-					[configuredMappings.map(([discordId]) => discordId), configuredMappings.map(([, openProjectId]) => openProjectId)],
-				);
-			} catch (error) {
-				if (error && typeof error === "object" && "code" in error && error.code === "23505") {
-					throw new Error("Configured OpenProject user mappings collide with existing mappings. Resolve the ambiguity before migrating.", { cause: error });
-				}
-				throw error;
-			}
-		}
+		await replaceConfiguredUserMappings((sql, values) => this.pool.query(sql, values), config.userMap);
 		} finally {
 			await this.pool.query("SELECT pg_advisory_unlock(hashtext('track-the-hack-bot-schema'))");
 		}
@@ -983,6 +993,7 @@ export class Database {
 			 patch_applied_at: string | null; applied_lock_version: number | null; comment_activity_id: number | null;
 			 review_message_id: string | null;
 			 claim_expires_at: string | null;
+			 source_content_hash: string | null;
 			 rag_candidates: ProposalRagCandidate[];
 			 ambiguities: string[];
 		}>("SELECT * FROM task_proposals WHERE id=$1", [id]);
@@ -1189,19 +1200,19 @@ export class Database {
 		}
 	}
 
-	async supersedePendingProposalForInvalidSources(id: string, missingMessageIds: string[]) {
+	async supersedePendingProposalForInvalidSources(id: string, missingMessageIds: string[], contentChanged = false) {
 		const client = await this.pool.connect();
 		try {
 			await client.query("BEGIN");
 			const result = await client.query(
 				`UPDATE task_proposals SET status='superseded',review_outcome='superseded',
-				 error='One or more cited Discord source messages no longer exist or are inaccessible.',reviewed_at=now(),updated_at=now()
+				 error=$2,reviewed_at=now(),updated_at=now()
 				 WHERE id=$1 AND status='pending_review' AND expires_at > now() RETURNING id`,
-				[id],
+				[id, contentChanged ? "Cited Discord source evidence changed after this proposal was created." : "One or more cited Discord source messages were deleted."],
 			);
 			if (result.rowCount === 1) await client.query(
 				"INSERT INTO task_audit_log(proposal_id,event,metadata) VALUES($1,'source_invalid_preflight',$2)",
-				[id, jsonParameter({ missingMessageIds })],
+				[id, jsonParameter({ missingMessageIds, contentChanged })],
 			);
 			await client.query("COMMIT");
 			return result.rowCount === 1;
