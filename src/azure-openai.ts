@@ -187,8 +187,8 @@ export type ProposalReconciliationResult = {
 	usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number };
 };
 
-export function automaticCandidateEligible(assessment?: AutomaticCandidateAssessment) {
-	return Boolean(assessment
+export function automaticCandidateEligible(assessment: AutomaticCandidateAssessment | undefined, windowSensitivity: AutomaticGateResult["windowSensitivity"]) {
+	return Boolean(windowSensitivity === "safe" && assessment
 		&& assessment.has_activated_specific_work
 		&& assessment.has_remaining_work_or_trackable_transition
 		&& assessment.is_durable

@@ -288,10 +288,10 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			}
 			const reconciledTasks = reconciliation.proposals;
 			const gate = completedGate = await services.extractor.assessAutomaticCandidates(extraction.inputMessages, reconciledTasks.map(item => item.candidate));
-			const eligibleTasks = reconciledTasks.filter((_, index) => automaticCandidateEligible(gate.assessments[index]));
+			const eligibleTasks = reconciledTasks.filter((_, index) => automaticCandidateEligible(gate.assessments[index], gate.windowSensitivity));
 			const candidateAssessments = reconciledTasks.map(({ candidate: task }, index) => ({
 				...gate.assessments[index],
-				automaticEligibility: automaticCandidateEligible(gate.assessments[index]) ? "eligible" : "ineligible",
+				automaticEligibility: automaticCandidateEligible(gate.assessments[index], gate.windowSensitivity) ? "eligible" : "ineligible",
 				proposedAction: task.proposed_action,
 				sourceMessageIds: task.source_message_ids,
 			}));
