@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { corpusWindowSchema, evaluationTrace, optionalRatio, providerFailureCategory, releaseThresholdFailures, retryableProviderFailure, runtimeProposalCandidates } from "../dist/evaluate-ai.js";
+import { corpusWindowSchema, evaluationTrace, optionalRatio, providerFailureCategory, releaseThresholdFailures, retryableProviderFailure, runtimeProposalCandidates, validEvaluationCacheEntry } from "../dist/evaluate-ai.js";
 import { OpenProjectClient, workPackageChangesApplied } from "../dist/openproject.js";
 import { explicitWorkPackageId, lexicalTitleSimilarity, OpenProjectRag, resolveProposalTarget, resolveProposedAction } from "../dist/rag.js";
 import { embeddingContentHash } from "../dist/embeddings.js";
@@ -51,6 +51,19 @@ test("AI evaluation traces extraction and gate rejection stages", () => {
 		extractedCandidates: 3, groundedCandidates: 2, finalCandidates: 0,
 		gateCriteriaFailures: { activation: 1, remainingWork: 1, durability: 1, decisionReadiness: 1, sensitivity: 1 },
 	});
+});
+
+test("AI evaluation caches count only real extracted-task predictions as valid", () => {
+	const trace = { extractedCandidates: 1, groundedCandidates: 1, finalCandidates: 1, gateCriteriaFailures: { activation: 0, remainingWork: 0, durability: 0, decisionReadiness: 0, sensitivity: 0 } };
+	const task = {
+		title: "Publish map", work_item_key: "venue-map", description: "Publish the map.", assignee_alias: null,
+		start_date: null, due_date: null, priority_name: null, size_name: null, project_name: null, estimated_hours: null,
+		source_message_ids: ["m1"], relevant_attachment_ids: [], evidence: "Approved", proposed_action: "create",
+		content_intent: "none", metadata_change_fields: [],
+	};
+	assert.equal(validEvaluationCacheEntry(JSON.stringify({ version: "automatic-v3.4", predicted: [task], trace })), true);
+	assert.equal(validEvaluationCacheEntry(JSON.stringify({ version: "automatic-v3.4", predicted: [{ title: "partial" }], trace })), false);
+	assert.equal(validEvaluationCacheEntry("not json"), false);
 });
 
 test("exact OpenProject references are resolved without semantic phrase matching", () => {

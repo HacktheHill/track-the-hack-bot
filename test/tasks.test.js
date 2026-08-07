@@ -1,8 +1,33 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, directProposalDismissalReason, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, handleProposalButton, handleProposalTargetSelect, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, proposalReviewComponents, recentExtractionMessages, relevantImageAttachments, removeProposalReviewCard, resolveOptionalOwner, reviewedProposalAllowsDuplicate, taskCommand, taskIdentityGuidance, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
+import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, directProposalDismissalReason, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, handleProposalButton, handleProposalTargetSelect, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, missingProposalSourceMessageIds, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, proposalReviewComponents, recentExtractionMessages, relevantImageAttachments, removeProposalReviewCard, resolveOptionalOwner, reviewedProposalAllowsDuplicate, taskCommand, taskIdentityGuidance, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
 import { formatProposalContent } from "../dist/task-proposals.js";
 import { normalizeTaskTitle, OpenProjectClient, openProjectAttachmentFileName, titlesLikelyDuplicate, workPackageMarkdownLink } from "../dist/openproject.js";
+
+test("proposal source preflight refetches every citation and reports deleted evidence", async () => {
+	const fetched = [];
+	const channel = {
+		isTextBased: () => true,
+		messages: { fetch: async id => {
+			fetched.push(id);
+			if (id === "444") throw new Error("Unknown Message");
+			return { id };
+		} },
+	};
+	const client = { channels: { fetch: async id => {
+		assert.equal(id, "222");
+		return channel;
+	} } };
+	assert.deepEqual(await missingProposalSourceMessageIds(client, "111", {
+		channel_id: "999",
+		source_message_ids: ["333", "444"],
+		source_links: [
+			"https://discord.com/channels/111/222/333",
+			"https://discord.com/channels/111/222/444",
+		],
+	}), ["444"]);
+	assert.deepEqual(fetched, ["333", "444"]);
+});
 
 test("task defaults start today and use the configured due offset", () => {
 	assert.deepEqual(defaultTaskDates(new Date("2026-07-13T23:30:00Z"), true, 7), {

@@ -85,6 +85,12 @@ export function reconciledSupersessionIds(input: {
 	recommendedSupersessionIds: string[];
 	invalidatableProposalIds: string[];
 }) {
+	if (!input.reconciliationSucceeded) return [];
+	if (input.reconciledCount === 0 && input.eligibleCount === 0 && input.persistedProposalIds.size === 0) {
+		const safelyRecommended = [...new Set(input.recommendedSupersessionIds)]
+			.filter(id => input.invalidatableProposalIds.includes(id));
+		return safelyRecommended.length === 1 ? safelyRecommended : [];
+	}
 	if (input.reconciledCount === 1 && input.eligibleCount === 1 && input.persistedProposalIds.size > 0) {
 		return input.recommendedSupersessionIds.filter(id => !input.persistedProposalIds.has(id));
 	}
@@ -285,7 +291,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				supersededPendingProposalIds: [], deployment: "deterministic", latencyMs: 0,
 			};
 			let reconciliationSucceeded = false;
-			if (services.extractor.reconcileProposals && shouldReconcileTaskProposals(groupedTasks.length, pendingProposals.length)) try {
+			if (services.extractor.reconcileProposals && (affectedPendingProposalIds.length > 0 || shouldReconcileTaskProposals(groupedTasks.length, pendingProposals.length))) try {
 				reconciliation = await services.extractor.reconcileProposals(extraction.inputMessages, groupedTasks, pendingProposals, affectedPendingProposalIds);
 				reconciliationSucceeded = true;
 			} catch (error) {
@@ -692,6 +698,8 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 	});
 	client.on("messageDelete", message => {
 		void (async () => {
+			// Creating rows may already have crossed a remote mutation boundary. The final
+			// reviewer preflight handles them; deletion events only invalidate pending rows.
 			const superseded = await services.db.supersedePendingProposalsForDeletedSource(message.id);
 			for (const proposal of superseded) {
 				if (!proposal.review_message_id) continue;

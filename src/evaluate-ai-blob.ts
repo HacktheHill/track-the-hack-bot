@@ -11,7 +11,7 @@ import { z } from "zod";
 import { loadAiCorpusConfig } from "./ai-corpus-config.js";
 import { parseCorpusJsonl } from "./ai-corpus.js";
 import { AzureBlobCorpusStore } from "./ai-corpus-blob.js";
-import { evaluationCacheKey, evaluationEnvSchema } from "./evaluate-ai.js";
+import { evaluationCacheKey, evaluationEnvSchema, validEvaluationCacheEntry } from "./evaluate-ai.js";
 
 async function streamText(stream: NodeJS.ReadableStream | undefined) {
 	if (!stream) throw new Error("Blob response did not contain a body.");
@@ -51,8 +51,9 @@ async function main() {
 		for (const key of cacheKeys) {
 			const blob = container.getBlobClient(`${prefix}cache/${key}.json`);
 			if (!await blob.exists()) continue;
-			existing.add(key);
-			await writeFile(join(cacheDirectory, `${key}.json`), await streamText((await blob.download()).readableStreamBody), { mode: 0o600 });
+			const content = await streamText((await blob.download()).readableStreamBody);
+			if (validEvaluationCacheEntry(content)) existing.add(key);
+			await writeFile(join(cacheDirectory, `${key}.json`), content, { mode: 0o600 });
 		}
 		const reportPrefix = join(directory, `report-${Date.now()}`);
 		const evaluationStatus = await run(process.execPath, [resolve("dist/evaluate-ai.js"), corpusPath, reportPrefix, "--full"], { ...process.env, AI_EVAL_CACHE_DIR: cacheDirectory });
