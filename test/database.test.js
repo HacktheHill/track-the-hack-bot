@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { assertUniqueConfiguredUserMappings, Database, embeddingVectorTypeMatches, openProjectUserUniqueIndexSql } from "../dist/database.js";
+import { assertUniqueConfiguredUserMappings, configuredUserMappingsSql, Database, embeddingVectorTypeMatches, openProjectUserUniqueIndexSql, replaceConfiguredUserMappings } from "../dist/database.js";
 
 function databaseWithPool(pool) {
 	if (!pool.connect) pool.connect = async () => ({ ...pool, release() {} });
@@ -19,6 +19,21 @@ test("OpenProject identity mappings require one Discord user per OpenProject use
 	assert.doesNotThrow(() => assertUniqueConfiguredUserMappings({ discord1: 10, discord2: 11 }));
 	assert.throws(() => assertUniqueConfiguredUserMappings({ discord1: 10, discord2: 10 }), /ambiguous.*10.*discord1, discord2/i);
 	assert.match(openProjectUserUniqueIndexSql, /UNIQUE INDEX.*openproject_user_id/i);
+});
+
+test("configured OpenProject identity swaps delete configured Discord IDs before one atomic insert", async () => {
+	let statement;
+	await replaceConfiguredUserMappings(async (sql, values) => { statement = { sql, values }; }, { discord1: 11, discord2: 10 });
+	assert.equal(statement.sql, configuredUserMappingsSql);
+	assert.match(statement.sql, /^WITH deleted_configured_mappings AS \(\s*DELETE[\s\S]*\)\s*INSERT/i);
+	assert.deepEqual(statement.values, [["discord1", "discord2"], [11, 10]]);
+});
+
+test("configured identity replacement rejects duplicates and nonconfigured collisions", async () => {
+	await assert.rejects(replaceConfiguredUserMappings(async () => {}, { discord1: 10, discord2: 10 }), /ambiguous.*10/i);
+	await assert.rejects(replaceConfiguredUserMappings(async () => {
+		throw Object.assign(new Error("unique violation"), { code: "23505" });
+	}, { discord1: 10 }), /collide with existing mappings/i);
 });
 
 test("failed task confirmations retain every owner for retry", async () => {

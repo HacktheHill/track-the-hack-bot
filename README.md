@@ -165,10 +165,15 @@ manual `/task create` requests can use `allow_duplicate` to override that check.
 Manual AI drafting requires a configured Azure OpenAI endpoint/deployment.
 Automatic extraction is controlled separately by `OPENPROJECT_AUTOMATION_MODE`:
 
-- `off` disables automatic extraction.
-- `shadow` records extraction and gate decisions without storing proposals or
-  posting review cards.
+- `off` creates no new automatic proposals and performs no uncited extraction.
+- `shadow` records extraction and gate decisions without creating new proposals
+  or posting review cards.
 - `review` posts human-review cards after the configured channel idle period.
+
+In all three modes, edits and deletions can maintain already-pending proposals
+that cite the changed message. This source maintenance never creates an
+unrelated proposal; it keeps cited pending review evidence accurate even while
+new automatic proposal creation is disabled.
 
 AI extraction runs in every channel except those listed in the blocked or
 excluded ID lists. Excluded category IDs apply to all descendant channels.
@@ -194,8 +199,10 @@ revised when their cited messages or attachments change. Raw Discord transcripts
 are never copied into task descriptions.
 Production uses `review` mode: AI may post a proposal, but only a permitted
 human reviewer can create or dismiss the task. Immediately before a proposal is
-claimed for application, every cited Discord message is refetched. Missing or
-inaccessible evidence deterministically supersedes a still-pending proposal;
+claimed for application, every cited Discord message is refetched and its raw
+content and attachment IDs/URLs are compared with the proposal's source hash.
+Confirmed deletion or changed evidence supersedes only a still-pending proposal;
+transient Discord fetch failures block application but remain retryable;
 deletion listeners never rewrite an already-creating row because its remote
 OpenProject mutation may have started.
 
