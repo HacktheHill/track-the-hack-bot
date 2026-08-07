@@ -18,8 +18,16 @@ input.
 Use `npm run evaluate:ai -- /secure/path/corpus.jsonl` for a private JSONL corpus
 and `npm run replay:ai -- 2,4,5` for retained production events. Reports include
 stage-level latency, token usage, validity, proposal precision/recall, owner and
-deadline accuracy, and routing outcomes. Keep independently adjudicated v3 cases
-outside source control. Legacy events and corpora that contain extraction-time
+deadline accuracy, and routing outcomes. Exact proposal metrics continue to
+require action, sources, project, and title concepts to match. Diagnostic metrics
+align proposals one-to-one when they share source evidence or a required title
+concept, then separately report detection, action, source precision/recall, title
+concept recall, project routing, owner, and deadline results. Reports also count
+grounding rejections, related-candidate merges, finalization rejections, and each
+automatic gate criterion failure.
+Case-level diagnostics contain counts only, never proposal content or source IDs.
+Keep independently adjudicated v3 cases outside source control. Legacy events
+and corpora that contain extraction-time
 `automatic_eligibility`, `trigger_kind`, or `lifecycle` labels are not directly
 comparable to v3 gate results.
 

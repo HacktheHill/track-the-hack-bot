@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { corpusWindowSchema, evaluationTrace, optionalRatio, providerFailureCategory, retryableProviderFailure, runtimeProposalCandidates } from "../dist/evaluate-ai.js";
+import { corpusWindowSchema, evaluationTrace, optionalRatio, proposalDiagnostics, providerFailureCategory, retryableProviderFailure, runtimeProposalCandidates } from "../dist/evaluate-ai.js";
 import { OpenProjectClient, workPackageChangesApplied } from "../dist/openproject.js";
 import { explicitWorkPackageId, lexicalTitleSimilarity, OpenProjectRag, resolveProposalTarget, resolveProposedAction } from "../dist/rag.js";
 import { embeddingContentHash } from "../dist/embeddings.js";
@@ -32,17 +32,85 @@ test("AI evaluation reports unavailable ratios without comparisons", () => {
 	assert.equal(optionalRatio(3, 4), 0.75);
 });
 
-test("AI evaluation traces extraction and gate rejection stages", () => {
-	assert.deepEqual(evaluationTrace(3, 2, [{
+test("AI evaluation traces grounding, merging, and gate rejection stages", () => {
+	assert.deepEqual(evaluationTrace(4, 3, 2, [{
 		candidate_index: 0, has_activated_specific_work: false, has_remaining_work_or_trackable_transition: true,
 		is_durable: false, is_decision_ready: true, sensitivity: "safe", supporting_source_message_ids: ["m1"],
 	}, {
 		candidate_index: 1, has_activated_specific_work: true, has_remaining_work_or_trackable_transition: false,
 		is_durable: true, is_decision_ready: false, sensitivity: "uncertain", supporting_source_message_ids: ["m2"],
 	}], 0), {
-		extractedCandidates: 3, groundedCandidates: 2, finalCandidates: 0,
+		extractedCandidates: 4, referenceValidCandidates: 3, groundedCandidates: 2, finalCandidates: 0,
 		gateCriteriaFailures: { activation: 1, remainingWork: 1, durability: 1, decisionReadiness: 1, sensitivity: 1 },
 	});
+});
+
+test("AI evaluation decomposes errors after aligning a proposal", () => {
+	const diagnostics = proposalDiagnostics([{
+		action: "create", titleIncludes: ["launch", "page"], projectName: "Web Team",
+		assigneeAlias: "owner-a", dueDate: "2026-08-15", sourceMessageIds: ["m1", "m2"],
+	}], [{
+		title: "Launch checklist", description: "Prepare release materials", proposed_action: "update",
+		project_name: "web-team", assignee_alias: "owner-b", due_date: "2026-08-15", source_message_ids: ["m2", "m3"],
+	}]);
+	assert.deepEqual(diagnostics, {
+		alignedProposals: 1,
+		detection: { truePositives: 1, falsePositives: 0, falseNegatives: 0 },
+		action: { correct: 0, compared: 1 },
+		sources: { truePositives: 1, falsePositives: 1, falseNegatives: 1 },
+		titleConcepts: { matched: 1, expected: 2 },
+		project: { correct: 1, compared: 1 },
+		owner: { correct: 0, compared: 1 },
+		deadline: { correct: 1, compared: 1 },
+	});
+});
+
+test("AI diagnostic alignment is one-to-one and maximizes aligned proposals", () => {
+	const diagnostics = proposalDiagnostics([
+		{ action: "create", titleIncludes: ["alpha"], sourceMessageIds: ["m1"] },
+		{ action: "create", titleIncludes: ["beta"], sourceMessageIds: ["m2"] },
+	], [
+		{ title: "Beta", description: "Work", proposed_action: "create", project_name: null, source_message_ids: ["m1", "m2"] },
+		{ title: "Alpha", description: "Work", proposed_action: "create", project_name: null, source_message_ids: ["m3"] },
+	]);
+	assert.equal(diagnostics.alignedProposals, 2);
+	assert.deepEqual(diagnostics.detection, { truePositives: 2, falsePositives: 0, falseNegatives: 0 });
+	assert.deepEqual(diagnostics.titleConcepts, { matched: 2, expected: 2 });
+});
+
+test("AI diagnostic alignment does not pair unrelated proposals", () => {
+	const diagnostics = proposalDiagnostics(
+		[{ action: "create", titleIncludes: ["launch"], sourceMessageIds: ["m1"] }],
+		[{ title: "Book venue", description: "Call supplier", proposed_action: "create", project_name: null, source_message_ids: ["m2"] }],
+	);
+	assert.equal(diagnostics.alignedProposals, 0);
+	assert.deepEqual(diagnostics.detection, { truePositives: 0, falsePositives: 1, falseNegatives: 1 });
+	assert.deepEqual(diagnostics.sources, { truePositives: 0, falsePositives: 1, falseNegatives: 1 });
+	assert.deepEqual(diagnostics.titleConcepts, { matched: 0, expected: 1 });
+});
+
+test("AI diagnostic alignment is independent of action and project correctness", () => {
+	const diagnostics = proposalDiagnostics([
+		{ action: "create", titleIncludes: ["shared"], projectName: "Alpha", sourceMessageIds: ["m1"] },
+		{ action: "update", titleIncludes: ["shared"], projectName: "Beta", sourceMessageIds: ["m1"] },
+	], [
+		{ title: "Shared", description: "Work", proposed_action: "update", project_name: "Beta", source_message_ids: ["m1"] },
+		{ title: "Shared", description: "Work", proposed_action: "create", project_name: "Alpha", source_message_ids: ["m1"] },
+	]);
+	assert.deepEqual(diagnostics.action, { correct: 0, compared: 2 });
+	assert.deepEqual(diagnostics.project, { correct: 0, compared: 2 });
+});
+
+test("duplicate predicted source IDs do not bias diagnostic alignment", () => {
+	const diagnostics = proposalDiagnostics([
+		{ action: "create", titleIncludes: ["first"], sourceMessageIds: ["m1"] },
+		{ action: "create", titleIncludes: ["second"], sourceMessageIds: ["m1", "m2"] },
+	], [
+		{ title: "Second", description: "Work", proposed_action: "create", project_name: null, source_message_ids: ["m1", "m1"] },
+		{ title: "First", description: "Work", proposed_action: "create", project_name: null, source_message_ids: ["m1"] },
+	]);
+	assert.deepEqual(diagnostics.titleConcepts, { matched: 2, expected: 2 });
+	assert.deepEqual(diagnostics.sources, { truePositives: 2, falsePositives: 0, falseNegatives: 1 });
 });
 
 test("exact OpenProject references are resolved without semantic phrase matching", () => {
