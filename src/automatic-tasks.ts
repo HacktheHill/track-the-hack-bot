@@ -619,9 +619,9 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					extractionMetadata: extraction.metadata,
 					extractionOptions: extraction.replayOptions,
 					windowSensitivity: gate.windowSensitivity,
-					pipelineVersion: "v5",
+					pipelineVersion: "v6",
 					extractionPromptVersion: "candidate-v4",
-					gatePromptVersion: "automatic-precision-v1",
+					gatePromptVersion: "automatic-precision-v2",
 					stages: {
 						contextSelection: { deployment: contextSelection.deployment, latencyMs: contextSelection.latencyMs, candidateMessageCount: minimizedCandidates.length, selectedMessageCount: minimized.length },
 						extraction: { deployment: extraction.deployment, latencyMs: extraction.latencyMs, tokenUsage: extraction.usage },

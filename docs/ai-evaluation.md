@@ -13,7 +13,12 @@ durability, decision readiness, contextual sensitivity, and supporting source
 message IDs. It also classifies the sensitivity of the complete message window.
 A candidate is eligible only when every positive criterion passes,
 the sensitivity result is `safe`, and its support is grounded in the bounded
-input.
+input. The gate first assigns a closed focal-transition kind so status-only,
+preference, recap, conditional-option, resource-sharing, and synchronous
+coordination hypotheses cannot pass by returning uniformly positive booleans.
+Explicit assignments, accepted requests, commitments, corrections, bounded
+decision requests, artifact reviews, and tracked lifecycle transitions remain
+subject to every existing criterion.
 
 Use `npm run evaluate:ai -- /secure/path/corpus.jsonl` for a private JSONL corpus
 and `npm run replay:ai -- 2,4,5` for retained production events. Reports include

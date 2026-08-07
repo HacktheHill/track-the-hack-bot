@@ -42,14 +42,14 @@ test("release thresholds enforce only window count, precision, and valid output"
 
 test("AI evaluation traces grounding, merging, and gate rejection stages", () => {
 	assert.deepEqual(evaluationTrace(4, 3, 2, [{
-		candidate_index: 0, has_activated_specific_work: false, has_remaining_work_or_trackable_transition: true,
+		candidate_index: 0, focal_transition_kind: "status_only", has_activated_specific_work: false, has_remaining_work_or_trackable_transition: true,
 		is_durable: false, is_decision_ready: true, sensitivity: "safe", supporting_source_message_ids: ["m1"],
 	}, {
-		candidate_index: 1, has_activated_specific_work: true, has_remaining_work_or_trackable_transition: false,
+		candidate_index: 1, focal_transition_kind: "accepted_request", has_activated_specific_work: true, has_remaining_work_or_trackable_transition: false,
 		is_durable: true, is_decision_ready: false, sensitivity: "uncertain", supporting_source_message_ids: ["m2"],
 	}], 0), {
 		extractedCandidates: 4, referenceValidCandidates: 3, groundedCandidates: 2, finalCandidates: 0,
-		gateCriteriaFailures: { activation: 1, remainingWork: 1, durability: 1, decisionReadiness: 1, sensitivity: 1 },
+		gateCriteriaFailures: { transition: 1, activation: 1, remainingWork: 1, durability: 1, decisionReadiness: 1, sensitivity: 1 },
 	});
 });
 
@@ -122,15 +122,15 @@ test("duplicate predicted source IDs do not bias diagnostic alignment", () => {
 });
 
 test("AI evaluation caches count only real extracted-task predictions as valid", () => {
-	const trace = { extractedCandidates: 1, referenceValidCandidates: 1, groundedCandidates: 1, finalCandidates: 1, gateCriteriaFailures: { activation: 0, remainingWork: 0, durability: 0, decisionReadiness: 0, sensitivity: 0 } };
+	const trace = { extractedCandidates: 1, referenceValidCandidates: 1, groundedCandidates: 1, finalCandidates: 1, gateCriteriaFailures: { transition: 0, activation: 0, remainingWork: 0, durability: 0, decisionReadiness: 0, sensitivity: 0 } };
 	const task = {
 		title: "Publish map", work_item_key: "venue-map", description: "Publish the map.", assignee_alias: null,
 		start_date: null, due_date: null, priority_name: null, size_name: null, project_name: null, estimated_hours: null,
 		source_message_ids: ["m1"], relevant_attachment_ids: [], evidence: "Approved", proposed_action: "create",
 		content_intent: "none", metadata_change_fields: [],
 	};
-	assert.equal(validEvaluationCacheEntry(JSON.stringify({ version: "automatic-v3.6", predicted: [task], trace })), true);
-	assert.equal(validEvaluationCacheEntry(JSON.stringify({ version: "automatic-v3.6", predicted: [{ title: "partial" }], trace })), false);
+	assert.equal(validEvaluationCacheEntry(JSON.stringify({ version: "automatic-v3.7", predicted: [task], trace })), true);
+	assert.equal(validEvaluationCacheEntry(JSON.stringify({ version: "automatic-v3.7", predicted: [{ title: "partial" }], trace })), false);
 	assert.equal(validEvaluationCacheEntry("not json"), false);
 });
 
@@ -616,7 +616,7 @@ test("AI evaluator uses production grounding and target semantics for every acti
 		size_name: null, estimated_hours: null, source_message_ids: ["m1"], relevant_attachment_ids: [],
 	};
 	const eligible = {
-		candidate_index: 0, has_activated_specific_work: true, has_remaining_work_or_trackable_transition: true,
+		candidate_index: 0, focal_transition_kind: "tracked_update", has_activated_specific_work: true, has_remaining_work_or_trackable_transition: true,
 		is_durable: true, is_decision_ready: true, sensitivity: "safe", supporting_source_message_ids: ["m1"],
 	};
 	const messages = [{ id: "m1", authorAlias: "USER_1", text: "Update it", timestamp: "2026-07-16T00:00:00Z", priority: true }];
