@@ -4,10 +4,41 @@ import type { IntegrationConfig } from "./config.js";
 
 export type EmbeddingClientResult = { embeddings: number[][]; model: string; dimensions: number };
 
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+const TRANSIENT_NETWORK_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE", "ETIMEDOUT", "EAI_AGAIN", "ENETDOWN", "ENETUNREACH"]);
+
+function retryDelayMs(response: Response, attempt: number) {
+	const milliseconds = response.headers.get("retry-after-ms") ?? response.headers.get("x-ms-retry-after-ms");
+	if (milliseconds !== null) {
+		const value = Number(milliseconds);
+		if (Number.isFinite(value)) return Math.min(60_000, Math.max(0, value));
+	}
+	const retryAfter = response.headers.get("retry-after");
+	if (retryAfter !== null) {
+		const seconds = Number(retryAfter);
+		if (Number.isFinite(seconds)) return Math.min(60_000, Math.max(0, seconds * 1000));
+		const date = Date.parse(retryAfter);
+		if (Number.isFinite(date)) return Math.min(60_000, Math.max(0, date - Date.now()));
+	}
+	return Math.min(1_000 * 2 ** attempt, 60_000);
+}
+
+function isTransientNetworkError(error: unknown) {
+	if (error instanceof DOMException && error.name === "AbortError") return false;
+	if (error instanceof TypeError) return true;
+	const candidate = error as { code?: unknown; cause?: { code?: unknown } };
+	const code = typeof candidate?.code === "string" ? candidate.code : candidate?.cause?.code;
+	return typeof code === "string" && TRANSIENT_NETWORK_CODES.has(code);
+}
+
 export class AzureEmbeddingClient {
 	private readonly tokenProvider: () => Promise<string>;
 
-	constructor(private readonly config: IntegrationConfig, tokenProvider?: () => Promise<string>) {
+	constructor(
+		private readonly config: IntegrationConfig,
+		tokenProvider?: () => Promise<string>,
+		private readonly sleep: (milliseconds: number) => Promise<void> = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
+	) {
 		const credential = new DefaultAzureCredential();
 		this.tokenProvider = tokenProvider ?? (async () => (await credential.getToken("https://cognitiveservices.azure.com/.default")).token);
 	}
@@ -26,17 +57,22 @@ export class AzureEmbeddingClient {
 			: `${endpoint}/openai/deployments/${encodeURIComponent(deployment)}/embeddings?api-version=${encodeURIComponent(this.config.AZURE_OPENAI_API_VERSION)}`;
 		let response: Response | undefined;
 		for (let attempt = 0; attempt < 5; attempt++) {
-			response = await fetch(url, {
-				method: "POST",
-				headers: { Authorization: `Bearer ${await this.tokenProvider()}`, "Content-Type": "application/json" },
-				body: JSON.stringify({ model: deployment, input, dimensions }),
-			});
-			if (response.status !== 429 && response.status < 500) break;
-			const retryAfter = Number(response.headers.get("retry-after"));
-			const delayMs = Number.isFinite(retryAfter) && retryAfter > 0
-				? Math.min(retryAfter * 1000, 60_000)
-				: Math.min(1_000 * 2 ** attempt, 60_000);
-			await new Promise(resolve => setTimeout(resolve, delayMs));
+			const token = await this.tokenProvider();
+			try {
+				response = await fetch(url, {
+					method: "POST",
+					headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+					body: JSON.stringify({ model: deployment, input, dimensions }),
+				});
+			} catch (error) {
+				if (!isTransientNetworkError(error) || attempt === 4) throw error;
+				await this.sleep(Math.min(1_000 * 2 ** attempt, 60_000));
+				continue;
+			}
+			if (!RETRYABLE_STATUSES.has(response.status) || attempt === 4) break;
+			const delayMs = retryDelayMs(response, attempt);
+			await response.body?.cancel().catch(() => undefined);
+			await this.sleep(delayMs);
 		}
 		if (!response) throw new Error("Azure embeddings request did not return a response.");
 		if (!response.ok) throw new Error(`Azure embeddings ${response.status}: ${(await response.text()).slice(0, 300)}`);
