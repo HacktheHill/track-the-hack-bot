@@ -351,7 +351,7 @@ async function deliverProposalReply(
 }
 
 async function updateProposalReviewCard(
-	interaction: MessageContextMenuCommandInteraction | ChatInputCommandInteraction | ButtonInteraction,
+	interaction: MessageContextMenuCommandInteraction | ChatInputCommandInteraction | ButtonInteraction | ModalSubmitInteraction | StringSelectMenuInteraction,
 	services: Services,
 	proposalId: string,
 	payload: InteractionEditReplyOptions,
@@ -670,25 +670,38 @@ export function citesExtractionFocus(sourceMessageIds: readonly string[], focusI
 	return sourceMessageIds.some(id => focusIds.has(id));
 }
 
+export function recentExtractionMessages<T extends { author: { bot: boolean }; system: boolean; content: string; createdTimestamp: number }>(messages: readonly T[], limit: number) {
+	return [...messages]
+		.filter(message => !message.author.bot && !message.system && !message.content.startsWith("/"))
+		.sort((left, right) => right.createdTimestamp - left.createdTimestamp)
+		.slice(0, limit)
+		.sort((left, right) => left.createdTimestamp - right.createdTimestamp);
+}
+
 export function reviewedProposalAllowsDuplicate(action: "create" | "update" | "complete" | "reopen") {
 	return action === "create";
 }
 
-export function manualProposalButtons(proposalId: string, action: "create" | "update" | "complete" | "reopen", _suggestedWorkPackageId?: number) {
-	return [new ButtonBuilder()
-		.setCustomId(`op-review:${proposalId}`)
-		.setLabel(action === "create" ? "Review new task" : "Review")
-		.setStyle(ButtonStyle.Primary),
-	new ButtonBuilder().setCustomId(`op-dismiss-no-task:${proposalId}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
-	new ButtonBuilder().setCustomId(`op-incorrect:${proposalId}`).setLabel("Incorrect").setStyle(ButtonStyle.Secondary)];
+export function manualProposalButtons(proposalId: string, action: "create" | "update" | "complete" | "reopen", targetResolved = action === "create") {
+	return [
+		...(targetResolved ? [new ButtonBuilder()
+			.setCustomId(`op-review:${proposalId}`)
+			.setLabel(action === "create" ? "Review new task" : "Apply")
+			.setStyle(ButtonStyle.Primary)] : []),
+		...(action === "create" ? [new ButtonBuilder().setCustomId(`op-edit-details:${proposalId}`).setLabel("Edit details").setStyle(ButtonStyle.Secondary)] : []),
+		new ButtonBuilder().setCustomId(`op-choose-target:${proposalId}`).setLabel("Choose task by ID").setStyle(ButtonStyle.Secondary),
+		new ButtonBuilder().setCustomId(`op-dismiss-no-task:${proposalId}`).setLabel("Dismiss").setStyle(ButtonStyle.Secondary),
+		new ButtonBuilder().setCustomId(`op-incorrect:${proposalId}`).setLabel("Incorrect").setStyle(ButtonStyle.Secondary),
+	];
 }
 
 export function proposalReviewComponents(
 	proposalId: string,
 	action: "create" | "update" | "complete" | "reopen",
 	candidates: readonly ProposalRagCandidate[] = [],
+	targetResolved = action === "create",
 ) {
-	const buttons = manualProposalButtons(proposalId, action);
+	const buttons = manualProposalButtons(proposalId, action, targetResolved);
 	const rows: Array<ActionRowBuilder<ButtonBuilder> | ActionRowBuilder<StringSelectMenuBuilder>> = [
 		new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons),
 	];
@@ -1538,10 +1551,17 @@ async function collectContext(target: Message, interaction: MessageContextMenuCo
 
 async function collectRecentContext(interaction: ChatInputCommandInteraction, limit: number): Promise<CollectedContext> {
 	if (!interaction.channel || !("messages" in interaction.channel)) throw new Error("This channel does not support message extraction.");
-	const fetched = await interaction.channel.messages.fetch({ limit });
-	const source = [...fetched.values()]
-		.filter(message => !message.author.bot && !message.system && !message.content.startsWith("/"))
-		.sort((left, right) => left.createdTimestamp - right.createdTimestamp);
+	const fetched: Message[] = [];
+	let before: string | undefined;
+	while (recentExtractionMessages(fetched, limit).length < limit && fetched.length < 500) {
+		const page = await interaction.channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+		if (!page.size) break;
+		fetched.push(...page.values());
+		const oldest = [...page.values()].sort((left, right) => left.createdTimestamp - right.createdTimestamp)[0];
+		before = oldest.id;
+		if (page.size < 100) break;
+	}
+	const source = recentExtractionMessages(fetched, limit);
 	if (!source.length) throw new Error("No recent messages were available for extraction.");
 	const aliases = new Map<string, string>();
 	const reverseAliases = new Map<string, string>();
@@ -1571,14 +1591,14 @@ async function collectRecentContext(interaction: ChatInputCommandInteraction, li
 			attachments: [...message.attachments.values()].map(attachment => ({
 				id: attachment.id, name: attachment.name ?? "attachment", contentType: attachment.contentType ?? undefined, url: attachment.url,
 			})),
-			contextRole: message.id === primary.id ? "primary" as const : "preceding" as const,
-			priority: message.id === primary.id,
+			contextRole: "primary" as const,
+			priority: true,
 			containedSensitiveData: containsSensitiveContent([{ id: message.id, authorAlias: "", text: raw, timestamp: "" }]),
 		};
 	});
 	const mentionedIds = [...primary.mentions.users.keys()].filter(id => id !== primary.author.id);
 	return {
-		messages, sourceRecords, reverseAliases, validIds: new Set(source.map(message => message.id)), focusIds: new Set([primary.id]),
+		messages, sourceRecords, reverseAliases, validIds: new Set(source.map(message => message.id)), focusIds: new Set(source.map(message => message.id)),
 		primaryId: primary.id, primaryAuthorId: primary.author.id,
 		explicitAssigneeId: mentionedIds.length === 1 ? mentionedIds[0] : undefined,
 	};
@@ -1866,15 +1886,42 @@ async function completeAiCandidate(
 		estimatedHours = inferredMetadata.estimatedHours;
 		dueDate = inferredDate(candidate.due_date) ?? defaultAiDueDate(new Date(), priority?.name, size?.value, services.config.BOT_TIME_ZONE);
 	}
-	if (action === "no_action") {
-		await services.db.recordExtraction({
-			source: "manual", outcome: "no_task", modelDeployment: deployment, triggerId: context.primaryId,
-			taskCount: result.tasks.length, latencyMs: proposalLatencyMs, tokenUsage: proposalTokenUsage,
-			inputSnapshot,
-			decision: { ...decisionTelemetry, requestedAction: candidate.proposed_action, outcome: "no_existing_match" },
+	if (action !== "create" && !match) {
+		const provisional = planExistingTaskOperations({
+			workPackage: { description: "Existing task" }, requestedAction: action, contentIntent: "none", description: "",
+			metadataFields: candidate.metadata_change_fields,
+			values: { title: candidate.title, assigneeDiscordId: assigneeId, priorityId: priority?.id,
+				sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate,
+				dueDate: inferredDate(candidate.due_date), estimatedHours },
 		});
-		await deliverAiStatus(interaction, `The discussion suggests an existing-task ${candidate.proposed_action}, but no sufficiently close OpenProject task was found.`, replaceReply);
-		return undefined;
+		const contentOperation = candidate.content_intent === "update_note" ? "postComment" : candidate.content_intent === "replace_description" ? "descriptionReplacement" : "none";
+		const proposal = await services.db.createProposal({
+			preferredProposalId, permittedExistingProposalIds, requesterId: interaction.user.id,
+			channelId: interaction.channelId, projectId, title: candidate.title, description,
+			assigneeDiscordId: assigneeId, accountableDiscordId: accountableId, priorityId: priority?.id,
+			sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate, dueDate, estimatedHours,
+			metadataInference, sourceMessageIds: candidate.source_message_ids, sourceLinks, sourceAttachments,
+			ragCandidates, modelDeployment: deployment, evidence: candidate.evidence,
+			ambiguities: [...ambiguities, "Target OpenProject task must be selected before applying."],
+			latencyMs: proposalLatencyMs, tokenUsage: proposalTokenUsage, escalationReason: extraction.escalationReason,
+			retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS, action,
+			metadataPatch: provisional.metadataPatch, contentOperation,
+			contentMarkdown: contentOperation === "none" ? null : description,
+			workItemKey: candidate.work_item_key,
+			sourceContentHash: sourceContentHash(candidate.source_message_ids.map(id => ({ id, text: context.sourceRecords.get(id)?.text ?? "", attachments: context.sourceRecords.get(id)?.attachments }))),
+			initialSnapshot: proposalSnapshot({ title: candidate.title, description, projectId, assigneeId, accountableId,
+				priorityId: priority?.id, sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined,
+				startDate, dueDate, estimatedHours: estimatedHours ?? null, action, sourceMessageIds: candidate.source_message_ids, sourceLinks }),
+		});
+		const stored = await services.db.proposal(proposal.id);
+		if (!stored || !proposalIsReviewable(stored) || !await canReviewProposal(interaction, stored, services)) return undefined;
+		await services.db.recordExtraction({ source: "manual", outcome: proposal.reused ? "duplicate" : "proposal", modelDeployment: deployment,
+			triggerId: context.primaryId, taskCount: result.tasks.length, latencyMs: proposalLatencyMs, tokenUsage: proposalTokenUsage,
+			inputSnapshot, proposalIds: [proposal.id], decision: { ...decisionTelemetry, action, outcome: "target_required" } });
+		const reviewPayload = await storedProposalReviewPayload(interaction, services, stored);
+		if (proposal.revised) await updateProposalReviewCard(interaction, services, proposal.id, reviewPayload);
+		await deliverProposalReply(interaction, services, proposal.id, reviewPayload, !proposal.reused, replaceReply);
+		return proposal.id;
 	}
 	if (projectId && match && action !== "create") {
 		const operations = planExistingTaskOperations({
@@ -1969,7 +2016,7 @@ async function completeAiCandidate(
 		const warning = displayedOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : "";
 		const reviewPayload: InteractionEditReplyOptions = {
 			content: boundedDiscordContent(`**Possible ${displayedAction} for ${displayedWorkPackageLink}**\n${operationSummary.map(item => `- ${item}`).join("\n")}${warning}${formatProposalContent(displayedOperation, displayedContent)}${redisplayed ? "" : `\n\nSimilarity: ${Math.round(match.similarity * 100)}%`}${displayedAmbiguities.length ? `\nAmbiguities: ${displayedAmbiguities.join("; ")}` : ""}`),
-			components: proposalReviewComponents(proposal.id, displayedAction, redisplayed?.rag_candidates ?? ragCandidates),
+			components: proposalReviewComponents(proposal.id, displayedAction, redisplayed?.rag_candidates ?? ragCandidates, true),
 		};
 		if (proposal.revised) await updateProposalReviewCard(interaction, services, proposal.id, reviewPayload);
 		await deliverProposalReply(interaction, services, proposal.id, reviewPayload, !proposal.reused, replaceReply);
@@ -2074,7 +2121,7 @@ async function completeAiCandidate(
 	}
 	const reviewPayload: InteractionEditReplyOptions = {
 		content: boundedDiscordContent(`${cardBody}${displayedAmbiguities.length ? `\n\nAmbiguities: ${displayedAmbiguities.join("; ")}` : ""}`),
-		components: proposalReviewComponents(proposal.id, displayedAction, displayedAction === "create" ? redisplayed?.rag_candidates ?? ragCandidates : []),
+		components: proposalReviewComponents(proposal.id, displayedAction, displayedAction === "create" ? redisplayed?.rag_candidates ?? ragCandidates : [], displayedAction === "create" || Boolean(redisplayed?.target_work_package_id)),
 	};
 	if (proposal.revised) await updateProposalReviewCard(interaction, services, proposal.id, reviewPayload);
 	await deliverProposalReply(interaction, services, proposal.id, reviewPayload, !proposal.reused, replaceReply);
@@ -2098,8 +2145,44 @@ async function handleSensitiveOverrideButton(interaction: ButtonInteraction, ser
 
 type StoredProposal = NonNullable<Awaited<ReturnType<Database["proposal"]>>>;
 
+async function storedProposalReviewPayload(interaction: TaskInteraction | StringSelectMenuInteraction | MessageContextMenuCommandInteraction, services: Services, proposal: StoredProposal): Promise<InteractionEditReplyOptions> {
+	if (proposal.action !== "create" && proposal.target_work_package_id) {
+		const target = await services.openProject.workPackage(proposal.target_work_package_id);
+		const projectId = (target.project?.id ?? Number(target._links.project?.href.split("/").at(-1))) || proposal.project_id || undefined;
+		const operations = describeProposalOperations(proposal.content_operation ?? "none", proposal.metadata_patch,
+			await proposalMetadataDisplayNames(interaction.guild!, services, proposal.metadata_patch, projectId));
+		return {
+			content: boundedDiscordContent(`Proposal will ${proposal.action} OpenProject task ${workPackageMarkdownLink(target.id, target.subject, services.openProject.workPackageUrl(target.id))}\nProposed title: **${proposal.title}**\n${operations.map(item => `- ${item}`).join("\n")}${formatProposalContent(proposal.content_operation ?? "none", proposal.content_markdown)}${proposal.ambiguities.length ? `\n\nAmbiguities: ${proposal.ambiguities.join("; ")}` : ""}`),
+			components: proposalReviewComponents(proposal.id, proposal.action, proposal.rag_candidates, true),
+		};
+	}
+	const projectId = proposal.project_id ?? undefined;
+	const sizeId = proposal.size_href ? Number(proposal.size_href.split("/").at(-1)) : undefined;
+	const [projects, assignee, accountable, priorities, sizes] = await Promise.all([
+		services.openProject.projects(),
+		proposal.assignee_discord_id ? interaction.guild!.members.fetch(proposal.assignee_discord_id).catch(() => null) : null,
+		proposal.accountable_discord_id ? interaction.guild!.members.fetch(proposal.accountable_discord_id).catch(() => null) : null,
+		services.openProject.priorities(),
+		projectId ? services.openProject.sizeOptions(projectId) : [],
+	]);
+	const unresolved = proposal.action !== "create";
+	const details = [
+		`Project: ${projects.find(item => item.id === projectId)?.name ?? "Not resolved"}`,
+		`Assignee: ${assignee?.displayName ?? "Not inferred"}`,
+		`Accountable: ${accountable?.displayName ?? "Not resolved"}`,
+		`Priority: ${priorities.find(item => item.id === proposal.priority_id)?.name ?? "Not inferred"}`,
+		`Size: ${sizes.find(item => item.id === sizeId)?.value ?? "Not inferred"}`,
+		`Dates: ${databaseDate(proposal.start_date) ?? "Not set"} -> ${databaseDate(proposal.due_date) ?? "Not set"}`,
+		`Estimate: ${proposal.estimated_hours == null ? "Not inferred" : `${proposal.estimated_hours}h`}`,
+	].join("\n");
+	return {
+		content: boundedDiscordContent(`${unresolved ? `**Target required for proposed ${proposal.action}**\n` : ""}**${proposal.title}**\n${proposal.description}\n\n${details}${proposal.ambiguities.length ? `\n\nAmbiguities: ${proposal.ambiguities.join("; ")}` : ""}`),
+		components: proposalReviewComponents(proposal.id, proposal.action, proposal.rag_candidates, !unresolved),
+	};
+}
+
 async function applyExistingProposalTarget(
-	interaction: ButtonInteraction | StringSelectMenuInteraction,
+	interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction,
 	services: Services,
 	proposal: StoredProposal,
 	targetId: number,
@@ -2111,7 +2194,6 @@ async function applyExistingProposalTarget(
 	if (!targetProjectId || !(await services.openProject.projects()).some(project => project.id === targetProjectId)) {
 		throw new Error("The suggested task is not in an active OpenProject project.");
 	}
-	if (selectedCandidate && selectedCandidate.projectId !== targetProjectId) throw new Error("The suggested task moved projects. Run extraction again before selecting it.");
 	const fieldNames: Record<string, MetadataFieldName> = {
 		subject: "subject", assigneeDiscordId: "assignee", priorityId: "priority", sizeHref: "size",
 		startDate: "start_date", dueDate: "due_date", estimatedHours: "estimated_hours",
@@ -2138,19 +2220,11 @@ async function applyExistingProposalTarget(
 			estimatedHours: proposal.estimated_hours == null ? undefined : Number(proposal.estimated_hours),
 		},
 	});
-	if (proposal.action === "create") {
-		await services.db.convertProposalToUpdate({
-			id: proposal.id, projectId: targetProjectId, targetWorkPackageId: target.id, targetLockVersion: target.lockVersion,
-			metadataPatch: operations.metadataPatch, contentOperation: operations.contentOperation, contentMarkdown: operations.contentMarkdown,
-		});
-	} else {
-		if (!proposal.target_work_package_id) throw new Error("This proposal has no current target.");
-		await services.db.retargetProposal({
-			id: proposal.id, expectedTargetWorkPackageId: proposal.target_work_package_id,
-			projectId: targetProjectId, targetWorkPackageId: target.id, targetLockVersion: target.lockVersion,
-			metadataPatch: operations.metadataPatch, contentOperation: operations.contentOperation, contentMarkdown: operations.contentMarkdown,
-		});
-	}
+	await services.db.resolveProposalTarget({
+		id: proposal.id, expectedAction: proposal.action, expectedTargetWorkPackageId: proposal.target_work_package_id ?? undefined,
+		projectId: targetProjectId, targetWorkPackageId: target.id, targetLockVersion: target.lockVersion,
+		metadataPatch: operations.metadataPatch, contentOperation: operations.contentOperation, contentMarkdown: operations.contentMarkdown,
+	});
 	if (selectedCandidate) {
 		await services.db.logTaskEvent(target.id, "rag_target_selected", interaction.user.id, {
 			proposalId: proposal.id,
@@ -2160,13 +2234,11 @@ async function applyExistingProposalTarget(
 			retrievalScore: selectedCandidate.similarity,
 		}).catch(error => console.error("RAG target selection audit failed", { proposalId: proposal.id, error: (error as Error).message }));
 	}
-	const resultingAction = proposal.action === "create" ? "update" : proposal.action;
-	const buttons = manualProposalButtons(proposal.id, resultingAction);
-	await interaction.editReply({
-		content: boundedDiscordContent(`Proposal will ${resultingAction} OpenProject task ${workPackageMarkdownLink(target.id, target.subject, services.openProject.workPackageUrl(target.id))}\nProposed title: **${proposal.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch, await proposalMetadataDisplayNames(interaction.guild!, services, operations.metadataPatch, targetProjectId)).map(item => `- ${item}`).join("\n")}${formatProposalContent(operations.contentOperation, operations.contentMarkdown)}${proposal.ambiguities.length ? `\n\nAmbiguities: ${proposal.ambiguities.join("; ")}` : ""}`),
-		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons)],
-		allowedMentions: { parse: [] },
-	});
+	const resolved = await services.db.proposal(proposal.id);
+	if (!resolved) throw new Error("The resolved proposal could not be loaded.");
+	const payload = await storedProposalReviewPayload(interaction, services, resolved);
+	await updateProposalReviewCard(interaction, services, proposal.id, payload);
+	await interaction.editReply({ ...payload, allowedMentions: { parse: [] } });
 }
 
 export async function handleProposalTargetSelect(interaction: StringSelectMenuInteraction, services: Services) {
@@ -2191,7 +2263,7 @@ export async function handleProposalTargetSelect(interaction: StringSelectMenuIn
 }
 
 export async function handleProposalButton(interaction: ButtonInteraction, services: Services) {
-	if (!interaction.customId.startsWith("op-review:") && !interaction.customId.startsWith("op-dismiss:") && !interaction.customId.startsWith("op-dismiss-no-task:") && !interaction.customId.startsWith("op-incorrect:") && !interaction.customId.startsWith("op-duplicate:") && !interaction.customId.startsWith("op-use-existing:")) return;
+	if (!interaction.customId.startsWith("op-review:") && !interaction.customId.startsWith("op-dismiss:") && !interaction.customId.startsWith("op-dismiss-no-task:") && !interaction.customId.startsWith("op-incorrect:") && !interaction.customId.startsWith("op-duplicate:") && !interaction.customId.startsWith("op-use-existing:") && !interaction.customId.startsWith("op-choose-target:") && !interaction.customId.startsWith("op-edit-details:")) return;
 	const id = interaction.customId.split(":")[1];
 	const proposal = await services.db.proposal(id);
 	if (!proposal || !proposalIsReviewable(proposal) || !await canReviewProposal(interaction, proposal, services)) throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
@@ -2212,10 +2284,39 @@ export async function handleProposalButton(interaction: ButtonInteraction, servi
 		}
 		return;
 	}
-	if (proposal.action !== "create" && (!proposal.operation_schema_version || !proposal.content_operation || !proposal.target_work_package_id || proposal.target_lock_version === null)) {
+	if (proposal.action !== "create" && proposal.target_work_package_id && (!proposal.operation_schema_version || !proposal.content_operation || proposal.target_lock_version === null)) {
 		await services.db.supersedeLegacyProposal(proposal.id);
 		await removeProposalReviewCard(interaction.client, services.db, proposal);
 		throw new Error("This older update proposal was invalidated. Extract the discussion again.");
+	}
+	if (interaction.customId.startsWith("op-choose-target:")) {
+		const modal = new ModalBuilder().setCustomId(`op-target-id:${proposal.id}`).setTitle("Choose OpenProject task");
+		modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(
+			new TextInputBuilder().setCustomId("target_id").setLabel("OpenProject task ID").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(10)
+				.setValue(proposal.target_work_package_id?.toString() ?? ""),
+		));
+		await interaction.showModal(modal);
+		return;
+	}
+	if (interaction.customId.startsWith("op-edit-details:")) {
+		if (proposal.action !== "create") throw new Error("Only new-task proposals have editable creation details.");
+		const [accountable, priorities, sizes] = await Promise.all([
+			proposal.accountable_discord_id ? interaction.guild!.members.fetch(proposal.accountable_discord_id).catch(() => null) : null,
+			services.openProject.priorities(),
+			proposal.project_id ? services.openProject.sizeOptions(proposal.project_id) : [],
+		]);
+		const sizeId = proposal.size_href ? Number(proposal.size_href.split("/").at(-1)) : undefined;
+		const modal = new ModalBuilder().setCustomId(`op-edit-details:${proposal.id}`).setTitle("Edit task details");
+		const fields = [
+			new TextInputBuilder().setCustomId("accountable").setLabel("Accountable name or Discord ID (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(accountable?.displayName ?? ""),
+			new TextInputBuilder().setCustomId("priority").setLabel("Priority name or ID (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(priorities.find(item => item.id === proposal.priority_id)?.name ?? ""),
+			new TextInputBuilder().setCustomId("size").setLabel("Size name or ID (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(sizes.find(item => item.id === sizeId)?.value ?? ""),
+			new TextInputBuilder().setCustomId("start_date").setLabel("Start date YYYY-MM-DD (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(databaseDate(proposal.start_date) ?? ""),
+			new TextInputBuilder().setCustomId("estimated_hours").setLabel("Estimated hours (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(proposal.estimated_hours?.toString() ?? ""),
+		];
+		modal.addComponents(...fields.map(field => new ActionRowBuilder<TextInputBuilder>().addComponents(field)));
+		await interaction.showModal(modal);
+		return;
 	}
 	if (interaction.customId.startsWith("op-use-existing:")) {
 		const targetId = Number(interaction.customId.split(":")[2]);
@@ -2255,6 +2356,9 @@ export async function handleProposalButton(interaction: ButtonInteraction, servi
 			await services.db.clearProposalReviewMessage(proposal.id, interaction.message.id);
 		}
 		return;
+	}
+	if (proposal.action !== "create" && !proposal.target_work_package_id) {
+		throw new Error("Choose the target OpenProject task before applying this proposal.");
 	}
 	const project = proposal.project_id ? (await services.openProject.projects()).find(item => item.id === proposal.project_id) : undefined;
 	const assignee = proposal.assignee_discord_id ? await interaction.guild!.members.fetch(proposal.assignee_discord_id).catch(() => null) : null;
@@ -2406,9 +2510,45 @@ async function handleFinalCreationButton(interaction: ButtonInteraction, service
 }
 
 async function handleModal(interaction: ModalSubmitInteraction, services: Services) {
-	if (!interaction.customId.startsWith("op-task:") && !interaction.customId.startsWith("op-task2:") && !interaction.customId.startsWith("op-ai:") && !interaction.customId.startsWith("op-edit-create:")) return;
+	if (!interaction.customId.startsWith("op-task:") && !interaction.customId.startsWith("op-task2:") && !interaction.customId.startsWith("op-ai:") && !interaction.customId.startsWith("op-edit-create:") && !interaction.customId.startsWith("op-target-id:") && !interaction.customId.startsWith("op-edit-details:")) return;
 	await interaction.deferReply({ ephemeral: true });
 	const entityId = interaction.customId.split(":")[1];
+	if (interaction.customId.startsWith("op-target-id:")) {
+		const proposal = await services.db.proposal(entityId);
+		if (!proposal || !proposalIsReviewable(proposal) || !await canReviewProposal(interaction, proposal, services)) throw new Error("You are not permitted to review this proposal, or it is no longer pending.");
+		const targetId = Number(interaction.fields.getTextInputValue("target_id").trim());
+		if (!Number.isSafeInteger(targetId) || targetId <= 0) throw new Error("Enter a valid positive OpenProject task ID.");
+		await applyExistingProposalTarget(interaction, services, proposal, targetId);
+		return;
+	}
+	if (interaction.customId.startsWith("op-edit-details:")) {
+		const proposal = await services.db.proposal(entityId);
+		if (!proposal || proposal.action !== "create" || !proposalIsReviewable(proposal) || !await canReviewProposal(interaction, proposal, services)) throw new Error("You are not permitted to edit this proposal, or it is no longer pending.");
+		const accountableId = await resolveAssigneeInput(interaction.fields.getTextInputValue("accountable"), interaction.guild!);
+		const priorityInput = interaction.fields.getTextInputValue("priority").trim();
+		const priorities = await services.openProject.priorities();
+		const priority = priorityInput ? priorities.find(item => String(item.id) === priorityInput || item.name.toLocaleLowerCase() === priorityInput.toLocaleLowerCase()) : undefined;
+		if (priorityInput && !priority) throw new Error("Choose a current priority name or ID.");
+		const sizeInput = interaction.fields.getTextInputValue("size").trim();
+		const sizes = proposal.project_id ? await services.openProject.sizeOptions(proposal.project_id) : [];
+		const size = sizeInput ? sizes.find(item => String(item.id) === sizeInput || item.value.toLocaleLowerCase() === sizeInput.toLocaleLowerCase()) : undefined;
+		if (sizeInput && !size) throw new Error(proposal.project_id ? "Choose a size available in this project." : "Resolve the proposal project before choosing a size.");
+		const startDate = validIsoDate(interaction.fields.getTextInputValue("start_date").trim() || undefined);
+		const estimateInput = interaction.fields.getTextInputValue("estimated_hours").trim();
+		const estimatedHours = estimateInput ? Number(estimateInput) : undefined;
+		if (estimatedHours !== undefined && (!Number.isFinite(estimatedHours) || estimatedHours < 0)) throw new Error("Estimated hours must be a non-negative number.");
+		await services.db.updateProposalMetadata(proposal.id, interaction.user.id, {
+			accountableId: accountableId ?? null, priorityId: priority?.id ?? null,
+			sizeHref: size ? `/api/v3/custom_options/${size.id}` : null,
+			startDate: startDate ?? null, estimatedHours: estimatedHours ?? null,
+		});
+		const updated = await services.db.proposal(proposal.id);
+		if (!updated) throw new Error("The edited proposal could not be loaded.");
+		const payload = await storedProposalReviewPayload(interaction, services, updated);
+		await updateProposalReviewCard(interaction, services, proposal.id, payload);
+		await interaction.editReply({ content: "Proposal details updated.", components: [] });
+		return;
+	}
 	if (interaction.customId.startsWith("op-edit-create:")) {
 		const current = await creationDraft(entityId, interaction.user.id, services);
 		await services.db.failDraft(entityId, "edited");

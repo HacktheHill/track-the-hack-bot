@@ -5,16 +5,16 @@ import { OpenProjectClient, workPackageChangesApplied } from "../dist/openprojec
 import { explicitWorkPackageId, lexicalTitleSimilarity, OpenProjectRag, resolveProposalTarget, resolveProposedAction } from "../dist/rag.js";
 import { embeddingContentHash } from "../dist/embeddings.js";
 
-test("untracked artifact updates fall back to new work while tracked transitions retain their action", () => {
+test("unresolved existing-task actions retain their requested operation", () => {
 	assert.equal(resolveProposedAction("create", false), "create");
 	assert.equal(resolveProposedAction("create", true), "create");
-	assert.equal(resolveProposedAction("update", false), "create");
+	assert.equal(resolveProposedAction("update", false), "update");
 	assert.equal(resolveProposedAction("complete", true), "complete");
 });
 
-test("completion and reopen require targets while targetless updates become create proposals", () => {
-	assert.equal(resolveProposedAction("update", false), "create");
-	assert.equal(resolveProposedAction("complete", false), "no_action");
+test("targetless transitions remain pending operation candidates", () => {
+	assert.equal(resolveProposedAction("update", false), "update");
+	assert.equal(resolveProposedAction("complete", false), "complete");
 	assert.equal(resolveProposedAction("reopen", true), "reopen");
 });
 
@@ -70,9 +70,29 @@ test("an invalid explicit target never falls back to a semantic match", async ()
 		suggestedMatch: { workPackageId: 99, similarity: 0.9 },
 		workPackage: async () => { throw new Error("not found"); },
 	});
-	assert.equal(result.action, "no_action");
+	assert.equal(result.action, "update");
 	assert.equal(result.match, undefined);
 	assert.equal(result.target, undefined);
+});
+
+test("fresh RAG target state adopts a moved task's current project", async () => {
+	const result = await resolveProposalTarget({
+		action: "update", sourceTexts: ["Update the prospectus"], openProjectBaseUrl: "https://projects.example.org",
+		projectId: 7, ragMode: "review", suggestedMatch: { workPackageId: 42, similarity: 0.9 },
+		workPackage: async id => ({ id, subject: "Prospectus", lockVersion: 4, project: { id: 9 }, _links: {} }),
+	});
+	assert.equal(result.match.workPackageId, 42);
+	assert.equal(result.projectId, 9);
+});
+
+test("deleted RAG suggestions degrade to an unresolved proposal", async () => {
+	const result = await resolveProposalTarget({
+		action: "complete", sourceTexts: ["Complete the prospectus"], openProjectBaseUrl: "https://projects.example.org",
+		projectId: 7, ragMode: "review", suggestedMatch: { workPackageId: 42, similarity: 0.9 },
+		workPackage: async () => { throw new Error("deleted"); },
+	});
+	assert.equal(result.action, "complete");
+	assert.equal(result.match, undefined);
 });
 
 test("an explicit target may replace the channel default project", async () => {

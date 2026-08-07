@@ -6,11 +6,10 @@ import type { RagRerankCandidate, RagRerankResult } from "./azure-openai.js";
 
 export function resolveProposedAction(
 	action: "create" | "update" | "complete" | "reopen",
-	hasTarget: boolean,
+	_hasTarget: boolean,
 ) {
 	if (action === "create") return "create" as const;
-	if (action === "update" && !hasTarget) return "create" as const;
-	return hasTarget ? action : "no_action" as const;
+	return action;
 }
 
 export function explicitWorkPackageId(texts: readonly string[], openProjectBaseUrl?: string) {
@@ -89,9 +88,9 @@ export async function resolveProposalTarget(options: {
 		}
 	} else if (options.ragMode === "review" && options.suggestedMatch) {
 		match = options.suggestedMatch;
-		target = await options.workPackage(match.workPackageId);
+		target = await options.workPackage(match.workPackageId).catch(() => undefined);
 		const targetProjectId = workPackageProjectId(target);
-		if (!targetProjectId || (projectId && targetProjectId !== projectId)) {
+		if (!targetProjectId) {
 			match = undefined;
 			target = undefined;
 		} else {
@@ -99,9 +98,7 @@ export async function resolveProposalTarget(options: {
 		}
 	}
 	const requestedAction = authoritativeTargetId && options.action === "create" ? "update" : options.action;
-	const action = authoritativeTargetId !== undefined && !target
-		? "no_action" as const
-		: resolveProposedAction(requestedAction, Boolean(target));
+	const action = resolveProposedAction(requestedAction, Boolean(target));
 	return { action, projectId, match, target };
 }
 

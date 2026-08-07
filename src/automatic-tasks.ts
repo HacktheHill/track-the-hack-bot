@@ -9,7 +9,7 @@ import { describeProposalOperations, formatProposalContent, planExistingTaskOper
 import { isExcludedChannel, projectIdForTeamRoles, projectIdFromChannelNames, resolveProjectId } from "./project-resolution.js";
 
 type AutomaticServices = { config: IntegrationConfig; db: Database; extractor: TaskExtractor; openProject: OpenProjectClient; rag?: OpenProjectRag };
-type Batch = { messages: Message[]; timer: NodeJS.Timeout };
+type Batch = { messages: Message[]; reconciliationSourceIds: Set<string>; timer: NodeJS.Timeout };
 type ReviewCardPayload = Pick<MessageCreateOptions, "content" | "components" | "allowedMentions">;
 
 function combinedUsage(...usages: Array<{ promptTokens?: number; completionTokens?: number; totalTokens?: number } | undefined>) {
@@ -70,6 +70,10 @@ export function proposalOwnerText(assigneeName?: string, accountableName?: strin
 
 export function messageRevisionChanged(previousContent: string | undefined, currentContent: string, previousAttachments: string, currentAttachments: string) {
 	return previousContent === undefined || previousContent !== currentContent || previousAttachments !== currentAttachments;
+}
+
+export function sourceEditShouldReconcile(mode: IntegrationConfig["OPENPROJECT_AUTOMATION_MODE"], affectedProposalIds: readonly string[]) {
+	return mode === "review" || affectedProposalIds.length > 0;
 }
 
 export function reconciledSupersessionIds(input: {
@@ -170,7 +174,6 @@ async function enrichAutomaticContext(messages: Message[], focal: Message) {
 }
 
 export function registerAutomaticTaskDetection(client: Client, services: AutomaticServices) {
-	if (services.config.OPENPROJECT_AUTOMATION_MODE === "off" || !services.extractor.enabled) return;
 	const batches = new Map<string, Batch>();
 	const activeFlushes = new Map<string, Promise<void>>();
 
@@ -178,6 +181,8 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 		const batch = batches.get(channelId);
 		if (!batch) return;
 		batches.delete(channelId);
+		if (!services.extractor.enabled) return;
+		const sourceReconciliation = batch.reconciliationSourceIds.size > 0;
 		const batchSource = automaticBatchSource(batch.messages);
 		if (batchSource[0] && await isExcludedChannel(batchSource[0].channelId, batchSource[0].guild!, services.config.excludedChannelIds)) return;
 		const seenCandidates: Array<{ title: string; action: string; projectId?: number; targetWorkPackageId?: number; assigneeId?: string }> = [];
@@ -288,7 +293,10 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			}
 			const reconciledTasks = reconciliation.proposals;
 			const gate = completedGate = await services.extractor.assessAutomaticCandidates(extraction.inputMessages, reconciledTasks.map(item => item.candidate));
-			const eligibleTasks = reconciledTasks.filter((_, index) => automaticCandidateEligible(gate.assessments[index]));
+			const eligibleTasks = reconciledTasks.filter((item, index) => automaticCandidateEligible(gate.assessments[index]) && (
+				!sourceReconciliation || Boolean(item.pendingProposalId && affectedPendingProposalIds.includes(item.pendingProposalId)
+					&& item.candidate.source_message_ids.some(id => batch.reconciliationSourceIds.has(id)))
+			));
 			const candidateAssessments = reconciledTasks.map(({ candidate: task }, index) => ({
 				...gate.assessments[index],
 				automaticEligibility: automaticCandidateEligible(gate.assessments[index]) ? "eligible" : "ineligible",
@@ -344,11 +352,53 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 				});
 				projectId = targetResolution.projectId;
 				const { action, match, target } = targetResolution;
-				if (action === "no_action") continue;
-				if (action !== "create" && !match) continue;
 				const candidateSizes = projectId === channelProjectId ? sizes : projectId ? await services.openProject.sizeOptions(projectId) : [];
 				let size = task.size_name ? candidateSizes.find(item => item.value.toLocaleLowerCase() === task.size_name!.toLocaleLowerCase()) : undefined;
 				const metadataInference = { priority: priority === undefined, size: size === undefined, estimate: estimatedHours === undefined };
+				if (action !== "create" && !match) {
+					const provisional = planExistingTaskOperations({
+						workPackage: { description: "Existing task" }, requestedAction: action, contentIntent: "none", description: "",
+						metadataFields: task.metadata_change_fields,
+						values: { title: task.title, assigneeDiscordId: assigneeId, priorityId: priority?.id,
+							sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined, startDate: task.start_date ?? undefined,
+							dueDate: task.due_date ?? undefined, estimatedHours },
+					});
+					const contentOperation = task.content_intent === "update_note" ? "postComment" : task.content_intent === "replace_description" ? "descriptionReplacement" : "none";
+					if (services.config.OPENPROJECT_AUTOMATION_MODE === "shadow" && !sourceReconciliation) {
+						createdProposals++;
+						continue;
+					}
+					const reviewers = new Set(source.filter(message => task.source_message_ids.includes(message.id)).map(message => message.author.id));
+					const proposal = await services.db.createProposal({
+						preferredProposalId: pendingProposalId, permittedExistingProposalIds, channelId, projectId,
+						title: task.title, description, assigneeDiscordId: assigneeId, accountableDiscordId: accountableId,
+						priorityId: priority?.id, sizeHref: size ? `/api/v3/custom_options/${size.id}` : undefined,
+						startDate: task.start_date ?? undefined, dueDate: task.due_date ?? undefined,
+						estimatedHours, metadataInference,
+						sourceMessageIds: task.source_message_ids, sourceLinks, sourceAttachments, ragCandidates,
+						modelDeployment: deployment, permittedReviewerIds: [...reviewers], evidence: task.evidence,
+						ambiguities: [...ambiguities, "Target OpenProject task must be selected before applying."],
+						latencyMs: pipelineLatencyMs, tokenUsage: pipelineUsage, action,
+						metadataPatch: provisional.metadataPatch, contentOperation, contentMarkdown: contentOperation === "none" ? null : description,
+						workItemKey: task.work_item_key, sourceContentHash: sourceContentHash(task.source_message_ids.map(id => ({ id, text: sourceRecords.get(id)?.text ?? "", attachments: sourceRecords.get(id)?.attachments }))),
+						retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS,
+					});
+					proposalIds.add(proposal.id);
+					const stored = await services.db.proposal(proposal.id);
+					if (stored) {
+						const reviewPayload: ReviewCardPayload = {
+							content: boundedDiscordContent(`Target required for proposed ${action}: **${task.title}**\n${description}`),
+							components: proposalReviewComponents(proposal.id, action, ragCandidates, false), allowedMentions: { parse: [] },
+						};
+						if (proposal.revised) await updateStoredReviewCard(primary, services, proposal.id, reviewPayload);
+						else if (services.config.OPENPROJECT_AUTOMATION_MODE === "review" && primary.channel.isSendable()) {
+							const reviewMessage = await primary.channel.send(reviewPayload);
+							await services.db.setProposalReviewMessage(proposal.id, reviewMessage.id);
+						}
+					}
+					createdProposals++;
+					continue;
+				}
 				if (action === "create") {
 					const inferredMetadata = inferCreationMetadata({
 						title: task.title,
@@ -385,7 +435,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 						duplicates++;
 						continue;
 					}
-					if (services.config.OPENPROJECT_AUTOMATION_MODE === "shadow") {
+					if (services.config.OPENPROJECT_AUTOMATION_MODE === "shadow" && !sourceReconciliation) {
 						seenCandidates.push({ title: task.title, action, projectId, targetWorkPackageId: match.workPackageId, assigneeId });
 						createdProposals++;
 						continue;
@@ -422,7 +472,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					});
 					const reviewPayload: ReviewCardPayload = {
 						content: boundedDiscordContent(`${ownerText}Proposed ${action} for OpenProject task ${workPackageMarkdownLink(target!.id, target!.subject, services.openProject.workPackageUrl(target!.id))}\nProposed title: **${task.title}**\n${describeProposalOperations(operations.contentOperation, operations.metadataPatch, { assignee: assigneeId ? assignee?.displayName ?? assignee?.user.username : undefined, priority: priority?.name, size: size?.value }).map(item => `- ${item}`).join("\n")}${operations.contentOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : ""}${formatProposalContent(operations.contentOperation, operations.contentMarkdown)}${ambiguities.length ? `\n\nAmbiguities: ${ambiguities.join("; ")}` : ""}`),
-						components: proposalReviewComponents(proposal.id, action, ragCandidates),
+						components: proposalReviewComponents(proposal.id, action, ragCandidates, true),
 						allowedMentions: { parse: [] },
 					};
 					proposalIds.add(proposal.id);
@@ -462,7 +512,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					duplicates++;
 					continue;
 				}
-				if (services.config.OPENPROJECT_AUTOMATION_MODE === "shadow") {
+				if (services.config.OPENPROJECT_AUTOMATION_MODE === "shadow" && !sourceReconciliation) {
 					seenCandidates.push({ title: task.title, action, projectId, assigneeId });
 					createdProposals++;
 					continue;
@@ -523,7 +573,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					}
 				}
 			}
-			if (services.config.OPENPROJECT_AUTOMATION_MODE !== "shadow") {
+			if (services.config.OPENPROJECT_AUTOMATION_MODE !== "shadow" || sourceReconciliation) {
 				const supersededIds = reconciledSupersessionIds({
 					reconciledCount: reconciledTasks.length, eligibleCount: eligibleTasks.length, extractedCount: result.tasks.length,
 					reconciliationSucceeded, persistedProposalIds: proposalIds,
@@ -609,7 +659,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 		activeFlushes.set(channelId, next);
 	};
 
-	const enqueueMessage = async (message: Message) => {
+	const enqueueMessage = async (message: Message, reconciliationSourceId?: string) => {
 		if (!message.inGuild() || !isOrganizerGuild(services.config, message.guildId) || message.author.bot || message.system) return;
 		if (await isExcludedChannel(message.channelId, message.guild!, services.config.excludedChannelIds)) return;
 		const existing = batches.get(message.channelId);
@@ -618,9 +668,14 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			.sort((left, right) => left.createdTimestamp - right.createdTimestamp)
 			.slice(-30);
 		const timer = setTimeout(() => enqueueFlush(message.channelId), services.config.OPENPROJECT_BATCH_IDLE_SECONDS * 1000);
-		batches.set(message.channelId, { messages, timer });
+		batches.set(message.channelId, {
+			messages,
+			reconciliationSourceIds: new Set([...(existing?.reconciliationSourceIds ?? []), ...(reconciliationSourceId ? [reconciliationSourceId] : [])]),
+			timer,
+		});
 	};
 	client.on("messageCreate", message => {
+		if (services.config.OPENPROJECT_AUTOMATION_MODE === "off" || !services.extractor.enabled) return;
 		void enqueueMessage(message).catch(error => console.error("Automatic task message enqueue failed", { channelId: message.channelId, error: (error as Error).message }));
 	});
 	client.on("messageUpdate", (previous, updated) => {
@@ -630,8 +685,24 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 			const previousAttachments = previous.partial ? "" : [...previous.attachments.values()].map(attachment => `${attachment.id}:${attachment.url}`).join("|");
 			const currentAttachments = [...message.attachments.values()].map(attachment => `${attachment.id}:${attachment.url}`).join("|");
 			if (!messageRevisionChanged(previous.partial ? undefined : previous.content, message.content, previousAttachments, currentAttachments)) return;
-			await enqueueMessage(message);
+			const affected = await services.db.pendingProposalsForSourceMessage(message.id);
+			if (!sourceEditShouldReconcile(services.config.OPENPROJECT_AUTOMATION_MODE, affected)) return;
+			await enqueueMessage(message, affected.length ? message.id : undefined);
 		})().catch(error => console.error("Automatic task message update enqueue failed", { channelId: updated.channelId, error: (error as Error).message }));
 	});
-	console.log(`Automatic task extraction enabled in ${services.config.OPENPROJECT_AUTOMATION_MODE} mode`);
+	client.on("messageDelete", message => {
+		void (async () => {
+			const superseded = await services.db.supersedePendingProposalsForDeletedSource(message.id);
+			for (const proposal of superseded) {
+				if (!proposal.review_message_id) continue;
+				const channel = await client.channels.fetch(proposal.channel_id).catch(() => null);
+				if (channel?.isTextBased() && "messages" in channel) {
+					const card = await channel.messages.fetch(proposal.review_message_id).catch(() => null);
+					if (card) await card.edit({ content: "This proposal was superseded because a cited source message was deleted.", components: [] }).catch(() => undefined);
+				}
+				await services.db.clearProposalReviewMessage(proposal.id, proposal.review_message_id);
+			}
+		})().catch(error => console.error("Deleted task source reconciliation failed", { messageId: message.id, error: (error as Error).message }));
+	});
+	console.log(`Automatic task source maintenance enabled; new extraction mode is ${services.config.OPENPROJECT_AUTOMATION_MODE}`);
 }
