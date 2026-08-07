@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { config as loadDotEnv } from "dotenv";
 import { z } from "zod";
-import { automaticCandidateEligible, automaticTransitionEligible, AzureTaskExtractor, extractedTaskSchema, mergeRelatedTaskCandidates, StructuredOutputError, type AutomaticCandidateAssessment, type ExtractedTasks, type MinimizedMessage } from "./azure-openai.js";
+import { automaticCandidateEligible, AzureTaskExtractor, extractedTaskSchema, mergeRelatedTaskCandidates, StructuredOutputError, type AutomaticCandidateAssessment, type ExtractedTasks, type MinimizedMessage } from "./azure-openai.js";
 import { contentHash, corpusWindowSchema, parseCorpusJsonl } from "./ai-corpus.js";
 import type { IntegrationConfig } from "./config.js";
 import { taskReferencesAreValid } from "./task-proposals.js";
@@ -196,13 +196,13 @@ function sleep(milliseconds: number) {
 	return new Promise(resolveSleep => setTimeout(resolveSleep, milliseconds));
 }
 
-const EVALUATOR_PIPELINE_VERSION = "automatic-v3.8";
+const EVALUATOR_PIPELINE_VERSION = "automatic-v3.6";
 const evaluationTraceSchema = z.object({
 	extractedCandidates: z.number().int().min(0),
 	referenceValidCandidates: z.number().int().min(0),
 	groundedCandidates: z.number().int().min(0),
 	finalCandidates: z.number().int().min(0),
-	gateCriteriaFailures: z.object({ transition: z.number().int().min(0), activation: z.number().int().min(0), remainingWork: z.number().int().min(0), durability: z.number().int().min(0), decisionReadiness: z.number().int().min(0), sensitivity: z.number().int().min(0) }),
+	gateCriteriaFailures: z.object({ activation: z.number().int().min(0), remainingWork: z.number().int().min(0), durability: z.number().int().min(0), decisionReadiness: z.number().int().min(0), sensitivity: z.number().int().min(0) }),
 });
 export const evaluationCacheEntrySchema = z.object({
 	version: z.literal(EVALUATOR_PIPELINE_VERSION),
@@ -225,7 +225,6 @@ export function evaluationTrace(extractedCandidates: number, referenceValidCandi
 		groundedCandidates,
 		finalCandidates,
 		gateCriteriaFailures: {
-			transition: assessments.filter(item => !automaticTransitionEligible(item)).length,
 			activation: assessments.filter(item => !item.has_activated_specific_work).length,
 			remainingWork: assessments.filter(item => !item.has_remaining_work_or_trackable_transition).length,
 			durability: assessments.filter(item => !item.is_durable).length,
@@ -351,7 +350,7 @@ async function main() {
 	};
 	const stageTotals = {
 		extractedCandidates: 0, referenceValidCandidates: 0, groundedCandidates: 0, finalCandidates: 0,
-		gateCriteriaFailures: { transition: 0, activation: 0, remainingWork: 0, durability: 0, decisionReadiness: 0, sensitivity: 0 },
+		gateCriteriaFailures: { activation: 0, remainingWork: 0, durability: 0, decisionReadiness: 0, sensitivity: 0 },
 	};
 
 	for (const item of selected) {
