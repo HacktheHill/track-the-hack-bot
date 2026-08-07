@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { corpusWindowSchema, evaluationTrace, optionalRatio, proposalDiagnostics, providerFailureCategory, releaseThresholdFailures, retryableProviderFailure, runtimeProposalCandidates } from "../dist/evaluate-ai.js";
+import { corpusWindowSchema, evaluationTrace, optionalRatio, proposalDiagnostics, providerFailureCategory, releaseThresholdFailures, retryableProviderFailure, runtimeProposalCandidates, validEvaluationCacheEntry } from "../dist/evaluate-ai.js";
 import { OpenProjectClient, workPackageChangesApplied } from "../dist/openproject.js";
 import { explicitWorkPackageId, lexicalTitleSimilarity, OpenProjectRag, resolveProposalTarget, resolveProposedAction } from "../dist/rag.js";
 import { embeddingContentHash } from "../dist/embeddings.js";
@@ -119,6 +119,19 @@ test("duplicate predicted source IDs do not bias diagnostic alignment", () => {
 	]);
 	assert.deepEqual(diagnostics.titleConcepts, { matched: 2, expected: 2 });
 	assert.deepEqual(diagnostics.sources, { truePositives: 2, falsePositives: 0, falseNegatives: 1 });
+});
+
+test("AI evaluation caches count only real extracted-task predictions as valid", () => {
+	const trace = { extractedCandidates: 1, referenceValidCandidates: 1, groundedCandidates: 1, finalCandidates: 1, gateCriteriaFailures: { activation: 0, remainingWork: 0, durability: 0, decisionReadiness: 0, sensitivity: 0 } };
+	const task = {
+		title: "Publish map", work_item_key: "venue-map", description: "Publish the map.", assignee_alias: null,
+		start_date: null, due_date: null, priority_name: null, size_name: null, project_name: null, estimated_hours: null,
+		source_message_ids: ["m1"], relevant_attachment_ids: [], evidence: "Approved", proposed_action: "create",
+		content_intent: "none", metadata_change_fields: [],
+	};
+	assert.equal(validEvaluationCacheEntry(JSON.stringify({ version: "automatic-v3.6", predicted: [task], trace })), true);
+	assert.equal(validEvaluationCacheEntry(JSON.stringify({ version: "automatic-v3.6", predicted: [{ title: "partial" }], trace })), false);
+	assert.equal(validEvaluationCacheEntry("not json"), false);
 });
 
 test("exact OpenProject references are resolved without semantic phrase matching", () => {

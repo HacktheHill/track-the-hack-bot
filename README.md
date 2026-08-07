@@ -193,7 +193,11 @@ automatic-gate assessments, and revisions for 90 days. Pending proposals are
 revised when their cited messages or attachments change. Raw Discord transcripts
 are never copied into task descriptions.
 Production uses `review` mode: AI may post a proposal, but only a permitted
-human reviewer can create or dismiss the task.
+human reviewer can create or dismiss the task. Immediately before a proposal is
+claimed for application, every cited Discord message is refetched. Missing or
+inaccessible evidence deterministically supersedes a still-pending proposal;
+deletion listeners never rewrite an already-creating row because its remote
+OpenProject mutation may have started.
 
 `/task link-user` can link Discord members to active or invited OpenProject
 accounts. Linked accounts can be used as Assignee or Accountable without being

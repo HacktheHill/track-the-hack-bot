@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { Database, embeddingVectorTypeMatches } from "../dist/database.js";
+import { assertUniqueConfiguredUserMappings, Database, embeddingVectorTypeMatches, openProjectUserUniqueIndexSql } from "../dist/database.js";
 
 function databaseWithPool(pool) {
 	if (!pool.connect) pool.connect = async () => ({ ...pool, release() {} });
@@ -13,6 +13,12 @@ test("embedding vector dimensions must match the configured column type", () => 
 	assert.equal(embeddingVectorTypeMatches("vector(1536)", 1536), true);
 	assert.equal(embeddingVectorTypeMatches("vector(1024)", 1536), false);
 	assert.equal(embeddingVectorTypeMatches(undefined, 1536), false);
+});
+
+test("OpenProject identity mappings require one Discord user per OpenProject user", () => {
+	assert.doesNotThrow(() => assertUniqueConfiguredUserMappings({ discord1: 10, discord2: 11 }));
+	assert.throws(() => assertUniqueConfiguredUserMappings({ discord1: 10, discord2: 10 }), /ambiguous.*10.*discord1, discord2/i);
+	assert.match(openProjectUserUniqueIndexSql, /UNIQUE INDEX.*openproject_user_id/i);
 });
 
 test("failed task confirmations retain every owner for retry", async () => {
@@ -448,6 +454,18 @@ test("deleted cited sources supersede only pending proposals transactionally", a
 	assert.match(queries[1].sql, /WHERE status='pending_review'/);
 	assert.match(queries[2].sql, /source_deleted/);
 	assert.equal(queries.at(-1).sql, "COMMIT");
+});
+
+test("source preflight invalidation never transitions an already-creating proposal", async () => {
+	const queries = [];
+	const db = databaseWithPool({ async query(sql, values) {
+		queries.push({ sql, values });
+		if (sql.includes("UPDATE task_proposals")) return { rowCount: 0, rows: [] };
+		return { rowCount: null, rows: [] };
+	} });
+	assert.equal(await db.supersedePendingProposalForInvalidSources("proposal", ["deleted"]), false);
+	assert.match(queries[1].sql, /status='pending_review'/);
+	assert.equal(queries.some(({ sql }) => sql.includes("source_invalid_preflight")), false);
 });
 
 test("existing proposals retarget only before any operation is applied", async () => {

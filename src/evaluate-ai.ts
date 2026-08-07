@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { config as loadDotEnv } from "dotenv";
 import { z } from "zod";
-import { automaticCandidateEligible, AzureTaskExtractor, mergeRelatedTaskCandidates, StructuredOutputError, type AutomaticCandidateAssessment, type ExtractedTasks, type MinimizedMessage } from "./azure-openai.js";
+import { automaticCandidateEligible, AzureTaskExtractor, extractedTaskSchema, mergeRelatedTaskCandidates, StructuredOutputError, type AutomaticCandidateAssessment, type ExtractedTasks, type MinimizedMessage } from "./azure-openai.js";
 import { contentHash, corpusWindowSchema, parseCorpusJsonl } from "./ai-corpus.js";
 import type { IntegrationConfig } from "./config.js";
 import { taskReferencesAreValid } from "./task-proposals.js";
@@ -204,11 +204,19 @@ const evaluationTraceSchema = z.object({
 	finalCandidates: z.number().int().min(0),
 	gateCriteriaFailures: z.object({ activation: z.number().int().min(0), remainingWork: z.number().int().min(0), durability: z.number().int().min(0), decisionReadiness: z.number().int().min(0), sensitivity: z.number().int().min(0) }),
 });
-const cachedCaseSchema = z.object({
+export const evaluationCacheEntrySchema = z.object({
 	version: z.literal(EVALUATOR_PIPELINE_VERSION),
-	predicted: z.array(z.unknown()),
+	predicted: z.array(extractedTaskSchema),
 	trace: evaluationTraceSchema,
 });
+
+export function validEvaluationCacheEntry(value: string) {
+	try {
+		return evaluationCacheEntrySchema.safeParse(JSON.parse(value)).success;
+	} catch {
+		return false;
+	}
+}
 
 export function evaluationTrace(extractedCandidates: number, referenceValidCandidates: number, groundedCandidates: number, assessments: AutomaticCandidateAssessment[], finalCandidates: number) {
 	return evaluationTraceSchema.parse({
@@ -228,8 +236,8 @@ export function evaluationTrace(extractedCandidates: number, referenceValidCandi
 
 async function cachedPrediction(directory: string, key: string) {
 	try {
-		const cached = cachedCaseSchema.parse(JSON.parse(await readFile(resolve(directory, `${key}.json`), "utf8")));
-		return { predicted: cached.predicted as ExtractedTask[], trace: cached.trace };
+		const cached = evaluationCacheEntrySchema.parse(JSON.parse(await readFile(resolve(directory, `${key}.json`), "utf8")));
+		return { predicted: cached.predicted, trace: cached.trace };
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		return undefined;

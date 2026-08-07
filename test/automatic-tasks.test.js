@@ -77,7 +77,19 @@ test("proposal supersession requires an affirmative safe transition", () => {
 	}), []);
 	assert.deepEqual(reconciledSupersessionIds({
 		reconciledCount: 0, eligibleCount: 0, extractedCount: 0, reconciliationSucceeded: true,
-		persistedProposalIds: new Set(), recommendedSupersessionIds: ["old"], invalidatableProposalIds: ["old", "multi-source"],
+		persistedProposalIds: new Set(), recommendedSupersessionIds: ["old"], invalidatableProposalIds: ["old"],
+	}), ["old"]);
+	assert.deepEqual(reconciledSupersessionIds({
+		reconciledCount: 0, eligibleCount: 0, extractedCount: 1, reconciliationSucceeded: false,
+		persistedProposalIds: new Set(), recommendedSupersessionIds: ["old"], invalidatableProposalIds: ["old"],
+	}), []);
+	assert.deepEqual(reconciledSupersessionIds({
+		reconciledCount: 0, eligibleCount: 0, extractedCount: 0, reconciliationSucceeded: true,
+		persistedProposalIds: new Set(), recommendedSupersessionIds: ["old", "other"], invalidatableProposalIds: ["old", "other"],
+	}), []);
+	assert.deepEqual(reconciledSupersessionIds({
+		reconciledCount: 0, eligibleCount: 0, extractedCount: 0, reconciliationSucceeded: true,
+		persistedProposalIds: new Set(), recommendedSupersessionIds: ["multi-source"], invalidatableProposalIds: [],
 	}), []);
 	assert.deepEqual(reconciledSupersessionIds({
 		reconciledCount: 1, eligibleCount: 1, extractedCount: 1, reconciliationSucceeded: true,
