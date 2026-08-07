@@ -81,17 +81,18 @@ client.once("clientReady", async () => {
 			extractor,
 			rag,
 		};
+		const organizerGuild = await client.guilds.fetch(integrationConfig.ORGANIZER_GUILD_ID);
+		const initialReconciliation = await reconcileOpenProjectUsers(organizerGuild, integrationConfig, db, services.openProject);
+		console.log("Initial OpenProject identity reconciliation complete", initialReconciliation);
 		registerTaskInteractions(client, services);
 		registerAutomaticTaskDetection(client, services);
 		const cleanupReviewCards = () => void cleanupTerminalProposalCards(client, db)
 			.catch(error => console.error("Proposal review card cleanup failed", { error: (error as Error).message }));
 		cleanupReviewCards();
 		setInterval(cleanupReviewCards, 15 * 60 * 1000).unref();
-		const organizerGuild = await client.guilds.fetch(integrationConfig.ORGANIZER_GUILD_ID);
 		const reconcileIdentities = () => void reconcileOpenProjectUsers(organizerGuild, integrationConfig, db, services.openProject)
 			.then(result => console.log("OpenProject identity reconciliation complete", result))
 			.catch(error => console.error("OpenProject identity reconciliation failed", { error: (error as Error).message }));
-		reconcileIdentities();
 		setInterval(reconcileIdentities, 24 * 60 * 60 * 1000).unref();
 		if (rag?.enabled) {
 			void rag.sync().catch(error => console.error("Initial OpenProject embedding sync failed", { error: (error as Error).message }));

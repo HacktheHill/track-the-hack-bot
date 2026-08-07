@@ -34,6 +34,7 @@ import { attachExtractionDiagnostics, automaticCandidateEligible, containsSensit
 import { resolveProposalTarget, type OpenProjectRag } from "./rag.js";
 import { composeOpenProjectMarkdown, describeProposalOperations, formatGeneratedTaskDescription, formatProposalContent, planExistingTaskOperations, sourceContentHash, taskReferencesAreValid, type MetadataFieldName, type ProposalMetadataPatch } from "./task-proposals.js";
 import { isExcludedChannel, projectIdForName, projectIdForProposedOwner, projectIdForTeamRoles, projectIdFromChannelNames, resolveProjectId } from "./project-resolution.js";
+import { resolveOpenProjectIdentity } from "./identity.js";
 
 export { isExcludedChannel } from "./project-resolution.js";
 
@@ -527,6 +528,32 @@ export function taskOwnerIds(assigneeId?: string, accountableId?: string, derive
 	return [...new Set([assigneeId, accountableId ?? derivedAccountableId].filter((id): id is string => Boolean(id)))];
 }
 
+export function taskIdentityGuidance(discordId: string, relationship: "assignee" | "accountable user") {
+	return `The selected ${relationship} <@${discordId}> could not be uniquely mapped to an unused active or invited OpenProject user. Use /task link-user to map that Discord member explicitly, then retry.`;
+}
+
+async function resolveSelectedOwner(discordId: string, relationship: "assignee" | "accountable user", guild: Guild, services: Services) {
+	const resolution = await resolveOpenProjectIdentity(discordId, guild, services.config, services.db, services.openProject);
+	if (!resolution.openProjectId) throw new Error(taskIdentityGuidance(discordId, relationship));
+	return resolution.openProjectId;
+}
+
+export async function resolveOptionalOwner(
+	discordId: string | undefined,
+	relationship: "assignee" | "accountable user",
+	guild: Guild,
+	services: Services,
+) {
+	if (!discordId) return { discordId: undefined, ambiguity: undefined };
+	try {
+		const resolution = await resolveOpenProjectIdentity(discordId, guild, services.config, services.db, services.openProject);
+		if (resolution.openProjectId) return { discordId, ambiguity: undefined };
+	} catch (error) {
+		return { discordId: undefined, ambiguity: `${relationship} <@${discordId}> was omitted because identity reconciliation failed: ${(error as Error).message}` };
+	}
+	return { discordId: undefined, ambiguity: `${relationship} <@${discordId}> was omitted because it does not uniquely map to an unused active or invited OpenProject user. An organizer can use /task link-user.` };
+}
+
 export function defaultAiDueDate(now: Date, priorityName?: string, sizeName?: string, timeZone = "America/Toronto") {
 	const priorityDays = priorityName?.toLocaleLowerCase() === "immediate" ? 3
 		: priorityName?.toLocaleLowerCase() === "high" ? 7
@@ -758,7 +785,8 @@ async function resolveAssigneeInput(value: string, guild: Guild) {
 	const mention = /^<@!?(\d+)>$/.exec(input);
 	if (mention || /^\d+$/.test(input)) return (mention?.[1] ?? input);
 	const normalized = input.replace(/^@/, "").toLocaleLowerCase();
-	const matches = [...guild.members.cache.values()].filter(member => [
+	const members = await guild.members.fetch();
+	const matches = [...members.values()].filter(member => [
 		member.displayName,
 		member.displayName.replace(/(?:\s*\[[^\]]+\])+\s*$/g, ""),
 		member.user.globalName,
@@ -795,10 +823,8 @@ async function createAndAnnounce(args: {
 	await requireCreator(interaction, services);
 	const guild = interaction.guild!;
 	const assignee = args.assigneeId ? await guild.members.fetch(args.assigneeId) : null;
-	const assigneeOpenProjectId = assignee ? await services.db.openProjectUserId(assignee.id) : undefined;
-	if (assignee && !assigneeOpenProjectId) throw new Error("The assignee is not mapped to OpenProject.");
-	const accountableOverride = args.accountableId ? await services.db.openProjectUserId(args.accountableId) : undefined;
-	if (args.accountableId && !accountableOverride) throw new Error("The accountable user is not mapped to OpenProject.");
+	const assigneeOpenProjectId = assignee ? await resolveSelectedOwner(assignee.id, "assignee", guild, services) : undefined;
+	const accountableOverride = args.accountableId ? await resolveSelectedOwner(args.accountableId, "accountable user", guild, services) : undefined;
 	const accountableMember = !assignee && args.accountableId ? await guild.members.fetch(args.accountableId).catch(() => null) : null;
 	const projectId = await resolveProject(args.projectText, interaction.channelId!, guild, assignee, accountableMember, services);
 	if (!projectId) throw new Error("Select a project; the channel, category, and proposed owner do not resolve to one active OpenProject project.");
@@ -1021,7 +1047,9 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 		const mappings = await services.db.openProjectUserMappings();
 		const collision = [...mappings].find(([discordId, mappedId]) => mappedId === openProjectId && discordId !== discordUser.id);
 		if (collision) throw new Error(`That OpenProject user is already mapped to <@${collision[0]}>.`);
-		await services.db.setOpenProjectUser(discordUser.id, openProjectId);
+		if (!await services.db.claimOpenProjectUser(discordUser.id, openProjectId)) {
+			throw new Error("That OpenProject user was mapped to another Discord member. Refresh the selection and retry.");
+		}
 		await interaction.editReply(`Mapped <@${discordUser.id}> to OpenProject user **${user.name}**.`);
 		return;
 	}
@@ -1081,8 +1109,7 @@ async function handleSlash(interaction: ChatInputCommandInteraction, services: S
 		let event = subcommand;
 		if (subcommand === "assign") {
 			const assignee = interaction.options.getUser("assignee", true);
-			const openProjectId = await services.db.openProjectUserId(assignee.id);
-			if (!openProjectId) throw new Error("The assignee is not mapped to OpenProject.");
+			const openProjectId = await resolveSelectedOwner(assignee.id, "assignee", interaction.guild!, services);
 			await services.openProject.updateWorkPackage(id, { _links: { assignee: { href: `/api/v3/users/${openProjectId}` } } });
 			await services.db.logTaskEvent(id, event, interaction.user.id, { assigneeDiscordId: assignee.id });
 			await interaction.editReply(`Assigned ${services.openProject.workPackageUrl(id)} to <@${assignee.id}>.`);
@@ -1761,8 +1788,16 @@ async function completeAiCandidate(
 	permittedExistingProposalIds: string[] = [],
 ) {
 	const { result, deployment } = extraction;
-	const assigneeId = context.explicitAssigneeId ?? (candidate.assignee_alias ? context.reverseAliases.get(candidate.assignee_alias) : undefined);
-	const accountableId = context.primaryAuthorId;
+	const inferredAssigneeId = context.explicitAssigneeId ?? (candidate.assignee_alias ? context.reverseAliases.get(candidate.assignee_alias) : undefined);
+	const inferredAccountableId = context.primaryAuthorId;
+	const [assigneeResolution, accountableResolution] = await Promise.all([
+		resolveOptionalOwner(inferredAssigneeId, "assignee", interaction.guild!, services),
+		resolveOptionalOwner(inferredAccountableId, "accountable user", interaction.guild!, services),
+	]);
+	const assigneeId = assigneeResolution.discordId;
+	const accountableId = accountableResolution.discordId;
+	const identityAmbiguities = [assigneeResolution.ambiguity, accountableResolution.ambiguity].filter((value): value is string => Boolean(value));
+	const ambiguities = [...result.ambiguities, ...identityAmbiguities];
 	const assigneeMember = assigneeId ? await interaction.guild!.members.fetch(assigneeId).catch(() => null) : null;
 	const projects = await services.openProject.projects();
 	const initialProjectId = await resolveProjectId(interaction.channelId, interaction.guild!, projects, {
@@ -1877,7 +1912,7 @@ async function completeAiCandidate(
 			sourceAttachments,
 			ragCandidates,
 			modelDeployment: deployment, evidence: candidate.evidence,
-			ambiguities: [...result.ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: proposalLatencyMs,
+			ambiguities: [...ambiguities, `Possible existing task match: ${match.workPackageId}`], latencyMs: proposalLatencyMs,
 			tokenUsage: proposalTokenUsage, escalationReason: extraction.escalationReason,
 			retentionDays: services.config.OPENPROJECT_PROPOSAL_RETENTION_DAYS, action,
 			targetWorkPackageId: match.workPackageId, targetLockVersion: target!.lockVersion,
@@ -1938,7 +1973,7 @@ async function completeAiCandidate(
 			await proposalMetadataDisplayNames(interaction.guild!, services, displayedPatch, displayedProjectId),
 		);
 		const displayedContent = redisplayed?.content_markdown ?? operations.contentMarkdown;
-		const displayedAmbiguities = redisplayed?.ambiguities ?? result.ambiguities;
+		const displayedAmbiguities = redisplayed?.ambiguities ?? ambiguities;
 		const warning = displayedOperation === "descriptionReplacement" ? "\nThis will replace the canonical task description." : "";
 		const reviewPayload: InteractionEditReplyOptions = {
 			content: proposalReviewCardContent(`**Possible ${displayedAction} for ${displayedWorkPackageLink}**\n${operationSummary.map(item => `- ${item}`).join("\n")}${warning}${formatProposalContent(displayedOperation, displayedContent)}${redisplayed ? "" : `\n\nSimilarity: ${Math.round(match.similarity * 100)}%`}${displayedAmbiguities.length ? `\nAmbiguities: ${displayedAmbiguities.join("; ")}` : ""}`),
@@ -1964,7 +1999,7 @@ async function completeAiCandidate(
 		modelDeployment: deployment,
 		sourceAttachments,
 		ragCandidates,
-		evidence: candidate.evidence, ambiguities: [...result.ambiguities, ...(advisory ? [advisory] : [])],
+		evidence: candidate.evidence, ambiguities: [...ambiguities, ...(advisory ? [advisory] : [])],
 		workItemKey: candidate.work_item_key,
 		sourceContentHash: sourceContentHash(candidate.source_message_ids.map(id => ({
 			id, text: context.sourceRecords.get(id)?.text ?? "", attachments: context.sourceRecords.get(id)?.attachments,
@@ -2006,7 +2041,7 @@ async function completeAiCandidate(
 		});
 	}
 	const displayedAction = redisplayed?.action ?? "create";
-	const displayedAmbiguities = redisplayed?.ambiguities ?? [...result.ambiguities, ...(advisory ? [advisory] : [])];
+	const displayedAmbiguities = redisplayed?.ambiguities ?? [...ambiguities, ...(advisory ? [advisory] : [])];
 	let cardBody: string;
 	if (displayedAction !== "create" && redisplayed?.target_work_package_id) {
 		const workPackage = await services.openProject.workPackage(redisplayed.target_work_package_id);
@@ -2459,8 +2494,9 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 				const links: Record<string, { href: string | null }> = {};
 				if (metadataPatch.subject !== undefined) changes.subject = metadataPatch.subject;
 				if (Object.hasOwn(metadataPatch, "assigneeDiscordId")) {
-					const openProjectId = metadataPatch.assigneeDiscordId ? await services.db.openProjectUserId(metadataPatch.assigneeDiscordId) : undefined;
-					if (metadataPatch.assigneeDiscordId && !openProjectId) throw new Error("The assignee is not mapped to OpenProject.");
+					const openProjectId = metadataPatch.assigneeDiscordId
+						? await resolveSelectedOwner(metadataPatch.assigneeDiscordId, "assignee", interaction.guild!, services)
+						: undefined;
 					links.assignee = { href: openProjectId ? `/api/v3/users/${openProjectId}` : null };
 				}
 				if (Object.hasOwn(metadataPatch, "priorityId")) links.priority = { href: metadataPatch.priorityId ? `/api/v3/priorities/${metadataPatch.priorityId}` : null };
