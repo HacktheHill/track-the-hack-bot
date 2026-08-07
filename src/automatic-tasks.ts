@@ -393,7 +393,7 @@ export function registerAutomaticTaskDetection(client: Client, services: Automat
 					const stored = await services.db.proposal(proposal.id);
 					if (stored) {
 						const reviewPayload: ReviewCardPayload = {
-							content: boundedDiscordContent(`Target required for proposed ${action}: **${task.title}**\n${description}`),
+							content: proposalReviewCardContent(`Target required for proposed ${action}: **${task.title}**\n${description}`),
 							components: proposalReviewComponents(proposal.id, action, ragCandidates, false), allowedMentions: { parse: [] },
 						};
 						if (proposal.revised) await updateStoredReviewCard(primary, services, proposal.id, reviewPayload);
