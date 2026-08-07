@@ -4,7 +4,6 @@ import { SlashCommandBuilder } from "@discordjs/builders";
 import { config } from "dotenv";
 import { aiTaskMessageCommand, taskCommand, taskMessageCommand } from "./tasks.js";
 import { scheduleCommand } from "./scheduler.js";
-import { outreachEvidenceCommand } from "./outreach.js";
 
 config();
 
@@ -41,7 +40,6 @@ const organizerCommands = [
 	scheduleCommand.toJSON(),
 	taskMessageCommand.toJSON(),
 	aiTaskMessageCommand.toJSON(),
-	outreachEvidenceCommand.toJSON(),
 ];
 
 const sharedCommands = [
