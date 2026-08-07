@@ -419,6 +419,42 @@ function messageUrl(guildId: string, channelId: string, messageId: string) {
 	return `https://discord.com/channels/${guildId}/${channelId}/${messageId}`;
 }
 
+export async function missingProposalSourceMessageIds(
+	client: Pick<Client, "channels">,
+	guildId: string,
+	proposal: { channel_id: string; source_message_ids: readonly string[]; source_links: readonly string[] },
+) {
+	const channelByMessageId = new Map<string, string>();
+	for (const link of proposal.source_links) {
+		const match = /^https:\/\/(?:canary\.|ptb\.)?discord(?:app)?\.com\/channels\/(\d+)\/(\d+)\/(\d+)$/.exec(link);
+		if (match?.[1] === guildId) channelByMessageId.set(match[3], match[2]);
+	}
+	const channels = new Map<string, Awaited<ReturnType<Client["channels"]["fetch"]>>>();
+	const missing: string[] = [];
+	for (const messageId of proposal.source_message_ids) {
+		const channelId = channelByMessageId.get(messageId) ?? proposal.channel_id;
+		let channel = channels.get(channelId);
+		if (!channels.has(channelId)) {
+			channel = await client.channels.fetch(channelId).catch(() => null);
+			channels.set(channelId, channel);
+		}
+		if (!channel?.isTextBased() || !("messages" in channel)
+			|| !await channel.messages.fetch(messageId).then(() => true, () => false)) missing.push(messageId);
+	}
+	return missing;
+}
+
+async function requireCurrentProposalSources(interaction: TaskInteraction, services: Services, proposal: {
+	id: string; channel_id: string; source_message_ids: string[]; source_links: string[];
+}) {
+	const missing = await missingProposalSourceMessageIds(interaction.client, interaction.guildId!, proposal);
+	if (!missing.length) return;
+	const superseded = await services.db.supersedePendingProposalForInvalidSources(proposal.id, missing);
+	throw new Error(superseded
+		? "This proposal was superseded because cited source evidence was deleted or became inaccessible."
+		: "This proposal is already being handled and its cited source evidence could not be revalidated. Check OpenProject before retrying.");
+}
+
 async function validatedSourceLink(value: string | null, interaction: ChatInputCommandInteraction) {
 	if (!value) return [];
 	const match = /^https:\/\/(?:canary\.|ptb\.)?discord(?:app)?\.com\/channels\/(\d+)\/(\d+)\/(\d+)$/.exec(value.trim());
@@ -2448,6 +2484,11 @@ async function handleFinalCreationButton(interaction: ButtonInteraction, service
 		return true;
 	}
 	await interaction.deferReply({ ephemeral: true });
+	if (draft.proposalId) {
+		const proposal = await services.db.proposal(draft.proposalId);
+		if (!proposal) throw new Error("The proposal no longer exists.");
+		await requireCurrentProposalSources(interaction, services, proposal);
+	}
 	if (!await services.db.claimDraft(id, interaction.user.id, "creation")) {
 		throw new Error("This task creation was already handled by another interaction.");
 	}
@@ -2608,6 +2649,7 @@ async function handleModal(interaction: ModalSubmitInteraction, services: Servic
 			sourceAttachments: proposal.source_attachments,
 			allowDuplicate: reviewedProposalAllowsDuplicate(proposal.action),
 		};
+		await requireCurrentProposalSources(interaction, services, proposal);
 		if (!await services.db.claimProposal(proposal.id, interaction.user.id)) throw new Error("This proposal is already being handled.");
 		try {
 			if (proposal.action !== "create") {

@@ -15,6 +15,21 @@ export function embeddingVectorTypeMatches(databaseType: string | undefined, dim
 	return databaseType?.replace(/\s+/g, "").toLowerCase() === `vector(${dimensions})`;
 }
 
+export function assertUniqueConfiguredUserMappings(userMap: Record<string, number>) {
+	const discordIdsByOpenProjectId = new Map<number, string[]>();
+	for (const [discordId, openProjectId] of Object.entries(userMap)) {
+		const discordIds = discordIdsByOpenProjectId.get(openProjectId) ?? [];
+		discordIds.push(discordId);
+		discordIdsByOpenProjectId.set(openProjectId, discordIds);
+	}
+	const collisions = [...discordIdsByOpenProjectId].filter(([, discordIds]) => discordIds.length > 1);
+	if (collisions.length) {
+		throw new Error(`Configured OpenProject user mappings are ambiguous: ${collisions.map(([id, discordIds]) => `${id} is assigned to ${discordIds.join(", ")}`).join("; ")}.`);
+	}
+}
+
+export const openProjectUserUniqueIndexSql = "CREATE UNIQUE INDEX IF NOT EXISTS discord_openproject_users_openproject_user_id_uidx ON discord_openproject_users(openproject_user_id)";
+
 function embeddingTableSql(dimensions: number) {
 	return `CREATE TABLE IF NOT EXISTS openproject_embeddings (
 		work_package_id INTEGER PRIMARY KEY,
@@ -135,6 +150,7 @@ export class Database {
 	}
 
 	async migrate(config: IntegrationConfig) {
+		assertUniqueConfiguredUserMappings(config.userMap);
 		await this.pool.query("SELECT pg_advisory_lock(hashtext('track-the-hack-bot-schema'))");
 		try {
 		await this.pool.query(`
@@ -290,6 +306,14 @@ export class Database {
 			CREATE INDEX IF NOT EXISTS scheduled_messages_due_idx
 				ON scheduled_messages(status, send_at, next_attempt_at)
 		`);
+		const ambiguousMappings = await this.pool.query<{ openproject_user_id: number; discord_user_ids: string[] }>(
+			`SELECT openproject_user_id,array_agg(discord_user_id ORDER BY discord_user_id) AS discord_user_ids
+			 FROM discord_openproject_users GROUP BY openproject_user_id HAVING COUNT(*) > 1`,
+		);
+		if (ambiguousMappings.rows.length) {
+			throw new Error(`Existing OpenProject user mappings are ambiguous: ${ambiguousMappings.rows.map(row => `${row.openproject_user_id} is assigned to ${row.discord_user_ids.join(", ")}`).join("; ")}. Resolve them before migrating.`);
+		}
+		await this.pool.query(openProjectUserUniqueIndexSql);
 		await this.pool.query("DROP TABLE IF EXISTS discord_channel_projects");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS permitted_reviewer_ids TEXT[] NOT NULL DEFAULT '{}'");
 		await this.pool.query("ALTER TABLE task_proposals ADD COLUMN IF NOT EXISTS metadata_inference JSONB NOT NULL DEFAULT '{}'");
@@ -373,13 +397,22 @@ export class Database {
 			await this.pool.query("CREATE INDEX IF NOT EXISTS openproject_embeddings_project_idx ON openproject_embeddings(project_id)");
 			await this.pool.query("CREATE TABLE IF NOT EXISTS openproject_embedding_sync (id BOOLEAN PRIMARY KEY DEFAULT TRUE, last_run_at TIMESTAMPTZ, last_error TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())");
 		}
-		for (const [discordId, openProjectId] of Object.entries(config.userMap)) {
-			await this.pool.query(
-				`INSERT INTO discord_openproject_users(discord_user_id, openproject_user_id)
-				 VALUES ($1,$2) ON CONFLICT(discord_user_id) DO UPDATE
-				 SET openproject_user_id=excluded.openproject_user_id, updated_at=now()`,
-				[discordId, openProjectId],
-			);
+		const configuredMappings = Object.entries(config.userMap);
+		if (configuredMappings.length) {
+			try {
+				await this.pool.query(
+					`INSERT INTO discord_openproject_users(discord_user_id, openproject_user_id)
+					 SELECT * FROM unnest($1::text[],$2::integer[])
+					 ON CONFLICT(discord_user_id) DO UPDATE
+					 SET openproject_user_id=excluded.openproject_user_id, updated_at=now()`,
+					[configuredMappings.map(([discordId]) => discordId), configuredMappings.map(([, openProjectId]) => openProjectId)],
+				);
+			} catch (error) {
+				if (error && typeof error === "object" && "code" in error && error.code === "23505") {
+					throw new Error("Configured OpenProject user mappings collide with existing mappings. Resolve the ambiguity before migrating.", { cause: error });
+				}
+				throw error;
+			}
 		}
 		} finally {
 			await this.pool.query("SELECT pg_advisory_unlock(hashtext('track-the-hack-bot-schema'))");
@@ -424,6 +457,7 @@ export class Database {
 			return true;
 		} catch (error) {
 			await client.query("ROLLBACK").catch(() => undefined);
+			if (error && typeof error === "object" && "code" in error && error.code === "23505") return false;
 			throw error;
 		} finally {
 			client.release();
@@ -1147,6 +1181,30 @@ export class Database {
 			);
 			await client.query("COMMIT");
 			return result.rows;
+		} catch (error) {
+			await client.query("ROLLBACK");
+			throw error;
+		} finally {
+			client.release();
+		}
+	}
+
+	async supersedePendingProposalForInvalidSources(id: string, missingMessageIds: string[]) {
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			const result = await client.query(
+				`UPDATE task_proposals SET status='superseded',review_outcome='superseded',
+				 error='One or more cited Discord source messages no longer exist or are inaccessible.',reviewed_at=now(),updated_at=now()
+				 WHERE id=$1 AND status='pending_review' AND expires_at > now() RETURNING id`,
+				[id],
+			);
+			if (result.rowCount === 1) await client.query(
+				"INSERT INTO task_audit_log(proposal_id,event,metadata) VALUES($1,'source_invalid_preflight',$2)",
+				[id, jsonParameter({ missingMessageIds })],
+			);
+			await client.query("COMMIT");
+			return result.rowCount === 1;
 		} catch (error) {
 			await client.query("ROLLBACK");
 			throw error;

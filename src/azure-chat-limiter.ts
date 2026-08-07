@@ -7,6 +7,12 @@ type QueuedAttempt<T> = {
 	onAbort?: () => void;
 };
 
+const MAX_PROVIDER_COOLDOWN_MS = 30_000;
+
+export function boundedProviderCooldown(milliseconds: number) {
+	return Math.min(Math.max(0, milliseconds), MAX_PROVIDER_COOLDOWN_MS);
+}
+
 function abortReason(signal?: AbortSignal) {
 	return signal?.reason ?? new DOMException("Azure OpenAI request aborted.", "AbortError");
 }
@@ -60,17 +66,20 @@ export class AzureChatLimiter {
 			this.timer = undefined;
 		}
 		if (this.active >= this.maxConcurrency || !this.queue.length) return;
-		const next = this.queue[0]!;
 		const now = Date.now();
-		const readyAt = Math.max(this.lastStartedAt + this.minIntervalMs, this.cooldowns.get(next.key) ?? 0);
-		if (readyAt > now) {
+		const globallyReadyAt = this.lastStartedAt + this.minIntervalMs;
+		const firstByKey = new Map<string, number>();
+		for (const [index, attempt] of this.queue.entries()) if (!firstByKey.has(attempt.key)) firstByKey.set(attempt.key, index);
+		const nextIndex = [...firstByKey.values()].find(index => Math.max(globallyReadyAt, this.cooldowns.get(this.queue[index]!.key) ?? 0) <= now);
+		if (nextIndex === undefined) {
+			const readyAt = Math.min(...[...firstByKey.values()].map(index => Math.max(globallyReadyAt, this.cooldowns.get(this.queue[index]!.key) ?? 0)));
 			this.timer = setTimeout(() => {
 				this.timer = undefined;
 				this.pump();
 			}, readyAt - now);
 			return;
 		}
-		this.queue.shift();
+		const [next] = this.queue.splice(nextIndex, 1);
 		next.signal?.removeEventListener("abort", next.onAbort!);
 		if (next.signal?.aborted) {
 			next.reject(abortReason(next.signal));
@@ -82,7 +91,7 @@ export class AzureChatLimiter {
 		void Promise.resolve().then(next.operation).then(value => {
 			if (value instanceof Response && value.status === 429) {
 				const delay = retryAfterMilliseconds(value);
-				if (delay !== undefined) this.cooldowns.set(next.key, Date.now() + delay);
+				if (delay !== undefined) this.cooldowns.set(next.key, Date.now() + boundedProviderCooldown(delay));
 			}
 			next.resolve(value);
 		}, next.reject).finally(() => {

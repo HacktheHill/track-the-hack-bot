@@ -15,8 +15,7 @@ export function normalizeExtractedDate(value?: string | null) {
 		: null;
 }
 
-const taskSchema = z.object({
-	tasks: z.array(z.object({
+export const extractedTaskSchema = z.object({
 		title: z.string().min(1).max(255),
 		work_item_key: z.string().trim().min(1).max(100),
 		description: z.string().min(1).max(4000),
@@ -33,7 +32,10 @@ const taskSchema = z.object({
 		proposed_action: z.enum(["create", "update", "complete", "reopen"]),
 		content_intent: z.enum(["none", "update_note", "replace_description"]).default("none"),
 		metadata_change_fields: z.array(z.enum(metadataFieldNames)).max(4).default([]),
-	})).max(5),
+});
+
+const taskSchema = z.object({
+	tasks: z.array(extractedTaskSchema).max(5),
 	ambiguities: z.array(z.string().max(300)),
 });
 
@@ -1039,7 +1041,10 @@ export class AzureTaskExtractor implements TaskExtractor {
 				const supersededPendingProposalIds = [...new Set(result.parsed.superseded_pending_proposal_ids)]
 					.filter(id => {
 						const pending = selectedPendingProposals.find(proposal => proposal.id === id);
-						return Boolean(pending && !retainedPendingIds.has(id) && proposals.some(item => proposalIdentityMatches(item.candidate, pending)));
+						return Boolean(pending && !retainedPendingIds.has(id) && (
+							proposals.some(item => proposalIdentityMatches(item.candidate, pending))
+							|| (proposals.length === 0 && affectedIds.has(id))
+						));
 					});
 				return { proposals, supersededPendingProposalIds, deployment: `azure:${deployment}`, latencyMs: result.latencyMs, usage: result.usage };
 			} catch (error) {

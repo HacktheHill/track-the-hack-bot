@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { automaticCandidateEligible, AzureTaskExtractor, containsSensitiveContent, mergeRelatedTaskCandidates, minimizeText, normalizeExtractedDate, sensitiveContentReasons, shouldReconcileTaskProposals, shouldSelectTaskContext } from "../dist/azure-openai.js";
-import { AzureChatLimiter } from "../dist/azure-chat-limiter.js";
+import { AzureChatLimiter, boundedProviderCooldown } from "../dist/azure-chat-limiter.js";
 
 test("minimizeText removes common credentials and personal contact data", () => {
 	const value = minimizeText(
@@ -83,6 +83,22 @@ test("Azure chat limiter applies Retry-After cooldown across queued attempts", a
 	});
 	await Promise.all([first, second]);
 	assert.ok(started[1] - started[0] >= 25);
+});
+
+test("Azure chat limiter bounds provider cooldown and lets another deployment bypass a cooled key", async () => {
+	assert.equal(boundedProviderCooldown(90_000), 30_000);
+	const limiter = new AzureChatLimiter(1, 0);
+	const order = [];
+	const first = limiter.run("cooled", undefined, async () => {
+		order.push("first");
+		return new Response(null, { status: 429, headers: { "retry-after-ms": "40" } });
+	});
+	const cooled = limiter.run("cooled", undefined, async () => { order.push("cooled"); return "cooled"; });
+	const ready = limiter.run("ready", undefined, async () => { order.push("ready"); return "ready"; });
+	await first;
+	assert.equal(await ready, "ready");
+	assert.equal(await cooled, "cooled");
+	assert.deepEqual(order, ["first", "ready", "cooled"]);
 });
 
 test("Azure chat limiter spaces attempt starts by the configured interval", async () => {
@@ -274,6 +290,23 @@ test("proposal reconciliation does not conflate distinct tasks from one source m
 		);
 		assert.equal(result.proposals[0].pendingProposalId, undefined);
 		assert.deepEqual(result.supersededPendingProposalIds, []);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("zero-candidate reconciliation retains an explicit affected-proposal cancellation", async () => {
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => Response.json({ choices: [{ message: { content: JSON.stringify({
+		proposals: [], superseded_pending_proposal_ids: ["affected"],
+	}) } }] });
+	try {
+		const result = await new AzureTaskExtractor(config, async () => "token").reconcileProposals(
+			[{ id: "m1", authorAlias: "USER_1", text: "Cancel that work", timestamp: "2026-07-20T00:00:00Z", contextRole: "primary" }],
+			[], [{ id: "affected", title: "Publish the map", description: "Publish it.", action: "create", sourceMessageIds: ["m1"] }], ["affected"],
+		);
+		assert.deepEqual(result.proposals, []);
+		assert.deepEqual(result.supersededPendingProposalIds, ["affected"]);
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
