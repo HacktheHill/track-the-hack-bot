@@ -338,7 +338,8 @@ export class Database {
 		await this.pool.query(`UPDATE task_proposals SET status='superseded', review_outcome='superseded',
 			error='This proposal predates safe update operations. Extract the discussion again.', reviewed_at=now(), updated_at=now()
 			WHERE status='pending_review' AND action <> 'create'
-			AND (operation_schema_version IS NULL OR target_work_package_id IS NULL OR target_lock_version IS NULL OR content_operation IS NULL)`);
+			AND target_work_package_id IS NOT NULL
+			AND (operation_schema_version IS NULL OR target_lock_version IS NULL OR content_operation IS NULL)`);
 		await this.pool.query("ALTER TABLE task_proposals DROP CONSTRAINT IF EXISTS task_proposals_openproject_work_package_id_key");
 		await this.pool.query("ALTER TABLE ai_extraction_events ADD COLUMN IF NOT EXISTS trigger_id TEXT");
 		await this.pool.query("ALTER TABLE ai_extraction_events ADD COLUMN IF NOT EXISTS input_snapshot JSONB");
@@ -714,8 +715,8 @@ export class Database {
 		preferredProposalId?: string;
 		permittedExistingProposalIds?: string[];
 	}) {
-		if (input.action && input.action !== "create" && (!input.targetWorkPackageId || input.targetLockVersion === undefined)) {
-			throw new Error("Existing-task proposals require a target task and lock version.");
+		if (input.action && input.action !== "create" && Boolean(input.targetWorkPackageId) !== (input.targetLockVersion !== undefined)) {
+			throw new Error("Existing-task proposal targets require a lock version.");
 		}
 		const id = randomUUID();
 		const normalizedTitle = input.title.toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
@@ -789,7 +790,7 @@ export class Database {
 							input.startDate ?? null, input.dueDate ?? null, input.estimatedHours ?? null, jsonParameter(input.metadataInference ?? {}),
 							input.classification ?? null, input.modelDeployment, input.permittedReviewerIds ?? (input.requesterId ? [input.requesterId] : []),
 							input.latencyMs ?? null, input.tokenUsage ?? null, input.escalationReason ?? null, input.action ?? "create",
-							input.targetWorkPackageId ?? null, input.targetLockVersion ?? null, input.action && input.action !== "create" ? 1 : null,
+							input.targetWorkPackageId ?? null, input.targetLockVersion ?? null, input.action && input.action !== "create" && input.targetWorkPackageId ? 1 : null,
 							jsonParameter(input.metadataPatch ?? {}), input.contentOperation ?? null, input.contentMarkdown ?? null,
 							jsonParameter(input.sourceAttachments ?? [])],
 					);
@@ -843,7 +844,7 @@ export class Database {
 			 input.permittedReviewerIds ?? (input.requesterId ? [input.requesterId] : []), input.action ?? "create", input.targetWorkPackageId ?? null, input.targetLockVersion ?? null,
 			 input.evidence ?? null, input.ambiguities ?? [], input.latencyMs ?? null,
 			 input.tokenUsage ?? null, input.escalationReason ?? null,
-			 input.action && input.action !== "create" ? 1 : null, jsonParameter(input.metadataPatch ?? {}),
+			 input.action && input.action !== "create" && input.targetWorkPackageId ? 1 : null, jsonParameter(input.metadataPatch ?? {}),
 			 input.contentOperation ?? null, input.contentMarkdown ?? null, input.workItemKey ?? null,
 			 input.sourceContentHash ?? null, input.retentionDays ?? 30],
 				);
@@ -880,8 +881,10 @@ export class Database {
 		return { id: proposalId, reused, revised };
 	}
 
-	async convertProposalToUpdate(input: {
+	async resolveProposalTarget(input: {
 		id: string;
+		expectedAction: "create" | "update" | "complete" | "reopen";
+		expectedTargetWorkPackageId?: number;
 		projectId: number;
 		targetWorkPackageId: number;
 		targetLockVersion: number;
@@ -890,13 +893,22 @@ export class Database {
 		contentMarkdown: string | null;
 	}) {
 		const result = await this.pool.query(
-			`UPDATE task_proposals SET action='update', target_work_package_id=$2, target_lock_version=$3,
-			 operation_schema_version=1, metadata_patch=$4, content_operation=$5, content_markdown=$6,
-			 project_id=$7, updated_at=now()
-			 WHERE id=$1 AND status='pending_review' AND action='create'`,
-			[input.id, input.targetWorkPackageId, input.targetLockVersion, jsonParameter(input.metadataPatch), input.contentOperation, input.contentMarkdown, input.projectId],
+			`UPDATE task_proposals SET action=CASE WHEN action='create' THEN 'update' ELSE action END,
+			 target_work_package_id=$4, target_lock_version=$5, operation_schema_version=1,
+			 metadata_patch=$6, content_operation=$7, content_markdown=$8, project_id=$3, updated_at=now()
+			 WHERE id=$1 AND status='pending_review' AND expires_at > now() AND action=$2
+			 AND target_work_package_id IS NOT DISTINCT FROM $9 AND patch_applied_at IS NULL AND comment_activity_id IS NULL`,
+			[input.id, input.expectedAction, input.projectId, input.targetWorkPackageId, input.targetLockVersion,
+				jsonParameter(input.metadataPatch), input.contentOperation, input.contentMarkdown, input.expectedTargetWorkPackageId ?? null],
 		);
-		if (result.rowCount !== 1) throw new Error("This proposal is no longer available for target selection.");
+		if (result.rowCount !== 1) throw new Error("This proposal changed or is no longer available for target selection.");
+	}
+
+	async convertProposalToUpdate(input: {
+		id: string; projectId: number; targetWorkPackageId: number; targetLockVersion: number;
+		metadataPatch: ProposalMetadataPatch; contentOperation: ContentOperation; contentMarkdown: string | null;
+	}) {
+		return this.resolveProposalTarget({ ...input, expectedAction: "create" });
 	}
 
 	async retargetProposal(input: {
@@ -1054,7 +1066,10 @@ export class Database {
 		accountableId?: string | null; priorityId?: number | null; sizeHref?: string | null;
 		startDate?: string | null; estimatedHours?: number | null;
 	}) {
-		const result = await this.pool.query<{
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+		const result = await client.query<{
 			revision: number; title: string; description: string; project_id: number | null;
 			assignee_discord_id: string | null; accountable_discord_id: string | null;
 			priority_id: number | null; size_href: string | null; start_date: string | null;
@@ -1062,20 +1077,35 @@ export class Database {
 			target_work_package_id: number | null; source_message_ids: string[]; source_links: string[];
 		}>(
 			`UPDATE task_proposals SET accountable_discord_id=$2, priority_id=$3, size_href=$4, start_date=$5,
-			 estimated_hours=$6, revision=revision + 1, reviewer_discord_id=$7, updated_at=now()
+			 estimated_hours=$6, metadata_inference=metadata_inference || '{"priority":false,"size":false,"estimate":false}'::jsonb,
+			 correction_flags=correction_flags || jsonb_build_object(
+				'accountable',accountable_discord_id IS DISTINCT FROM $2,'priority',priority_id IS DISTINCT FROM $3,
+				'size',size_href IS DISTINCT FROM $4,'startDate',start_date IS DISTINCT FROM $5::date,
+				'estimate',estimated_hours IS DISTINCT FROM $6::numeric),
+			 revision=revision + 1, reviewer_discord_id=$7, updated_at=now()
 			 WHERE id=$1 AND status='pending_review' AND expires_at > now() RETURNING *`,
 			[id, fields.accountableId ?? null, fields.priorityId ?? null, fields.sizeHref ?? null, fields.startDate ?? null, fields.estimatedHours ?? null, reviewerId],
 		);
 		if (result.rowCount !== 1) throw new Error("This proposal is no longer editable.");
 		const row = result.rows[0];
-		await this.recordProposalRevision(id, row.revision, "edit", {
+		await client.query(
+			"INSERT INTO task_proposal_revisions(proposal_id,revision,phase,payload) VALUES($1,$2,'edit',$3)",
+			[id, row.revision, jsonParameter({
 			title: row.title, description: row.description, projectId: row.project_id,
 			assigneeId: row.assignee_discord_id, accountableId: row.accountable_discord_id,
 			priorityId: row.priority_id, sizeHref: row.size_href, startDate: row.start_date,
 			dueDate: row.due_date, estimatedHours: row.estimated_hours, action: row.action,
 			targetWorkPackageId: row.target_work_package_id, sourceMessageIds: row.source_message_ids,
 			sourceLinks: row.source_links,
-		});
+			})],
+		);
+		await client.query("COMMIT");
+		} catch (error) {
+			await client.query("ROLLBACK");
+			throw error;
+		} finally {
+			client.release();
+		}
 	}
 
 	async claimProposal(id: string, reviewerId: string) {
@@ -1084,10 +1114,45 @@ export class Database {
 			 review_started_at=COALESCE(review_started_at, now()),
 			 claim_expires_at=now() + interval '15 minutes', updated_at=now()
 			 WHERE id=$1 AND (status='pending_review' OR (status='creating' AND claim_expires_at < now()))
-			 AND expires_at > now() RETURNING id`,
+			 AND expires_at > now()
+			 AND (action='create' OR (target_work_package_id IS NOT NULL AND target_lock_version IS NOT NULL
+				AND operation_schema_version IS NOT NULL AND content_operation IS NOT NULL)) RETURNING id`,
 			[id, reviewerId],
 		);
 		return result.rowCount === 1;
+	}
+
+	async pendingProposalsForSourceMessage(messageId: string) {
+		const result = await this.pool.query<{ id: string }>(
+			"SELECT id FROM task_proposals WHERE status='pending_review' AND expires_at > now() AND $1=ANY(source_message_ids)",
+			[messageId],
+		);
+		return result.rows.map(row => row.id);
+	}
+
+	async supersedePendingProposalsForDeletedSource(messageId: string) {
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			const result = await client.query<{ id: string; channel_id: string; review_message_id: string | null }>(
+				`UPDATE task_proposals SET status='superseded',review_outcome='superseded',
+				 error='A cited Discord source message was deleted.',reviewed_at=now(),updated_at=now()
+				 WHERE status='pending_review' AND $1=ANY(source_message_ids)
+				 RETURNING id,channel_id,review_message_id`,
+				[messageId],
+			);
+			for (const row of result.rows) await client.query(
+				"INSERT INTO task_audit_log(proposal_id,event,metadata) VALUES($1,'source_deleted',$2)",
+				[row.id, jsonParameter({ messageId })],
+			);
+			await client.query("COMMIT");
+			return result.rows;
+		} catch (error) {
+			await client.query("ROLLBACK");
+			throw error;
+		} finally {
+			client.release();
+		}
 	}
 
 	async releaseProposal(id: string, error: string) {
@@ -1127,7 +1192,11 @@ export class Database {
 			const result = await client.query<{ revision: number }>(
 				`UPDATE task_proposals SET status='created', reviewer_discord_id=$2,
 				 openproject_work_package_id=$3, confirmation_message_id=$4, error=NULL,
-				 review_outcome='approved', reviewed_at=now(), correction_flags=$5,
+				 review_outcome='approved', reviewed_at=now(), correction_flags=(
+					SELECT jsonb_object_agg(incoming.key,
+						COALESCE((task_proposals.correction_flags->>incoming.key)::boolean,FALSE) OR incoming.value::text::boolean)
+					FROM jsonb_each($5::jsonb) AS incoming
+				 ),
 				 claim_expires_at=NULL, revision=revision + 1,
 				 review_duration_ms=GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(review_started_at, created_at))) * 1000)::integer,
 				 updated_at=now() WHERE id=$1 AND status='creating' RETURNING revision`,
