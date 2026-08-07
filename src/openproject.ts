@@ -47,7 +47,7 @@ function detectedImageType(bytes: Uint8Array) {
 }
 
 export class OpenProjectRequestError extends Error {
-	constructor(message: string, readonly ambiguous = false) {
+	constructor(message: string, readonly ambiguous = false, readonly status?: number) {
 		super(message);
 	}
 }
@@ -139,7 +139,7 @@ export class OpenProjectClient {
 				if (!response.ok) {
 					const body = await response.text();
 					if (method === "GET" && response.status >= 500 && attempt + 1 < attempts) continue;
-					throw new OpenProjectRequestError(`OpenProject ${response.status}: ${body.slice(0, 500)}`);
+					throw new OpenProjectRequestError(`OpenProject ${response.status}: ${body.slice(0, 500)}`, false, response.status);
 				}
 				return (await response.json()) as T;
 			} catch (error) {
@@ -276,7 +276,15 @@ export class OpenProjectClient {
 
 	async linkableUsers() {
 		return this.cached("linkable-users", async () => {
-			const users = await this.collection<OpenProjectUser>("/api/v3/users?pageSize=500");
+			let users: OpenProjectUser[];
+			try {
+				users = await this.collection<OpenProjectUser>("/api/v3/users?pageSize=500");
+			} catch (error) {
+				if (!(error instanceof OpenProjectRequestError) || error.status !== 403) throw error;
+				const projects = await this.projects();
+				const projectUsers = await Promise.all(projects.map(project => this.availableAssignees(project.id)));
+				users = [...new Map(projectUsers.flat().map(user => [user.id, user])).values()];
+			}
 			return users
 				.filter(user => (user._type === "User" || !user._type) && (!user.status || user.status === "active" || user.status === "invited"))
 				.sort((left, right) => left.name.localeCompare(right.name));

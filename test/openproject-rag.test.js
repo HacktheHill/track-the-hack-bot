@@ -304,6 +304,31 @@ test("automatic user catalog uses active and invited non-group accounts instead 
 	}
 });
 
+test("user catalog falls back to project assignees when the global directory is forbidden", async () => {
+	const originalFetch = globalThis.fetch;
+	const paths = [];
+	globalThis.fetch = async url => {
+		const path = new URL(String(url)).pathname;
+		paths.push(path);
+		if (path === "/api/v3/users") return new Response("Missing permission", { status: 403 });
+		if (path === "/api/v3/projects") return Response.json({
+			_embedded: { elements: [{ id: 9, name: "Project", active: true }] },
+			_links: {},
+		});
+		return Response.json({
+			_embedded: { elements: [{ id: 1, name: "Project Member", status: "active", _type: "User" }] },
+			_links: {},
+		});
+	};
+	try {
+		const client = new OpenProjectClient({ OPENPROJECT_BASE_URL: "https://openproject.example", OPENPROJECT_API_KEY: "secret", OPENPROJECT_CACHE_TTL_MS: 1000 });
+		assert.deepEqual((await client.users()).map(user => user.id), [1]);
+		assert.deepEqual(paths, ["/api/v3/users", "/api/v3/projects", "/api/v3/workspaces/9/available_assignees"]);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
 test("OpenProject updates reject stale proposal lock versions before PATCH", async () => {
 	const originalFetch = globalThis.fetch;
 	let calls = 0;
