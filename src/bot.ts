@@ -82,8 +82,9 @@ client.once("clientReady", async () => {
 			rag,
 		};
 		const organizerGuild = await client.guilds.fetch(integrationConfig.ORGANIZER_GUILD_ID);
-		const initialReconciliation = await reconcileOpenProjectUsers(organizerGuild, integrationConfig, db, services.openProject);
-		console.log("Initial OpenProject identity reconciliation complete", initialReconciliation);
+		await reconcileOpenProjectUsers(organizerGuild, integrationConfig, db, services.openProject)
+			.then(result => console.log("Initial OpenProject identity reconciliation complete", result))
+			.catch(error => console.error("Initial OpenProject identity reconciliation failed", { error: (error as Error).message }));
 		registerTaskInteractions(client, services);
 		registerAutomaticTaskDetection(client, services);
 		const cleanupReviewCards = () => void cleanupTerminalProposalCards(client, db)
