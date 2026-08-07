@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, directProposalDismissalReason, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, handleProposalButton, handleProposalTargetSelect, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, proposalReviewCardContent, proposalReviewComponents, proposalReviewExplanation, relevantImageAttachments, removeProposalReviewCard, reviewedProposalAllowsDuplicate, taskCommand, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
+import { AI_CONTEXT_GAP_MS, appendRelevantUrls, appendSourceLinks, boundedDiscordContent, calendarDate, citesExtractionFocus, continuationScore, databaseDate, dateChoices, defaultAiDueDate, defaultTaskDates, directProposalDismissalReason, explicitAssignmentNames, followingUntilGap, formatProposalMetrics, handleProposalButton, handleProposalTargetSelect, historicalContinuityScore, inferCreationMetadata, isExcludedChannel, manualProposalButtons, precedingUntilGap, projectAccessAllowed, proposalCorrections, proposalIsReviewable, proposalReviewAllowed, proposalReviewCardContent, proposalReviewComponents, proposalReviewExplanation, relevantImageAttachments, removeProposalReviewCard, resolveOptionalOwner, reviewedProposalAllowsDuplicate, taskCommand, taskIdentityGuidance, taskOwnerIds, validIsoDate } from "../dist/tasks.js";
 import { formatProposalContent } from "../dist/task-proposals.js";
 import { normalizeTaskTitle, OpenProjectClient, openProjectAttachmentFileName, titlesLikelyDuplicate, workPackageMarkdownLink } from "../dist/openproject.js";
 
@@ -129,6 +129,35 @@ test("task creation pings explicit owners once", () => {
 	assert.deepEqual(taskOwnerIds("same", "same", "derived"), ["same"]);
 	assert.deepEqual(taskOwnerIds(undefined, undefined, "derived"), ["derived"]);
 });
+
+test("explicit owner failures provide actionable linking guidance", () => {
+	assert.match(taskIdentityGuidance("123", "assignee"), /selected assignee <@123>/);
+	assert.match(taskIdentityGuidance("123", "assignee"), /\/task link-user/);
+});
+
+test("AI owners without a unique collision-free mapping are omitted with an ambiguity", async () => {
+	const services = {
+		config: { teamRoles: {} },
+		db: {
+			openProjectUserId: async () => undefined,
+			openProjectUserMappings: async () => new Map([["other", 7]]),
+			claimOpenProjectUser: async () => assert.fail("colliding identity must not be persisted"),
+		},
+		openProject: {
+			linkableUsers: async () => [{ id: 7, name: "Alex Person", status: "active", _type: "User" }],
+			groupUserIds: async () => [],
+		},
+	};
+	const guild = { members: { fetch: async id => memberForTask(id, "Alex Person") } };
+	const resolved = await resolveOptionalOwner("discord-alex", "assignee", guild, services);
+	assert.equal(resolved.discordId, undefined);
+	assert.match(resolved.ambiguity, /was omitted/);
+	assert.match(resolved.ambiguity, /\/task link-user/);
+});
+
+function memberForTask(id, displayName) {
+	return { id, displayName, user: { bot: false }, roles: { cache: { has: () => false } } };
+}
 
 test("assignment labels identify responsible people", () => {
 	assert.deepEqual(explicitAssignmentNames("Task 3 (Alex): prepare the planning document"), ["Alex"]);
