@@ -461,8 +461,10 @@ test("automatic precision gate judges raw evidence and validates complete candid
 		assert.equal(automaticCandidateEligible(gate.assessments[0], gate.windowSensitivity), false);
 		assert.equal(gate.windowSensitivity, "safe");
 		assert.equal(gate.usage.totalTokens, 42);
-		assert.equal(request.response_format.json_schema.name, "discord_automatic_precision_gate_v1");
+		assert.equal(request.response_format.json_schema.name, "discord_automatic_precision_gate_v2");
 		assert.match(request.messages[0].content, /untrusted hypothesis/);
+		assert.match(request.messages[0].content, /Quoted, pasted, serialized/);
+		assert.match(request.messages[0].content, /concrete asynchronous deliverable/);
 		assert.match(request.messages[0].content, /How does Instagram access work/);
 		assert.match(request.messages[0].content, /already present in a tracker is not activation/);
 		assert.match(request.messages[0].content, /status restatement/);
