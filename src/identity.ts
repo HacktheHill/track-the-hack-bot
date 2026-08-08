@@ -3,7 +3,7 @@ import type { IntegrationConfig } from "./config.js";
 import type { Database } from "./database.js";
 import type { OpenProjectClient, OpenProjectUser } from "./openproject.js";
 
-export type DiscordIdentity = { id: string; displayName: string; teamGroupIds: number[] };
+export type DiscordIdentity = { id: string; displayName: string; alternateNames?: string[]; teamGroupIds: number[] };
 export type IdentityMatch = { user: OpenProjectUser; reason: "exact_name" | "last_initial" | "team" | "unique_first_name" };
 export type IdentityResolution = {
 	openProjectId?: number;
@@ -21,12 +21,13 @@ function discordNameParts(displayName: string) {
 	return normalizedName(withoutTeams).split(" ").filter(Boolean);
 }
 
-export function matchOpenProjectIdentity(
-	identity: DiscordIdentity,
+function matchOpenProjectName(
+	displayName: string,
+	teamGroupIds: number[],
 	users: OpenProjectUser[],
 	groupUsers: Map<number, Set<number>>,
 ): IdentityMatch | undefined {
-	const discordParts = discordNameParts(identity.displayName);
+	const discordParts = discordNameParts(displayName);
 	if (!discordParts.length) return undefined;
 	const candidates = users.filter(user => normalizedName(user.name).split(" ")[0] === discordParts[0]);
 	if (!candidates.length) return undefined;
@@ -34,18 +35,36 @@ export function matchOpenProjectIdentity(
 	const exact = candidates.filter(user => normalizedName(user.name) === discordParts.join(" "));
 	if (exact.length === 1) return { user: exact[0], reason: "exact_name" };
 
-	const teamCandidates = identity.teamGroupIds.length
-		? candidates.filter(user => identity.teamGroupIds.some(groupId => groupUsers.get(groupId)?.has(user.id)))
+	const teamCandidates = teamGroupIds.length
+		? candidates.filter(user => teamGroupIds.some(groupId => groupUsers.get(groupId)?.has(user.id)))
 		: [];
-	const scoped = identity.teamGroupIds.length ? teamCandidates : candidates;
+	const scoped = teamGroupIds.length ? teamCandidates : candidates;
 	if (discordParts.length >= 2) {
 		const initial = discordParts.at(-1)![0];
 		const initialMatches = scoped.filter(user => normalizedName(user.name).split(" ").slice(1).some(part => part.startsWith(initial)));
 		if (initialMatches.length === 1) return { user: initialMatches[0], reason: "last_initial" };
 	}
 	if (teamCandidates.length === 1) return { user: teamCandidates[0], reason: "team" };
-	if (!identity.teamGroupIds.length && candidates.length === 1) return { user: candidates[0], reason: "unique_first_name" };
+	if (!teamGroupIds.length && candidates.length === 1) return { user: candidates[0], reason: "unique_first_name" };
 	return undefined;
+}
+
+export function matchOpenProjectIdentity(
+	identity: DiscordIdentity,
+	users: OpenProjectUser[],
+	groupUsers: Map<number, Set<number>>,
+): IdentityMatch | undefined {
+	const primary = matchOpenProjectName(identity.displayName, identity.teamGroupIds, users, groupUsers);
+	if (primary) return primary;
+	const primaryName = normalizedName(identity.displayName);
+	const alternateMatches = (identity.alternateNames ?? [])
+		.filter(name => normalizedName(name) !== primaryName)
+		.flatMap(name => {
+			const match = matchOpenProjectName(name, identity.teamGroupIds, users, groupUsers);
+			return match ? [match] : [];
+		});
+	const matchesByUser = new Map(alternateMatches.map(match => [match.user.id, match]));
+	return matchesByUser.size === 1 ? matchesByUser.values().next().value : undefined;
 }
 
 function teamGroupIds(member: GuildMember, config: IntegrationConfig) {
@@ -80,6 +99,7 @@ export async function resolveOpenProjectIdentity(
 	const match = matchOpenProjectIdentity({
 		id: member.id,
 		displayName: member.displayName,
+		alternateNames: [member.user.globalName, member.user.username].filter((name): name is string => Boolean(name)),
 		teamGroupIds: teamGroupIds(member, config),
 	}, users, groupUsers);
 	if (!match) return { problem: "ambiguous_or_unmapped" };
@@ -107,7 +127,12 @@ export async function reconcileOpenProjectUsers(
 	let ambiguous = 0;
 	for (const member of members.values()) {
 		if (member.user.bot || !member.roles.cache.has(config.ORGANIZER_GUILD_MEMBER_ROLE_ID) || existing.has(member.id)) continue;
-		const match = matchOpenProjectIdentity({ id: member.id, displayName: member.displayName, teamGroupIds: teamGroupIds(member, config) }, users, groupUsers);
+		const match = matchOpenProjectIdentity({
+			id: member.id,
+			displayName: member.displayName,
+			alternateNames: [member.user.globalName, member.user.username].filter((name): name is string => Boolean(name)),
+			teamGroupIds: teamGroupIds(member, config),
+		}, users, groupUsers);
 		if (!match || usedOpenProjectIds.has(match.user.id)) {
 			ambiguous++;
 			continue;

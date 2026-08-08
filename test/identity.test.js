@@ -27,8 +27,25 @@ test("ambiguous first names are never linked automatically", () => {
 	assert.equal(matchOpenProjectIdentity({ id: "4", displayName: "Julie [Community]", teamGroupIds: [] }, users, groups)?.user.id, 180);
 });
 
+test("a unique alternate Discord name can resolve an ambiguous guild nickname", () => {
+	const ambiguousTeamGroups = new Map([[26, new Set([174, 178])]]);
+	const match = matchOpenProjectIdentity({
+		id: "5",
+		displayName: "Maria",
+		alternateNames: ["Maria K"],
+		teamGroupIds: [26],
+	}, users, ambiguousTeamGroups);
+	assert.deepEqual({ id: match?.user.id, reason: match?.reason }, { id: 174, reason: "last_initial" });
+	assert.equal(matchOpenProjectIdentity({
+		id: "6",
+		displayName: "Maria",
+		alternateNames: ["Maria K", "Maria M"],
+		teamGroupIds: [],
+	}, users, groups), undefined);
+});
+
 function member(id, displayName, roles = []) {
-	return { id, displayName, user: { bot: false }, roles: { cache: { has: role => roles.includes(role) } } };
+	return { id, displayName, user: { bot: false, globalName: null, username: displayName }, roles: { cache: { has: role => roles.includes(role) } } };
 }
 
 test("on-demand identity resolution uses an existing mapping without fetching Discord or OpenProject", async () => {
