@@ -13,6 +13,7 @@
 		"sync:ai-corpus": "npm run build && node dist/sync-ai-corpus.js",
 		"corpus:ui": "npm run build && node dist/ai-corpus-server.js",
 		"evaluate:ai-blob": "npm run build && node dist/evaluate-ai-blob.js",
+		"evaluate:ai-bakeoff-blob": "npm run build && node dist/evaluate-ai-bakeoff-blob.js",
 		"replay:ai": "npm run build && node dist/replay-ai.js",
 		"sync:embeddings": "npm run build && node dist/sync-embeddings.js",
 		"migrate:db": "npm run build && node dist/migrate-db.js",
