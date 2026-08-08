@@ -71,7 +71,7 @@ export function runtimeGroundedCandidates(tasks: ExtractedTask[], messages: Mini
 	return mergeRelatedTaskCandidates(runtimeReferenceValidCandidates(tasks, messages));
 }
 
-function runtimeReferenceValidCandidates(tasks: ExtractedTask[], messages: MinimizedMessage[]) {
+export function runtimeReferenceValidCandidates(tasks: ExtractedTask[], messages: MinimizedMessage[]) {
 	const validMessageIds = new Set(messages.map(message => message.id));
 	const focalMessageIds = new Set(messages
 		.filter(message => message.contextRole === "primary" || message.priority)
@@ -174,6 +174,32 @@ export function proposalDiagnostics(expected: ExpectedProposal[], predicted: Ext
 		}
 	}
 	return diagnostics;
+}
+
+export function exactProposalMatchCount(expected: ExpectedProposal[], predicted: ExtractedTask[]) {
+	const compatiblePredictions = expected.map(expectedProposal => predicted.flatMap((candidate, candidateIndex) => {
+		if (candidate.proposed_action !== expectedProposal.action || !sameSet(candidate.source_message_ids, expectedProposal.sourceMessageIds)) return [];
+		if (expectedProposal.projectName !== undefined && normalizedProject(candidate.project_name) !== normalizedProject(expectedProposal.projectName)) return [];
+		const content = `${candidate.title}\n${candidate.description}`.toLocaleLowerCase();
+		return expectedProposal.titleIncludes.every(term => content.includes(term.toLocaleLowerCase())) ? [candidateIndex] : [];
+	}));
+	const predictionMatches = Array<number>(predicted.length).fill(-1);
+	const assign = (expectedIndex: number, visited: Set<number>): boolean => {
+		for (const predictedIndex of compatiblePredictions[expectedIndex]!) {
+			if (visited.has(predictedIndex)) continue;
+			visited.add(predictedIndex);
+			if (predictionMatches[predictedIndex] === -1 || assign(predictionMatches[predictedIndex]!, visited)) {
+				predictionMatches[predictedIndex] = expectedIndex;
+				return true;
+			}
+		}
+		return false;
+	};
+	let matches = 0;
+	for (let expectedIndex = 0; expectedIndex < expected.length; expectedIndex++) {
+		if (assign(expectedIndex, new Set())) matches++;
+	}
+	return matches;
 }
 
 function addProposalDiagnostics(total: ProposalDiagnostics, diagnostics: ProposalDiagnostics) {

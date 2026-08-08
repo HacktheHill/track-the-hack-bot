@@ -110,6 +110,30 @@ accuracy remain reported diagnostics and are not release thresholds. The JSON
 report records `passed` and `thresholdFailures`; the Azure job publishes both
 reports before returning a failed status for a threshold miss.
 
+For a controlled evaluation-only comparison of the current two-stage strategy
+with a combined one-pass strategy, run `npm run evaluate:ai-bakeoff-blob`. This
+entrypoint reads and parses the same digest- and ETag-checked immutable Blob
+snapshot once for both strategies. It does not replace `evaluate:ai-blob`, alter
+release thresholds, or expose one-pass extraction through the production
+`TaskExtractor` interface. Bakeoff caches have strategy-specific identities
+under `bakeoff-cache/`. Published bakeoff reports contain aggregate quality,
+logical-call, HTTP-attempt, prompt/completion/total-token, latency, retry, HTTP
+429, error, and cache metrics only; they never contain case IDs, message text,
+predictions, or source IDs.
+The normal uncached-window limit applies before either arm makes a model call.
+Use `npm run evaluate:ai-bakeoff-blob -- --full` as the dedicated explicit opt-in
+when the verified snapshot exceeds `AI_EVAL_MAX_UNCACHED_CASES`. Reports separate
+historical per-strategy cost telemetry retained in caches from HTTP attempts,
+retries, throttles, latency, and cache behavior observed in the current run.
+Reported token totals are marked as lower bounds whenever any HTTP response lacks
+complete usage telemetry. Quality is marked non-comparable whenever either arm
+has failed windows.
+Provider latency is measured and summed per actual HTTP attempt, including failed
+and retried attempts, but excluding token acquisition, limiter queueing, and
+evaluation pacing. It is complete for every observed HTTP attempt; wrapper
+latency is not added again. Strategy runtime remains separately labeled as
+client-observed evaluation wall time.
+
 ## Cost controls
 
 Per-case predictions are cached by corpus content, pipeline version, deployment,
