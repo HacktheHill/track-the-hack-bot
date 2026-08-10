@@ -12,6 +12,7 @@ import bodyParser from "body-parser";
 import { config } from "dotenv";
 import { getClient, isIntegrationReady } from "./bot.js";
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { verificationLink } from "./verification-link.js";
 
 config();
 
@@ -140,7 +141,7 @@ app.listen(PORT, () => {
 });
 
 const getVerificationLinkButton = (userId: string) => {
-	const link = `${TRACK_THE_HACK_URL}/discord?id=${userId}`;
+	const link = verificationLink(TRACK_THE_HACK_URL, INTERNAL_API_SECRET, userId);
 	return new ActionRowBuilder<ButtonBuilder>().addComponents(
 		new ButtonBuilder()
 			.setLabel("Verification Link / Lien de vérification")

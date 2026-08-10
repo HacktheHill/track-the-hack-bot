@@ -4,6 +4,8 @@ import { SlashCommandBuilder } from "@discordjs/builders";
 import { config } from "dotenv";
 import { aiTaskMessageCommand, taskCommand, taskMessageCommand } from "./tasks.js";
 import { scheduleCommand } from "./scheduler.js";
+import { loadTeamFinderConfig } from "./config.js";
+import { teamFinderRegistration } from "./team-finder-command.js";
 
 config();
 
@@ -20,6 +22,8 @@ if (
 	process.exit(1);
 }
 
+const teamFinderCommands = teamFinderRegistration(loadTeamFinderConfig());
+
 const communityCommands = [
 	new SlashCommandBuilder()
 		.setName("verify")
@@ -27,6 +31,7 @@ const communityCommands = [
 			"Get a verification link | Obtenir un lien de vérification",
 		)
 		.toJSON(),
+	...teamFinderCommands.community,
 ];
 
 const organizerCommands = [
@@ -40,6 +45,7 @@ const organizerCommands = [
 	scheduleCommand.toJSON(),
 	taskMessageCommand.toJSON(),
 	aiTaskMessageCommand.toJSON(),
+	...teamFinderCommands.organizer,
 ];
 
 const sharedCommands = [
@@ -47,6 +53,7 @@ const sharedCommands = [
 		.setName("help")
 		.setDescription("Get help | Obtenir de l'aide")
 		.toJSON(),
+	...teamFinderCommands.shared,
 ];
 
 const rest = new REST().setToken(DISCORD_TOKEN);
