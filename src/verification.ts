@@ -16,6 +16,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 config();
 
 const app = express();
+app.disable("x-powered-by");
 app.use(bodyParser.json());
 
 const startedAt = new Date().toISOString();
@@ -77,6 +78,11 @@ const log = async (client: Client, member: GuildMember) => {
 
 app.post("/verify", async (req: Request, res: Response) => {
 	const { discordId } = req.body;
+
+	if (!discordId || typeof discordId !== "string") {
+		return res.status(400).json({ error: "Invalid or missing discordId" });
+	}
+
 	const requestTimestamp = req.header("x-track-the-hack-timestamp");
 	const requestSignature = req.header("x-track-the-hack-signature");
 	const sharedSecret = INTERNAL_API_SECRET;
@@ -112,6 +118,10 @@ app.post("/verify", async (req: Request, res: Response) => {
 
 		if (!member || !role) {
 			return res.status(404).json({ error: "User or role not found" });
+		}
+
+		if (member.roles.cache.has(role.id)) {
+			return res.json({ status: "Success", message: "User already verified" });
 		}
 
 		await member.roles.add(role);
