@@ -17,7 +17,7 @@ config();
 
 const app = express();
 app.disable("x-powered-by");
-app.use(bodyParser.json());
+app.use(bodyParser.json({ verify: (req: any, _res, buf) => { req.rawBody = buf; } }));
 
 const startedAt = new Date().toISOString();
 
@@ -87,7 +87,7 @@ app.post("/verify", async (req: Request, res: Response) => {
 	const requestSignature = req.header("x-track-the-hack-signature");
 	const sharedSecret = INTERNAL_API_SECRET;
 	const timestamp = Number(requestTimestamp);
-	const rawBody = JSON.stringify(req.body);
+	const rawBody = (req as any).rawBody ? (req as any).rawBody.toString('utf8') : JSON.stringify(req.body);
 	const signedPayload = `${requestTimestamp ?? ""}.${rawBody}`;
 	const expectedSignature = createHmac("sha256", sharedSecret)
 		.update(signedPayload)
