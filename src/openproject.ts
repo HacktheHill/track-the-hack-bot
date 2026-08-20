@@ -234,12 +234,21 @@ export class OpenProjectClient {
 		}
 	}
 
-	private async cached<T>(key: string, loader: () => Promise<T>) {
+	private async cached<T>(key: string, loader: () => Promise<T>): Promise<T> {
 		const cached = this.cache.get(key);
-		if (cached && cached.expiresAt > Date.now()) return cached.value as T;
-		const value = await loader();
-		this.cache.set(key, { value, expiresAt: Date.now() + this.config.OPENPROJECT_CACHE_TTL_MS });
-		return value;
+		if (cached && cached.expiresAt > Date.now()) return cached.value as Promise<T>;
+		// Optimization: Prevent cache stampedes (thundering herd problem) by storing the pending
+		// Promise immediately instead of awaiting it. If multiple concurrent requests hit this
+		// method before the first one completes, they will all share and await the same Promise.
+		// Expected impact: Eliminates duplicate parallel OpenProject API requests for the same
+		// data (e.g. metadata options during creation), reducing external latency and rate limits.
+		const promise = loader().catch((error) => {
+			// Clear the poisoned promise from the cache if it hasn't been overwritten.
+			if (this.cache.get(key)?.value === promise) this.cache.delete(key);
+			throw error;
+		});
+		this.cache.set(key, { value: promise, expiresAt: Date.now() + this.config.OPENPROJECT_CACHE_TTL_MS });
+		return promise;
 	}
 
 	private async collection<T>(path: string) {
