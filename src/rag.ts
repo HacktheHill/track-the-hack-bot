@@ -127,22 +127,28 @@ export function workPackageRetrievalDescription(workPackage: WorkPackage) {
 	return [...metadata, body].filter(Boolean).join("\n\n");
 }
 
+const lexicalStopWords = new Set(["and", "for", "the", "with"]);
+const lexicalEditWords = new Set(["change", "changed", "edit", "modify", "modified", "revise", "revised", "revision", "update", "updated"]);
+
 export function lexicalTitleSimilarity(left: string, right: string) {
-	const stopWords = new Set(["and", "for", "the", "with"]);
-	const editWords = new Set(["change", "changed", "edit", "modify", "modified", "revise", "revised", "revision", "update", "updated"]);
 	const canonical = (word: string) => {
-		if (editWords.has(word)) return "edit";
+		if (lexicalEditWords.has(word)) return "edit";
 		if (word.length > 4 && word.endsWith("ies")) return `${word.slice(0, -3)}y`;
 		if (word.length > 4 && word.endsWith("s") && !word.endsWith("ss")) return word.slice(0, -1);
 		return word;
 	};
 	const words = (value: string) => new Set(value.toLowerCase().match(/[a-z0-9]+/g)
-		?.filter(word => word.length > 2 && !stopWords.has(word))
+		?.filter(word => word.length > 2 && !lexicalStopWords.has(word))
 		.map(canonical) ?? []);
 	const leftWords = words(left);
 	const rightWords = words(right);
 	if (!leftWords.size || !rightWords.size) return 0;
-	const intersection = [...leftWords].filter(word => rightWords.has(word)).length;
+
+	let intersection = 0;
+	for (const word of leftWords) {
+		if (rightWords.has(word)) intersection++;
+	}
+
 	return intersection / new Set([...leftWords, ...rightWords]).size;
 }
 
