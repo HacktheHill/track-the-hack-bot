@@ -17,7 +17,13 @@ config();
 
 const app = express();
 app.disable("x-powered-by");
-app.use(bodyParser.json());
+app.use(
+	bodyParser.json({
+		verify: (req: Request, _res: Response, buf: Buffer) => {
+			(req as any).rawBody = buf.toString("utf8");
+		},
+	}),
+);
 
 const startedAt = new Date().toISOString();
 
@@ -87,7 +93,9 @@ app.post("/verify", async (req: Request, res: Response) => {
 	const requestSignature = req.header("x-track-the-hack-signature");
 	const sharedSecret = INTERNAL_API_SECRET;
 	const timestamp = Number(requestTimestamp);
-	const rawBody = JSON.stringify(req.body);
+	// Security: Use the exact original request string to validate the signature
+	// so that whitespace differences do not bypass validation.
+	const rawBody = (req as any).rawBody || "";
 	const signedPayload = `${requestTimestamp ?? ""}.${rawBody}`;
 	const expectedSignature = createHmac("sha256", sharedSecret)
 		.update(signedPayload)
