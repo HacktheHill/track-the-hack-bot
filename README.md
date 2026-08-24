@@ -45,6 +45,8 @@ the Hack the Hill Discord-to-OpenProject task workflow.
    | `COMMUNITY_GUILD_HACKER_ROLE_ID` | Role assigned after verification |
    | `COMMUNITY_GUILD_ORGANIZER_ROLE_ID` | Organizer role managed in the Community server |
    | `ORGANIZER_GUILD_ORGANIZER_ROLE_ID` | Source Organizer role and mapping-admin role |
+   | `TEAM_FINDER_FORUM_CHANNEL_ID` | Community forum for Team Finder listings |
+   | `TEAM_FINDER_CONVERSATION_CHANNEL_ID` | Community text channel that owns private Team Finder threads |
    | `LOG_CHANNEL_ID` | Community verification log channel |
    | `TRACK_THE_HACK_URL` | Public Track the Hack application URL |
    | `INTERNAL_API_SECRET` | Shared secret for signed verification requests |
@@ -83,6 +85,10 @@ above the Hacker and Organizer roles that it manages.
 ### Commands
 
 - **`/verify`**: Get a Community-server verification link.
+- **`/team-find post|dm|close`**: Publish, contact, or close a Team Finder listing.
+- **`/team-find rank|rankings`**: Order a request or privately view both party rankings.
+- **`/team-find offer|accept|reject|decline`**: Resolve a request from its private
+  Team Finder conversation. Team captains control team actions.
 - **`/sync`**: Synchronize the configured Organizer role and nicknames to the
   Community server.
 - **`/help`**: Show server-specific command help.
