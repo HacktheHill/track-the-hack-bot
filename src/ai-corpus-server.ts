@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -29,6 +29,13 @@ function sessionToken(request: Request) {
 	return cookies?.[1] ? decodeURIComponent(cookies[1]) : undefined;
 }
 
+function timingSafeEqualString(a: string | undefined, b: string | undefined) {
+	if (typeof a !== "string" || typeof b !== "string") return false;
+	const aBuffer = Buffer.from(a, "utf8");
+	const bBuffer = Buffer.from(b, "utf8");
+	return aBuffer.length === bBuffer.length && timingSafeEqual(aBuffer, bBuffer);
+}
+
 export function createCorpusApp(options: {
 	store: CorpusStore;
 	token: string;
@@ -47,7 +54,7 @@ export function createCorpusApp(options: {
 		next();
 	});
 	app.use("/api", (request, response, next) => {
-		if (sessionToken(request) !== options.token) return response.status(401).send("Invalid corpus session.");
+		if (!timingSafeEqualString(sessionToken(request), options.token)) return response.status(401).send("Invalid corpus session.");
 		next();
 	});
 	app.use(express.json({ limit: "1mb" }));
@@ -131,8 +138,8 @@ export function createCorpusApp(options: {
 	app.get("/", async (_request, response, next) => {
 		try {
 			const request = _request;
-			if (sessionToken(request) !== options.token) {
-				if (request.query.token !== options.token) return response.status(401).send("Open the one-time URL printed by the corpus UI process.");
+			if (!timingSafeEqualString(sessionToken(request), options.token)) {
+				if (!timingSafeEqualString(typeof request.query.token === "string" ? request.query.token : undefined, options.token)) return response.status(401).send("Open the one-time URL printed by the corpus UI process.");
 				response.setHeader("Set-Cookie", `corpus_session=${encodeURIComponent(options.token)}; HttpOnly; SameSite=Strict; Path=/`);
 				return response.redirect(303, "/");
 			}
