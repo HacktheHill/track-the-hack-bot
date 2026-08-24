@@ -28,6 +28,23 @@ const registerSyncCommand = (client: Client) => {
 
 		if (commandName === "sync") {
 			try {
+				let isOrganizer = false;
+				if (interaction.guildId === COMMUNITY_GUILD_ID) {
+					const member = await interaction.guild?.members.fetch(interaction.user.id).catch(() => null);
+					isOrganizer = member?.roles.cache.has(COMMUNITY_GUILD_ORGANIZER_ROLE_ID) ?? false;
+				} else if (interaction.guildId === ORGANIZER_GUILD_ID) {
+					const member = await interaction.guild?.members.fetch(interaction.user.id).catch(() => null);
+					isOrganizer = member?.roles.cache.has(ORGANIZER_GUILD_ORGANIZER_ROLE_ID) ?? false;
+				}
+
+				if (!isOrganizer) {
+					await interaction.reply({
+						content: "You do not have permission to run this command. | Vous n'avez pas la permission d'exécuter cette commande.",
+						ephemeral: true,
+					});
+					return;
+				}
+
 				await interaction.reply({
 					content:
 						"Syncing organizer roles and nicknames... | Synchronisation des rôles et surnoms d'organisateur...",
