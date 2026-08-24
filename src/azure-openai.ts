@@ -547,22 +547,29 @@ export function hasForbiddenGeneratedText(value: string) {
 	return forbiddenGeneratedText.test(value);
 }
 
+// ⚡ Bolt: Optimized boundedExtractionMessages to use a Set for O(1) duplicate checking
+// instead of Array.some() which is O(N). Also pre-computes priority for sorting (Schwartzian transform)
+// to avoid repeated priority lookups during sorting.
 export function boundedExtractionMessages(messages: MinimizedMessage[], maxChars: number) {
 	const selected: MinimizedMessage[] = [];
 	let remaining = maxChars;
 	const rolePriority = { primary: 0, thread_root: 1, reply_target: 2, referenced_history: 2, preceding: 3, subsequent: 3 } as const;
-	const ordered = [...messages].sort((left, right) => {
-		const leftPriority = left.contextRole ? rolePriority[left.contextRole] : left.priority ? 0 : 3;
-		const rightPriority = right.contextRole ? rolePriority[right.contextRole] : right.priority ? 0 : 3;
-		return leftPriority - rightPriority || right.timestamp.localeCompare(left.timestamp);
-	});
+	const ordered = messages.map(message => ({
+		message,
+		priority: message.contextRole ? rolePriority[message.contextRole] : message.priority ? 0 : 3
+	})).sort((left, right) => {
+		return left.priority - right.priority || right.message.timestamp.localeCompare(left.message.timestamp);
+	}).map(item => item.message);
+
+	const selectedIds = new Set<string>();
 	for (const message of ordered) {
-		if (selected.some(item => item.id === message.id)) continue;
+		if (selectedIds.has(message.id)) continue;
 		const overhead = message.authorAlias.length + message.timestamp.length + 100;
 		if (overhead >= remaining) continue;
 		const text = message.text.slice(0, remaining - overhead);
 		if (!text) continue;
 		selected.push({ ...message, text });
+		selectedIds.add(message.id);
 		remaining -= text.length + overhead;
 	}
 	return selected.sort((left, right) => left.timestamp.localeCompare(right.timestamp));
