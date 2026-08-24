@@ -71,6 +71,8 @@ export function normalizeTaskTitle(value: string) {
 	return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 
+const duplicateStopWords = new Set(["and", "for", "the", "to", "with"]);
+
 export function titlesLikelyDuplicate(left: string, right: string) {
 	const a = normalizeTaskTitle(left);
 	const b = normalizeTaskTitle(right);
@@ -80,10 +82,14 @@ export function titlesLikelyDuplicate(left: string, right: string) {
 	const rightIdentifiers = identifiers(b);
 	if (leftIdentifiers.size !== rightIdentifiers.size || [...leftIdentifiers].some(word => !rightIdentifiers.has(word))) return false;
 	if (a === b || (Math.min(a.length, b.length) >= 12 && (a.includes(b) || b.includes(a)))) return true;
-	const stopWords = new Set(["and", "for", "the", "to", "with"]);
-	const leftWords = new Set(a.split(" ").filter(word => word.length > 2 && !stopWords.has(word)));
-	const rightWords = new Set(b.split(" ").filter(word => word.length > 2 && !stopWords.has(word)));
-	const intersection = [...leftWords].filter(word => rightWords.has(word)).length;
+	const leftWords = new Set(a.split(" ").filter(word => word.length > 2 && !duplicateStopWords.has(word)));
+	const rightWords = new Set(b.split(" ").filter(word => word.length > 2 && !duplicateStopWords.has(word)));
+
+	let intersection = 0;
+	for (const word of leftWords) {
+		if (rightWords.has(word)) intersection++;
+	}
+
 	return intersection >= 2 && intersection / Math.min(leftWords.size, rightWords.size) >= 0.8;
 }
 
