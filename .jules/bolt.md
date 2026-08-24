@@ -1,0 +1,3 @@
+## 2024-05-24 - O(N) optimizations for context message extraction
+**Learning:** Found an `Array.some()` used to check for duplicate items within a loop filtering Discord context messages, leading to O(N^2) complexity that becomes significant when analyzing many messages. The sorting operation was also repeatedly performing dictionary lookups (`rolePriority`) and conditional checks inside the comparator.
+**Action:** Always prefer `Set.has()` over `Array.some()` or `Array.includes()` for membership checks inside loops (O(1) instead of O(N)). Use the Schwartzian transform (`map` -> `sort` -> `map`) to pre-calculate sort keys (priorities) and avoid doing the same expensive checks O(N log N) times inside the sort comparator.
