@@ -11,9 +11,24 @@ export type IdentityResolution = {
 	problem?: "member_unavailable" | "ambiguous_or_unmapped" | "collision";
 };
 
+// ⚡ Bolt: Cache normalized names to prevent expensive regex and string operations from repeatedly firing in tight matching loops
+// Using a bounded LRU-like cache to prevent memory leaks in a long-running process
+const normalizedNameCache = new Map<string, string>();
+const MAX_CACHE_SIZE = 5000;
 export function normalizedName(value: string) {
-	return value.normalize("NFKD").replace(/\p{M}/gu, "").toLocaleLowerCase()
+	let cached = normalizedNameCache.get(value);
+	if (cached !== undefined) return cached;
+	cached = value.normalize("NFKD").replace(/\p{M}/gu, "").toLocaleLowerCase()
 		.replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+
+	if (normalizedNameCache.size >= MAX_CACHE_SIZE) {
+		// Evict oldest entry (first item returned by keys() iterator)
+		const oldestKey = normalizedNameCache.keys().next().value;
+		if (oldestKey !== undefined) normalizedNameCache.delete(oldestKey);
+	}
+
+	normalizedNameCache.set(value, cached);
+	return cached;
 }
 
 function discordNameParts(displayName: string) {

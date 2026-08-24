@@ -1,0 +1,3 @@
+## 2024-10-27 - Identity Resolution String Normalization Bottleneck
+**Learning:** String normalization (`.normalize("NFKD")`) and Unicode regex replacements are surprisingly expensive when called repeatedly inside tight loops (like when filtering a list of users for matching names). The `matchOpenProjectIdentity` function was calling `normalizedName` repeatedly for every user in the catalog on every match attempt, causing a bottleneck.
+**Action:** When filtering or searching based on normalized string representations, always either preprocess the collection to normalize strings once, or memoize the normalization function to cache results. This avoids re-executing expensive regex and string operations unnecessarily.
