@@ -17,6 +17,13 @@ config();
 
 const app = express();
 app.disable("x-powered-by");
+app.use((_req, res, next) => {
+	res.setHeader("X-Content-Type-Options", "nosniff");
+	res.setHeader("X-Frame-Options", "DENY");
+	res.setHeader("Content-Security-Policy", "default-src 'none'");
+	res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+	next();
+});
 app.use(bodyParser.json());
 
 const startedAt = new Date().toISOString();
