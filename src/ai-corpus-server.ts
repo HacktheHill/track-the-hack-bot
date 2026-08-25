@@ -146,7 +146,7 @@ export function createCorpusApp(options: {
 		const statusCode = error instanceof z.ZodError ? 400 : error && typeof error === "object" && "statusCode" in error && typeof error.statusCode === "number" ? error.statusCode : 500;
 		const safeStatus = statusCode === 404 ? 404 : statusCode === 409 || statusCode === 412 ? 409 : statusCode >= 400 && statusCode < 500 ? 400 : 500;
 		const detail = error instanceof z.ZodError ? error.issues[0]?.message ?? "Invalid corpus request." : (error as Error).message;
-		response.status(safeStatus).send(safeStatus === 500 ? "Corpus operation failed. Check the local terminal for the error category." : detail);
+		response.status(safeStatus).type("text/plain").send(safeStatus === 500 ? "Corpus operation failed. Check the local terminal for the error category." : detail);
 		console.error("Corpus UI request failed", { status: safeStatus, error: error instanceof Error ? error.name : "unknown" });
 	});
 	return app;
