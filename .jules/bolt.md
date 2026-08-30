@@ -1,0 +1,3 @@
+## 2026-08-30 - Optimize Array Column Queries with GIN Indexes
+**Learning:** Using `= ANY(array_column)` in PostgreSQL does not utilize GIN indexes effectively. To leverage GIN indexes when querying array columns (e.g., `source_message_ids`), the `@>` (contains) operator should be used instead. Additionally, when using `node-postgres` (`pg`), a single parameterized array argument for the `@>` operator must be wrapped in an extra array (e.g., `[[value]]`) to be parsed correctly.
+**Action:** Use `@>` instead of `= ANY()` when checking for array containment to ensure GIN indexes are utilized. Remember to double-wrap array parameters when passing them to the `pg` driver for array containment queries.
