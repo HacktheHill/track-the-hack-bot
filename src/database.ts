@@ -1169,8 +1169,9 @@ export class Database {
 
 	async pendingProposalsForSourceMessage(messageId: string) {
 		const result = await this.pool.query<{ id: string }>(
-			"SELECT id FROM task_proposals WHERE status='pending_review' AND expires_at > now() AND $1=ANY(source_message_ids)",
-			[messageId],
+			// Ensure GIN index usage on source_message_ids array column
+			"SELECT id FROM task_proposals WHERE status='pending_review' AND expires_at > now() AND source_message_ids @> $1::text[]",
+			[[messageId]],
 		);
 		return result.rows.map(row => row.id);
 	}
@@ -1180,11 +1181,12 @@ export class Database {
 		try {
 			await client.query("BEGIN");
 			const result = await client.query<{ id: string; channel_id: string; review_message_id: string | null }>(
+				// Ensure GIN index usage on source_message_ids array column
 				`UPDATE task_proposals SET status='superseded',review_outcome='superseded',
 				 error='A cited Discord source message was deleted.',reviewed_at=now(),updated_at=now()
-				 WHERE status='pending_review' AND $1=ANY(source_message_ids)
+				 WHERE status='pending_review' AND source_message_ids @> $1::text[]
 				 RETURNING id,channel_id,review_message_id`,
-				[messageId],
+				[[messageId]],
 			);
 			for (const row of result.rows) await client.query(
 				"INSERT INTO task_audit_log(proposal_id,event,metadata) VALUES($1,'source_deleted',$2)",
