@@ -92,14 +92,14 @@ app.post("/verify", async (req: Request, res: Response) => {
 	const expectedSignature = createHmac("sha256", sharedSecret)
 		.update(signedPayload)
 		.digest("hex");
-	const signatureValid = Boolean(
-		requestSignature &&
-		/^[a-f0-9]{64}$/i.test(requestSignature) &&
-		timingSafeEqual(
-			Buffer.from(requestSignature, "utf8"),
-			Buffer.from(expectedSignature, "utf8"),
-		),
-	);
+	let signatureValid = false;
+	if (requestSignature && typeof requestSignature === "string" && /^[a-f0-9]{64}$/i.test(requestSignature)) {
+		const reqSigBuf = Buffer.from(requestSignature, "utf8");
+		const expSigBuf = Buffer.from(expectedSignature, "utf8");
+		if (reqSigBuf.length === expSigBuf.length) {
+			signatureValid = timingSafeEqual(reqSigBuf, expSigBuf);
+		}
+	}
 	const timestampValid = Number.isFinite(timestamp) && Math.abs(Date.now() - timestamp * 1000) <= 300_000;
 
 	if (!signatureValid) {
