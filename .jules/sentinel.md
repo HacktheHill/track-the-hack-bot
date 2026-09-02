@@ -1,4 +1,4 @@
-## 2023-10-27 - [Sentinel] Input Validation and Replay DoS Mitigation in Verification API
-**Vulnerability:** The `/verify` API endpoint lacked input validation for `req.body.discordId`, and was vulnerable to log spam / DoS via replay attacks because it did not check if the user was already verified before acting and logging to Discord.
-**Learning:** The Express integration using `bodyParser.json()` parses input aggressively. If an empty payload is sent, it can lead to `undefined` discordId which fetches the entire Discord guild if unhandled.
-**Prevention:** Always validate API input types, enforce idempotency checks to prevent redundant costly API requests, and add basic security headers like `app.disable("x-powered-by")`.
+## 2024-05-18 - Timing Attack in Authentication
+**Vulnerability:** A timing attack vulnerability was found in the session token verification middleware of the AI corpus UI server `src/ai-corpus-server.ts`. It used standard equality `!==` for token comparison.
+**Learning:** Standard equality operators in JavaScript check strings byte by byte and return immediately upon the first difference. This creates timing side-channels that can allow attackers to guess the valid token character by character.
+**Prevention:** Always use constant-time string comparison algorithms like `crypto.timingSafeEqual` when checking sensitive tokens or authentication secrets. To compare strings safely even when their lengths might differ, hash them with a fast secure hash (e.g., SHA-256) first before feeding them into `timingSafeEqual`.
