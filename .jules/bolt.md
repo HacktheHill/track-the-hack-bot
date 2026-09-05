@@ -1,0 +1,3 @@
+## 2024-05-18 - PostgreSQL Array Column Queries with GIN Indexes
+**Learning:** In PostgreSQL, queries using the `= ANY(array_column)` operator cannot utilize GIN indexes. The GIN index will only be used if array operators like `@>` (contains) or `&&` (overlap) are used. Furthermore, when passing an array parameter to an `@>` operator in the `node-postgres` driver for parameterized queries, the argument must be enclosed in double brackets (e.g. `[[messageId]]`) so it's interpreted as a single array argument.
+**Action:** When querying array columns where a GIN index exists (or is planned), always use array operators like `@>` or `&&` instead of `= ANY()`, and ensure parameters are passed as `[[parameter]]` when using `node-postgres`.
