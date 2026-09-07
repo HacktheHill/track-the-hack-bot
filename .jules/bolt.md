@@ -1,0 +1,3 @@
+## 2026-09-07 - PostgreSQL GIN Index Utilization on Arrays
+**Learning:** PostgreSQL's GIN (Generalized Inverted Index) on array columns cannot be utilized when using the `= ANY()` operator (e.g., `$1 = ANY(array_column)`), falling back to a full table sequential scan.
+**Action:** Always use array containment operators like `@>` (e.g., `array_column @> ARRAY[$1]::text[]`) or `&&` instead of `= ANY()` when querying array columns that have GIN indexes to ensure O(1) index lookups instead of O(N) sequential scans.
