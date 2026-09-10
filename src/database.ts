@@ -1168,8 +1168,10 @@ export class Database {
 	}
 
 	async pendingProposalsForSourceMessage(messageId: string) {
+		// PERF: Using the @> array operator allows PostgreSQL to use the GIN index on source_message_ids,
+		// avoiding sequential scans of the task_proposals table for this frequently executed query.
 		const result = await this.pool.query<{ id: string }>(
-			"SELECT id FROM task_proposals WHERE status='pending_review' AND expires_at > now() AND $1=ANY(source_message_ids)",
+			"SELECT id FROM task_proposals WHERE status='pending_review' AND expires_at > now() AND source_message_ids @> ARRAY[$1]::text[]",
 			[messageId],
 		);
 		return result.rows.map(row => row.id);
@@ -1179,10 +1181,12 @@ export class Database {
 		const client = await this.pool.connect();
 		try {
 			await client.query("BEGIN");
+			// PERF: Using the @> array operator allows PostgreSQL to use the GIN index on source_message_ids,
+			// avoiding sequential scans of the task_proposals table.
 			const result = await client.query<{ id: string; channel_id: string; review_message_id: string | null }>(
 				`UPDATE task_proposals SET status='superseded',review_outcome='superseded',
 				 error='A cited Discord source message was deleted.',reviewed_at=now(),updated_at=now()
-				 WHERE status='pending_review' AND $1=ANY(source_message_ids)
+				 WHERE status='pending_review' AND source_message_ids @> ARRAY[$1]::text[]
 				 RETURNING id,channel_id,review_message_id`,
 				[messageId],
 			);
