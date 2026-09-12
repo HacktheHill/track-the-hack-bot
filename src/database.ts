@@ -1169,7 +1169,9 @@ export class Database {
 
 	async pendingProposalsForSourceMessage(messageId: string) {
 		const result = await this.pool.query<{ id: string }>(
-			"SELECT id FROM task_proposals WHERE status='pending_review' AND expires_at > now() AND $1=ANY(source_message_ids)",
+			// Performance optimization: Using `@>` instead of `= ANY` allows PostgreSQL to use the GIN index on source_message_ids,
+			// reducing query time significantly from O(N) sequential scans on the large task_proposals table.
+			"SELECT id FROM task_proposals WHERE status='pending_review' AND expires_at > now() AND source_message_ids @> ARRAY[$1]::text[]",
 			[messageId],
 		);
 		return result.rows.map(row => row.id);
@@ -1180,9 +1182,11 @@ export class Database {
 		try {
 			await client.query("BEGIN");
 			const result = await client.query<{ id: string; channel_id: string; review_message_id: string | null }>(
+				// Performance optimization: Using `@>` instead of `= ANY` ensures utilization of the GIN index on source_message_ids,
+				// avoiding a full sequential scan.
 				`UPDATE task_proposals SET status='superseded',review_outcome='superseded',
 				 error='A cited Discord source message was deleted.',reviewed_at=now(),updated_at=now()
-				 WHERE status='pending_review' AND $1=ANY(source_message_ids)
+				 WHERE status='pending_review' AND source_message_ids @> ARRAY[$1]::text[]
 				 RETURNING id,channel_id,review_message_id`,
 				[messageId],
 			);
