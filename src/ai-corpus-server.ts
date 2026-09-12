@@ -39,15 +39,15 @@ export function createCorpusApp(options: {
 	const app = express();
 	app.disable("x-powered-by");
 	app.use((request, response, next) => {
-		if (!localAuthority(request.headers.host)) return response.status(403).send("Localhost access only.");
-		if (request.headers.origin && !localAuthority(request.headers.origin)) return response.status(403).send("Cross-origin requests are not allowed.");
+		if (!localAuthority(request.headers.host)) return response.status(403).type("text").send("Localhost access only.");
+		if (request.headers.origin && !localAuthority(request.headers.origin)) return response.status(403).type("text").send("Cross-origin requests are not allowed.");
 		response.setHeader("Cache-Control", "no-store");
 		response.setHeader("X-Content-Type-Options", "nosniff");
 		response.setHeader("Referrer-Policy", "no-referrer");
 		next();
 	});
 	app.use("/api", (request, response, next) => {
-		if (sessionToken(request) !== options.token) return response.status(401).send("Invalid corpus session.");
+		if (sessionToken(request) !== options.token) return response.status(401).type("text").send("Invalid corpus session.");
 		next();
 	});
 	app.use(express.json({ limit: "1mb" }));
@@ -78,10 +78,10 @@ export function createCorpusApp(options: {
 
 	app.post("/api/cases/:id/reconstruction-preview", async (request, response, next) => {
 		try {
-			if (!options.recoverContext) return response.status(503).send("Discord context recovery is not configured for this local review desk.");
+			if (!options.recoverContext) return response.status(503).type("text").send("Discord context recovery is not configured for this local review desk.");
 			const input = recoveryRequestSchema.parse(request.body);
 			const current = await options.store.getCase(request.params.id);
-			if (current.etag !== input.etag) return response.status(409).send("This case changed after it was opened. Reload before recovering context.");
+			if (current.etag !== input.etag) return response.status(409).type("text").send("This case changed after it was opened. Reload before recovering context.");
 			const preview = await options.recoverContext(current.case, input.messageUrls);
 			response.json({ ...preview, etag: current.etag });
 		} catch (error) { next(error); }
@@ -90,7 +90,7 @@ export function createCorpusApp(options: {
 	app.put("/api/cases/:id", async (request, response, next) => {
 		try {
 			const input = caseRequestSchema.parse(request.body);
-			if (input.case.id !== request.params.id) return response.status(400).send("Case ID cannot be changed.");
+			if (input.case.id !== request.params.id) return response.status(400).type("text").send("Case ID cannot be changed.");
 			const now = new Date().toISOString();
 			const value = sanitizeCorpusCase(corpusCaseSchema.parse({
 				...input.case,
@@ -132,7 +132,7 @@ export function createCorpusApp(options: {
 		try {
 			const request = _request;
 			if (sessionToken(request) !== options.token) {
-				if (request.query.token !== options.token) return response.status(401).send("Open the one-time URL printed by the corpus UI process.");
+				if (request.query.token !== options.token) return response.status(401).type("text").send("Open the one-time URL printed by the corpus UI process.");
 				response.setHeader("Set-Cookie", `corpus_session=${encodeURIComponent(options.token)}; HttpOnly; SameSite=Strict; Path=/`);
 				return response.redirect(303, "/");
 			}
@@ -146,7 +146,7 @@ export function createCorpusApp(options: {
 		const statusCode = error instanceof z.ZodError ? 400 : error && typeof error === "object" && "statusCode" in error && typeof error.statusCode === "number" ? error.statusCode : 500;
 		const safeStatus = statusCode === 404 ? 404 : statusCode === 409 || statusCode === 412 ? 409 : statusCode >= 400 && statusCode < 500 ? 400 : 500;
 		const detail = error instanceof z.ZodError ? error.issues[0]?.message ?? "Invalid corpus request." : (error as Error).message;
-		response.status(safeStatus).send(safeStatus === 500 ? "Corpus operation failed. Check the local terminal for the error category." : detail);
+		response.status(safeStatus).type("text").send(safeStatus === 500 ? "Corpus operation failed. Check the local terminal for the error category." : detail);
 		console.error("Corpus UI request failed", { status: safeStatus, error: error instanceof Error ? error.name : "unknown" });
 	});
 	return app;
