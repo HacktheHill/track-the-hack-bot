@@ -13,6 +13,7 @@ import { reconcileOpenProjectUsers } from "./identity.js";
 import { AzureEmbeddingClient } from "./embeddings.js";
 import { OpenProjectRag } from "./rag.js";
 import { registerMessageScheduler } from "./scheduler.js";
+import registerTeamFinder from "./team-finder.js";
 
 config();
 
@@ -60,6 +61,7 @@ client.once("clientReady", async () => {
 	registerHelpCommand(client);
 	registerSyncCommand(client);
 	registerVerificationCommand(client);
+	registerTeamFinder(client);
 
 	registerGuildMemberAddHandler(client);
 

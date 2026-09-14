@@ -46,6 +46,22 @@ const envSchema = z.object({
 	OPENPROJECT_AI_MAX_IMAGE_ATTACHMENTS: z.coerce.number().int().min(0).max(20).default(8),
 });
 
+const teamFinderSchema = z.object({
+	COMMUNITY_GUILD_ID: z.string().regex(/^[1-9]\d{16,19}$/),
+	COMMUNITY_GUILD_HACKER_ROLE_ID: z.string().regex(/^[1-9]\d{16,19}$/),
+	TEAM_FINDER_FORUM_CHANNEL_ID: z.string().regex(/^[1-9]\d{16,19}$/),
+	TEAM_FINDER_CONVERSATION_CHANNEL_ID: z.string().regex(/^[1-9]\d{16,19}$/),
+	TRACK_THE_HACK_URL: z.url(),
+	INTERNAL_API_SECRET: z.string().min(32),
+});
+
+export function loadTeamFinderConfig(env: NodeJS.ProcessEnv = process.env) {
+	const parsed = teamFinderSchema.safeParse(env);
+	return parsed.success ? parsed.data : null;
+}
+
+export type TeamFinderConfig = NonNullable<ReturnType<typeof loadTeamFinderConfig>>;
+
 export type TeamMapping = {
 	projectId: number;
 	openProjectGroupId?: number;
