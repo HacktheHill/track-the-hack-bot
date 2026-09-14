@@ -1,3 +1,3 @@
-## 2024-05-15 - OpenProject Cache Stampede
-**Learning:** The `OpenProjectClient`'s naive `cached()` implementation triggers a cache stampede on startup or high concurrency because it didn't coalesce pending promises. Concurrent requests for `projects()`, `users()`, etc. executed identical API calls.
-**Action:** When implementing application-level caching, always store the `Promise` of the work in progress rather than just the final result, preventing duplicate work while the first request is still inflight.
+## 2024-10-27 - Premature Optimization of Normalized Name Cache
+**Learning:** An optimization that saves compute time in isolation (like caching `normalizedName` to avoid regex/string parsing) is not worth the complexity if it only runs on a cold path that is already dominated by network latency (DB reads, API calls). The saving of single-digit milliseconds is imperceptible and adding a bounded eviction cache introduces ongoing maintenance complexity.
+**Action:** Always evaluate the performance context of an operation before optimizing it. Ask: "Is this on a hot path?" and "Is the cost of this operation actually the bottleneck compared to surrounding network or I/O operations?" Do not add caching complexity for cold paths dominated by network calls.

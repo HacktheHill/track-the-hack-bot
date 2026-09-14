@@ -112,7 +112,7 @@ export function workPackageChangesApplied(workPackage: WorkPackage, changes: Rec
 export class OpenProjectClient {
 	private readonly base: string;
 	private readonly authorization: string;
-	private readonly cache = new Map<string, { expiresAt: number; value: unknown } | Promise<unknown>>();
+	private readonly cache = new Map<string, { expiresAt: number; value: unknown }>();
 
 	constructor(private readonly config: IntegrationConfig) {
 		this.base = config.OPENPROJECT_BASE_URL.replace(/\/$/, "");
@@ -235,23 +235,11 @@ export class OpenProjectClient {
 	}
 
 	private async cached<T>(key: string, loader: () => Promise<T>) {
-		const existing = this.cache.get(key);
-		if (existing) {
-			if (existing instanceof Promise) {
-				return await existing as T;
-			} else if (existing.expiresAt > Date.now()) {
-				return existing.value as T;
-			}
-		}
-		const promise = loader().then(value => {
-			this.cache.set(key, { value, expiresAt: Date.now() + this.config.OPENPROJECT_CACHE_TTL_MS });
-			return value;
-		}).catch(err => {
-			this.cache.delete(key);
-			throw err;
-		});
-		this.cache.set(key, promise);
-		return promise;
+		const cached = this.cache.get(key);
+		if (cached && cached.expiresAt > Date.now()) return cached.value as T;
+		const value = await loader();
+		this.cache.set(key, { value, expiresAt: Date.now() + this.config.OPENPROJECT_CACHE_TTL_MS });
+		return value;
 	}
 
 	private async collection<T>(path: string) {
