@@ -27,7 +27,10 @@ The Track the Hack web application calls `POST /verify` over the private
 Container Apps network. Both workloads must use the same `INTERNAL_API_SECRET`.
 Requests are authenticated with `x-track-the-hack-timestamp` and
 `x-track-the-hack-signature`, where the signature is HMAC-SHA256 over
-`timestamp.body`.
+`discord-complete:v1:TIMESTAMP.EXACT_JSON_BODY`. The body is `{ token, hackerId }`;
+the token is the bot-issued signed opaque proof, and Track derives `hackerId`
+from the participant session. Raw Discord-ID payloads are rejected. See the
+[verification workflow](../README.md#participant-verification).
 
 ## Runtime configuration
 
@@ -46,8 +49,10 @@ to be secrets.
 
 The OpenProject integration is enabled only when all required values accepted by
 `src/config.ts` are present. For production, run `npm run migrate:db` as a
-reviewed one-off Container Apps Job, then set `OPENPROJECT_RUN_MIGRATIONS=false`
-on the bot. Local development may keep the default `true` value. After the
+reviewed one-off Container Apps Job, then set both `OPENPROJECT_RUN_MIGRATIONS=false`
+and `VERIFICATION_RUN_MIGRATIONS=false` on the bot. PostgreSQL is required for
+verification even if OpenProject is disabled; the migration command creates
+the verification tables independently. Local development may keep the default `true` value. After the
 migration job completes, the bot runtime principal needs only runtime DML
 permissions.
 
