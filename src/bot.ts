@@ -2,7 +2,7 @@ import { Client, GatewayIntentBits, Partials } from "discord.js";
 import { config } from "dotenv";
 import registerHelpCommand from "./help.js";
 import registerSyncCommand, { registerGuildMemberAddHandler } from "./sync.js";
-import registerVerificationCommand from "./verification.js";
+import registerVerificationCommand, { closeVerification } from "./verification.js";
 import { loadIntegrationConfig } from "./config.js";
 import { Database } from "./database.js";
 import { OpenProjectClient } from "./openproject.js";
@@ -114,6 +114,7 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
 		void (async () => {
 			integrationReady = false;
 			client.destroy();
+			await closeVerification();
 			await integrationDb?.close();
 			process.exit(0);
 		})();
