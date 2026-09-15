@@ -300,7 +300,14 @@ export async function removeProposalReviewCard(client: Client, db: Database, pro
 
 export async function cleanupTerminalProposalCards(client: Client, db: Database) {
 	const proposals = await db.terminalProposalReviewMessages();
-	for (const proposal of proposals) await removeProposalReviewCard(client, db, proposal);
+	// Run independent external API removals concurrently to prevent blocking the cron job.
+	// This reduces latency from O(N) sequential Discord fetches to O(1) concurrent latency.
+	const results = await Promise.allSettled(proposals.map(proposal => removeProposalReviewCard(client, db, proposal)));
+	for (const result of results) {
+		if (result.status === "rejected") {
+			console.error("Proposal review card concurrent cleanup failed", { error: (result.reason as Error)?.message ?? String(result.reason) });
+		}
+	}
 	return proposals.length;
 }
 
