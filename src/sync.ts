@@ -163,11 +163,17 @@ const syncOrganizerRoleAndNicknames = async (
 	singleUserId?: string,
 ) => {
 	try {
-		const organizerGuild = await client.guilds.fetch(ORGANIZER_GUILD_ID);
-		const organizerMembers = await organizerGuild.members.fetch();
+		// ⚡ Bolt: Fetch guilds concurrently to improve performance
+		const [organizerGuild, communityGuild] = await Promise.all([
+			client.guilds.fetch(ORGANIZER_GUILD_ID),
+			client.guilds.fetch(COMMUNITY_GUILD_ID)
+		]);
 
-		const communityGuild = await client.guilds.fetch(COMMUNITY_GUILD_ID);
-		const communityMembers = await communityGuild.members.fetch();
+		// ⚡ Bolt: Fetch guild members concurrently to improve performance
+		const [organizerMembers, communityMembers] = await Promise.all([
+			organizerGuild.members.fetch(),
+			communityGuild.members.fetch()
+		]);
 
 		const errors: string[] = [];
 
