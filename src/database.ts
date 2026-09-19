@@ -1178,30 +1178,27 @@ export class Database {
 	}
 
 	async supersedePendingProposalsForDeletedSource(messageId: string) {
-		const client = await this.pool.connect();
-		try {
-			await client.query("BEGIN");
-			// Use the @> array operator rather than = ANY() to ensure the PostgreSQL query planner
-			// correctly utilizes the GIN index on source_message_ids for improved performance.
-			const result = await client.query<{ id: string; channel_id: string; review_message_id: string | null }>(
-				`UPDATE task_proposals SET status='superseded',review_outcome='superseded',
-				 error='A cited Discord source message was deleted.',reviewed_at=now(),updated_at=now()
-				 WHERE status='pending_review' AND source_message_ids @> ARRAY[$1]::text[]
-				 RETURNING id,channel_id,review_message_id`,
-				[messageId],
-			);
-			for (const row of result.rows) await client.query(
-				"INSERT INTO task_audit_log(proposal_id,event,metadata) VALUES($1,'source_deleted',$2)",
-				[row.id, jsonParameter({ messageId })],
-			);
-			await client.query("COMMIT");
-			return result.rows;
-		} catch (error) {
-			await client.query("ROLLBACK");
-			throw error;
-		} finally {
-			client.release();
-		}
+		// Optimization: Use a CTE (Common Table Expression) to perform the batched UPDATE and multiple INSERTs
+		// in a single database roundtrip. This eliminates the N+1 query problem where a separate
+		// INSERT query was previously executed for every updated proposal in the application loop.
+		const result = await this.pool.query<{ id: string; channel_id: string; review_message_id: string | null }>(
+			`WITH updated AS (
+				-- Use the @> array operator rather than = ANY() to ensure the PostgreSQL query planner
+				-- correctly utilizes the GIN index on source_message_ids for improved performance.
+				UPDATE task_proposals SET status='superseded',review_outcome='superseded',
+				error='A cited Discord source message was deleted.',reviewed_at=now(),updated_at=now()
+				WHERE status='pending_review' AND source_message_ids @> ARRAY[$1]::text[]
+				RETURNING id, channel_id, review_message_id
+			),
+			inserted AS (
+				INSERT INTO task_audit_log(proposal_id, event, metadata)
+				SELECT id, 'source_deleted', $2::jsonb
+				FROM updated
+			)
+			SELECT id, channel_id, review_message_id FROM updated`,
+			[messageId, jsonParameter({ messageId })],
+		);
+		return result.rows;
 	}
 
 	async supersedePendingProposalForInvalidSources(id: string, missingMessageIds: string[], contentChanged = false) {
