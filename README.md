@@ -7,7 +7,7 @@ the Hack the Hill Discord-to-OpenProject task workflow.
 
 - Node.js 24
 - A Discord application installed in the Organizer and Community servers
-- PostgreSQL and OpenProject, if the task integration will be enabled
+- PostgreSQL for participant verification; OpenProject is optional for the task integration
 
 ## Local setup
 
@@ -32,7 +32,7 @@ the Hack the Hill Discord-to-OpenProject task workflow.
 
    Fill in the core Discord, role, log-channel, Track the Hack URL, and HMAC
    values in `.env`. `CLIENT_ID` is required when registering commands. The
-   remaining OpenProject, PostgreSQL, mapping, and optional Azure OpenAI values
+   remaining OpenProject, mapping, and optional Azure OpenAI values
    are documented in [.env.example](.env.example).
 
    The core runtime values are:
@@ -47,7 +47,8 @@ the Hack the Hill Discord-to-OpenProject task workflow.
    | `ORGANIZER_GUILD_ORGANIZER_ROLE_ID` | Source Organizer role and mapping-admin role |
    | `LOG_CHANNEL_ID` | Community verification log channel |
    | `TRACK_THE_HACK_URL` | Public Track the Hack application URL |
-   | `INTERNAL_API_SECRET` | Shared secret for signed verification requests |
+   | `INTERNAL_API_SECRET` | At least 32 random characters, shared with Track for signed links and requests |
+   | `DATABASE_URL` | Bot-owned PostgreSQL database; never Track MySQL |
 
    `PORT` is optional and defaults to `4000`.
 
@@ -77,6 +78,39 @@ Discord Developer Portal. Install the application with the `bot` and
 channels it operates in, including permission to read message history and send
 messages. It also needs Manage Roles and Manage Nicknames, with its bot role
 above the Hacker and Organizer roles that it manages.
+
+## Participant verification
+
+The bot gives each participant a private five-minute `/discord#...` link with
+an opaque random reference and HMAC signature. The participant must activate
+their day-of access in Track using the same browser, then press Verify. Track
+sends the signed proof and the session-derived Hacker ID to `/verify`; it never
+receives a Discord ID. Old raw-ID links/payloads are rejected.
+
+The bot's `discord_verification_challenges` table holds hashed references,
+Discord IDs, and expiry. `discord_participant_links` persists a unique binding
+in each direction. A failed Discord role assignment keeps the binding so the
+same participant can retry, including with a new link. Existing Hacker roles
+still require a binding. Conflicting bindings require organizer intervention;
+there is no silent reassignment or automatic role revocation.
+
+Both tables are created at startup by default, independently of OpenProject.
+To manage migrations externally, run `npm run migrate:db`, then set
+`VERIFICATION_RUN_MIGRATIONS=false`. Startup checks the tables exist. Expired
+challenges are cleaned up when new links are generated; bindings persist
+across restarts and belong to the current event's participant dataset.
+
+Configure the matching `INTERNAL_API_SECRET` and `DISCORD_BOT_URL` in Track,
+and `TRACK_THE_HACK_URL` here. Use HTTPS for deployed URLs and deploy the
+matching Track/bot changes together. Generate fresh links after rollout.
+No Discord command-registration changes are required.
+
+For credential-free testing, build this bot, then run `npm run test:e2e:discord`
+in the adjacent Track checkout (or set its `DISCORD_BOT_REPO` path). The test
+uses this repository's production proof generator, HTTP router, PostgreSQL
+store, and role-assignment adapter; only the Discord API calls are doubled.
+It provisions a disposable local database and never logs into Discord. Full
+wire protocol and test details are in Track's `docs/DISCORD_VERIFICATION.md`.
 
 ## Usage
 

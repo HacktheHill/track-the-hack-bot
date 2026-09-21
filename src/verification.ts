@@ -7,32 +7,13 @@ import {
 	PermissionFlagsBits,
 	TextChannel,
 } from "discord.js";
-import express, { Request, Response } from "express";
-import bodyParser from "body-parser";
 import { config } from "dotenv";
 import { getClient, isIntegrationReady } from "./bot.js";
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { VerificationStore } from "./verification-store.js";
+import { createVerificationApp } from "./verification-api.js";
+import { grantVerifiedHackerRole } from "./verification-role.js";
 
 config();
-
-const app = express();
-app.disable("x-powered-by");
-app.use((_req, res, next) => {
-	res.setHeader("X-Content-Type-Options", "nosniff");
-	res.setHeader("X-Frame-Options", "DENY");
-	res.setHeader("Content-Security-Policy", "default-src 'none'");
-	res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
-	next();
-});
-app.use(
-	bodyParser.json({
-		verify: (req: Request, _res: Response, buf: Buffer) => {
-			(req as any).rawBody = buf.toString("utf8");
-		},
-	}),
-);
-
-const startedAt = new Date().toISOString();
 
 const {
 	PORT = 4000,
@@ -42,6 +23,7 @@ const {
 	LOG_CHANNEL_ID,
 	TRACK_THE_HACK_URL,
 	INTERNAL_API_SECRET,
+	DATABASE_URL,
 } = process.env;
 
 if (
@@ -49,7 +31,9 @@ if (
 	!COMMUNITY_GUILD_HACKER_ROLE_ID ||
 	!COMMUNITY_GUILD_ORGANIZER_ROLE_ID ||
 	!LOG_CHANNEL_ID ||
+	!DATABASE_URL ||
 	!INTERNAL_API_SECRET ||
+	INTERNAL_API_SECRET.length < 32 ||
 	!TRACK_THE_HACK_URL
 ) {
 	console.error("Missing environment variables for verification");
@@ -89,83 +73,29 @@ const log = async (client: Client, member: GuildMember) => {
 	}
 };
 
-app.post("/verify", async (req: Request, res: Response) => {
-	const { discordId } = req.body;
+const verificationStore = new VerificationStore(DATABASE_URL);
+if (process.env.VERIFICATION_RUN_MIGRATIONS !== "false") await verificationStore.migrate();
+// Fail startup if externally managed migrations were not applied.
+await verificationStore.pool.query("SELECT 1 FROM discord_participant_links LIMIT 1");
+await verificationStore.pool.query("SELECT 1 FROM discord_verification_challenges LIMIT 1");
 
-	if (!discordId || typeof discordId !== "string") {
-		return res.status(400).json({ error: "Invalid or missing discordId" });
-	}
-
-	const requestTimestamp = req.header("x-track-the-hack-timestamp");
-	const requestSignature = req.header("x-track-the-hack-signature");
-	const sharedSecret = INTERNAL_API_SECRET;
-	const timestamp = Number(requestTimestamp);
-	// Security: Use the exact original request string to validate the signature
-	// so that whitespace differences do not bypass validation.
-	const rawBody = (req as any).rawBody || "";
-	const signedPayload = `${requestTimestamp ?? ""}.${rawBody}`;
-	const expectedSignature = createHmac("sha256", sharedSecret)
-		.update(signedPayload)
-		.digest("hex");
-	const signatureValid = Boolean(
-		requestSignature &&
-		/^[a-f0-9]{64}$/i.test(requestSignature) &&
-		timingSafeEqual(
-			Buffer.from(requestSignature, "utf8"),
-			Buffer.from(expectedSignature, "utf8"),
-		),
-	);
-	const timestampValid = Number.isFinite(timestamp) && Math.abs(Date.now() - timestamp * 1000) <= 300_000;
-
-	if (!signatureValid) {
-		return res.status(403).json({ error: "Invalid request signature" });
-	}
-	if (requestSignature && !timestampValid) {
-		return res.status(401).json({ error: "Expired request" });
-	}
-
-	try {
+const app = createVerificationApp({
+	secret: INTERNAL_API_SECRET,
+	store: verificationStore,
+	isReady: () => getClient().isReady() && isIntegrationReady(),
+	grantRole: async discordId => {
 		const client = getClient();
-
-		const guild = await client.guilds.fetch(COMMUNITY_GUILD_ID);
-		const member = await guild.members.fetch(discordId);
-		const role = guild.roles.cache.get(COMMUNITY_GUILD_HACKER_ROLE_ID);
-
-		if (!member || !role) {
-			return res.status(404).json({ error: "User or role not found" });
-		}
-
-		if (member.roles.cache.has(role.id)) {
-			return res.json({ status: "Success", message: "User already verified" });
-		}
-
-		await member.roles.add(role);
-		await log(client, member);
-
-		return res.json({ status: "Success" });
-	} catch (error) {
-		console.error(error);
-		return res.status(500).json({ error: "Internal server error" });
-	}
+		await grantVerifiedHackerRole(client, COMMUNITY_GUILD_ID, COMMUNITY_GUILD_HACKER_ROLE_ID, discordId, member => log(client, member));
+	},
 });
+const server = app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+export async function closeVerification() {
+	await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+	await verificationStore.close();
+}
 
-app.get("/healthz", (_req, res) => {
-	res.json({ status: "ok", startedAt });
-});
-
-app.get("/readyz", (_req, res) => {
-	if (!getClient().isReady() || !isIntegrationReady()) {
-		return res.status(503).json({ status: "not_ready" });
-	}
-	return res.json({ status: "ready" });
-});
-
-app.listen(PORT, () => {
-	console.log(`Server running on port ${PORT}`);
-});
-
-const getVerificationLinkButton = (userId: string) => {
-	const link = `${TRACK_THE_HACK_URL}/discord?id=${userId}`;
+const getVerificationLinkButton = async (userId: string) => {
+	const link = await verificationStore.createLink(TRACK_THE_HACK_URL, INTERNAL_API_SECRET, userId);
 	return new ActionRowBuilder<ButtonBuilder>().addComponents(
 		new ButtonBuilder()
 			.setLabel("Verification Link / Lien de vérification")
@@ -174,10 +104,10 @@ const getVerificationLinkButton = (userId: string) => {
 	);
 };
 
-const getVerificationLinkReply = (userId: string) => ({
+const getVerificationLinkReply = async (userId: string) => ({
 	content:
-		"Here is your verification link | Voici votre lien de vérification",
-	components: [getVerificationLinkButton(userId)],
+		"Your private link expires in five minutes. Activate your day-of participant access in the same browser first. | Votre lien privé expire dans cinq minutes. Activez d’abord votre accès de participant dans le même navigateur.",
+	components: [await getVerificationLinkButton(userId)],
 	ephemeral: true,
 });
 
@@ -220,7 +150,7 @@ const registerVerificationCommand = (client: Client) => {
 					await interaction.followUp(getGenerateLinkReply());
 				} else {
 					await interaction.editReply(
-						getVerificationLinkReply(userId),
+						await getVerificationLinkReply(userId),
 					);
 				}
 			}
@@ -233,10 +163,10 @@ const registerVerificationCommand = (client: Client) => {
 
 				const userId = interaction.user.id;
 
-				await interaction.followUp(getVerificationLinkReply(userId));
+				await interaction.followUp(await getVerificationLinkReply(userId));
 			}
-		} catch (error) {
-			console.error("Error handling interaction:", error);
+		} catch {
+			console.error("Error generating verification link");
 			try {
 				const errorMessage =
 					"There was an error handling this interaction. | Une erreur s'est produite lors du traitement de cette interaction.";
