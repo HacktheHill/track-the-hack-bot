@@ -1178,54 +1178,42 @@ export class Database {
 	}
 
 	async supersedePendingProposalsForDeletedSource(messageId: string) {
-		const client = await this.pool.connect();
-		try {
-			await client.query("BEGIN");
-			// Use the @> array operator rather than = ANY() to ensure the PostgreSQL query planner
-			// correctly utilizes the GIN index on source_message_ids for improved performance.
-			const result = await client.query<{ id: string; channel_id: string; review_message_id: string | null }>(
-				`UPDATE task_proposals SET status='superseded',review_outcome='superseded',
+		// Use the @> array operator rather than = ANY() to ensure the PostgreSQL query planner
+		// correctly utilizes the GIN index on source_message_ids for improved performance.
+		// Performance optimization: CTE combines UPDATE and INSERTs into a single roundtrip, preventing N+1 queries.
+		const result = await this.pool.query<{ id: string; channel_id: string; review_message_id: string | null }>(
+			`WITH updated_proposals AS (
+				UPDATE task_proposals SET status='superseded',review_outcome='superseded',
 				 error='A cited Discord source message was deleted.',reviewed_at=now(),updated_at=now()
 				 WHERE status='pending_review' AND source_message_ids @> ARRAY[$1]::text[]
-				 RETURNING id,channel_id,review_message_id`,
-				[messageId],
-			);
-			for (const row of result.rows) await client.query(
-				"INSERT INTO task_audit_log(proposal_id,event,metadata) VALUES($1,'source_deleted',$2)",
-				[row.id, jsonParameter({ messageId })],
-			);
-			await client.query("COMMIT");
-			return result.rows;
-		} catch (error) {
-			await client.query("ROLLBACK");
-			throw error;
-		} finally {
-			client.release();
-		}
+				 RETURNING id,channel_id,review_message_id
+			),
+			inserted_logs AS (
+				INSERT INTO task_audit_log(proposal_id,event,metadata)
+				SELECT id,'source_deleted',$2::jsonb FROM updated_proposals
+			)
+			SELECT * FROM updated_proposals`,
+			[messageId, jsonParameter({ messageId })],
+		);
+		return result.rows;
 	}
 
 	async supersedePendingProposalForInvalidSources(id: string, missingMessageIds: string[], contentChanged = false) {
-		const client = await this.pool.connect();
-		try {
-			await client.query("BEGIN");
-			const result = await client.query(
-				`UPDATE task_proposals SET status='superseded',review_outcome='superseded',
+		// Performance optimization: CTE combines UPDATE and conditional INSERT into a single roundtrip.
+		const result = await this.pool.query(
+			`WITH updated_proposals AS (
+				UPDATE task_proposals SET status='superseded',review_outcome='superseded',
 				 error=$2,reviewed_at=now(),updated_at=now()
-				 WHERE id=$1 AND status='pending_review' AND expires_at > now() RETURNING id`,
-				[id, contentChanged ? "Cited Discord source evidence changed after this proposal was created." : "One or more cited Discord source messages were deleted."],
-			);
-			if (result.rowCount === 1) await client.query(
-				"INSERT INTO task_audit_log(proposal_id,event,metadata) VALUES($1,'source_invalid_preflight',$2)",
-				[id, jsonParameter({ missingMessageIds, contentChanged })],
-			);
-			await client.query("COMMIT");
-			return result.rowCount === 1;
-		} catch (error) {
-			await client.query("ROLLBACK");
-			throw error;
-		} finally {
-			client.release();
-		}
+				 WHERE id=$1 AND status='pending_review' AND expires_at > now() RETURNING id
+			),
+			inserted_logs AS (
+				INSERT INTO task_audit_log(proposal_id,event,metadata)
+				SELECT id,'source_invalid_preflight',$3::jsonb FROM updated_proposals
+			)
+			SELECT * FROM updated_proposals`,
+			[id, contentChanged ? "Cited Discord source evidence changed after this proposal was created." : "One or more cited Discord source messages were deleted.", jsonParameter({ missingMessageIds, contentChanged })],
+		);
+		return result.rowCount === 1;
 	}
 
 	async releaseProposal(id: string, error: string) {
