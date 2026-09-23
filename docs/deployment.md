@@ -141,11 +141,25 @@ conversation-level batching only after the reviewed corpus validates recall.
 ## Build and deployment workflow
 
 [container.yml](../.github/workflows/container.yml) validates the application,
-runs the tests, and builds the image for pull requests. For non-pull-request
-runs on `main`, it publishes an immutable image tagged with the Git commit SHA,
-updates the `track-the-hack-bot` Container App, and verifies that an active
-revision is healthy. The `Production` environment must require a reviewer and
-must be restricted to `main`.
+runs the tests, and builds the image for pull requests and pushes to `main`.
+Deployment requires an explicit workflow dispatch from `main`. It publishes an
+immutable image tagged with the Git commit SHA, runs the migration job, updates
+the `track-the-hack-bot` Container App, and verifies that the new revision is
+healthy. The `Production` environment must be restricted to `main`. Configure a
+required reviewer when the repository plan supports that rule. The workflow's
+`main` guard and explicit dispatch remain mandatory controls.
+
+Before resetting participant verification for a new event, stop or scale down
+the bot and pause Track verification, then run:
+
+```sh
+npm run verification:manage -- reset --confirm-current-event-reset
+```
+
+Decide separately whether to remove the Hacker role from prior participants.
+Resume both services, generate a new link, and verify one new mapping before
+ending the maintenance window. Do not run reset during normal deployment or
+database migration.
 
 Configure these as repository or Production-environment settings, according to
 the repository's GitHub environment policy:

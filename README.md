@@ -97,8 +97,27 @@ there is no silent reassignment or automatic role revocation.
 Both tables are created at startup by default, independently of OpenProject.
 To manage migrations externally, run `npm run migrate:db`, then set
 `VERIFICATION_RUN_MIGRATIONS=false`. Startup checks the tables exist. Expired
-challenges are cleaned up when new links are generated; bindings persist
-across restarts and belong to the current event's participant dataset.
+challenges are cleaned up at startup, every 15 minutes, and when new links are
+generated. Bindings persist across restarts and belong to the current event's
+participant dataset.
+
+Run bot-owned maintenance from a trusted environment with the bot database
+configuration. Commands report counts only and never print participant or
+Discord identifiers:
+
+```sh
+npm run verification:manage -- cleanup
+npm run verification:manage -- unlink --discord-id DISCORD_ID
+npm run verification:manage -- unlink --hacker-id PARTICIPANT_ID
+npm run verification:manage -- reset --confirm-current-event-reset
+```
+
+Unlink removes the binding and every outstanding challenge for the resolved
+Discord account in one transaction. Reset locks and clears both verification
+tables. Pause verification before a reset so an in-flight request cannot recreate
+a binding. These database operations do not remove Discord roles. Role removal
+is a separate organizer decision because the bot does not know whether a member
+held the role before participant verification.
 
 Configure the matching `INTERNAL_API_SECRET` and `DISCORD_BOT_URL` in Track,
 and `TRACK_THE_HACK_URL` here. Use HTTPS for deployed URLs and deploy the
