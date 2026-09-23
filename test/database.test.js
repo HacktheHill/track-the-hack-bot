@@ -461,14 +461,14 @@ test("deleted cited sources supersede only pending proposals transactionally", a
 	const queries = [];
 	const db = databaseWithPool({ async query(sql, values) {
 		queries.push({ sql, values });
-		if (sql.includes("RETURNING id,channel_id")) return { rowCount: 1, rows: [{ id: "proposal", channel_id: "channel", review_message_id: "card" }] };
+		if (sql.includes("WITH updated AS")) return { rowCount: 1, rows: [{ id: "proposal", channel_id: "channel", review_message_id: "card" }] };
 		return { rowCount: 1, rows: [] };
 	} });
 	const rows = await db.supersedePendingProposalsForDeletedSource("message");
 	assert.equal(rows.length, 1);
-	assert.match(queries[1].sql, /WHERE status='pending_review'/);
-	assert.match(queries[2].sql, /source_deleted/);
-	assert.equal(queries.at(-1).sql, "COMMIT");
+	assert.match(queries[0].sql, /WITH updated AS/);
+	assert.match(queries[0].sql, /WHERE status='pending_review'/);
+	assert.match(queries[0].sql, /source_deleted/);
 });
 
 test("source preflight invalidation never transitions an already-creating proposal", async () => {
