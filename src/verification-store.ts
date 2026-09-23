@@ -37,14 +37,84 @@ export class VerificationStore {
 	async createLink(baseUrl: string, secret: string, discordId: string, now = Date.now()) {
 		const reference = randomBytes(32).toString("base64url");
 		const expires = Math.floor(now / 1000) + DISCORD_LINK_TTL_SECONDS;
-		await this.pool.query("DELETE FROM discord_verification_challenges WHERE expires_at <= $1", [new Date(now)]);
-		await this.pool.query(
-			"INSERT INTO discord_verification_challenges(reference_hash,discord_id,expires_at) VALUES($1,$2,$3)",
-			[referenceHash(reference), discordId, new Date(expires * 1000)],
-		);
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			await client.query("DELETE FROM discord_verification_challenges WHERE expires_at <= $1", [new Date(now)]);
+			await client.query(
+				"INSERT INTO discord_verification_challenges(reference_hash,discord_id,expires_at) VALUES($1,$2,$3)",
+				[referenceHash(reference), discordId, new Date(expires * 1000)],
+			);
+			await client.query("COMMIT");
+		} catch (error) {
+			await client.query("ROLLBACK");
+			throw error;
+		} finally {
+			client.release();
+		}
 		const link = new URL("/discord", baseUrl);
 		link.hash = signDiscordLink(reference, expires, secret);
 		return link.toString();
+	}
+	async cleanupExpiredChallenges(now = Date.now()) {
+		const result = await this.pool.query("DELETE FROM discord_verification_challenges WHERE expires_at <= $1", [
+			new Date(now),
+		]);
+		return result.rowCount ?? 0;
+	}
+	async unlinkParticipant(selector: { discordId?: string; hackerId?: string }) {
+		if (Boolean(selector.discordId) === Boolean(selector.hackerId)) {
+			throw new Error("Provide exactly one verification-link selector");
+		}
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			// Block link generation and redemption until both challenge and binding state are removed.
+			await client.query("LOCK TABLE discord_verification_challenges IN ACCESS EXCLUSIVE MODE");
+			const link = selector.discordId
+				? await client.query<{ discord_id: string }>(
+						"SELECT discord_id FROM discord_participant_links WHERE discord_id=$1 FOR UPDATE",
+						[selector.discordId],
+					)
+				: await client.query<{ discord_id: string }>(
+						"SELECT discord_id FROM discord_participant_links WHERE hacker_id=$1 FOR UPDATE",
+						[selector.hackerId],
+					);
+			const discordId = selector.discordId ?? link.rows[0]?.discord_id;
+			if (!discordId) {
+				await client.query("COMMIT");
+				return { links: 0, challenges: 0 };
+			}
+			const challenges = await client.query("DELETE FROM discord_verification_challenges WHERE discord_id=$1", [
+				discordId,
+			]);
+			const links = await client.query("DELETE FROM discord_participant_links WHERE discord_id=$1", [discordId]);
+			await client.query("COMMIT");
+			return { links: links.rowCount ?? 0, challenges: challenges.rowCount ?? 0 };
+		} catch (error) {
+			await client.query("ROLLBACK");
+			throw error;
+		} finally {
+			client.release();
+		}
+	}
+	async resetParticipantLinks() {
+		const client = await this.pool.connect();
+		try {
+			await client.query("BEGIN");
+			await client.query(
+				"LOCK TABLE discord_verification_challenges, discord_participant_links IN ACCESS EXCLUSIVE MODE",
+			);
+			const challenges = await client.query("DELETE FROM discord_verification_challenges");
+			const links = await client.query("DELETE FROM discord_participant_links");
+			await client.query("COMMIT");
+			return { links: links.rowCount ?? 0, challenges: challenges.rowCount ?? 0 };
+		} catch (error) {
+			await client.query("ROLLBACK");
+			throw error;
+		} finally {
+			client.release();
+		}
 	}
 	async bind(token: string, hackerId: string, secret: string, now = Date.now()) {
 		const proof = readDiscordProof(token, secret, now);

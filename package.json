@@ -17,6 +17,7 @@
 		"replay:ai": "npm run build && node dist/replay-ai.js",
 		"sync:embeddings": "npm run build && node dist/sync-embeddings.js",
 		"migrate:db": "npm run build && node dist/migrate-db.js",
+		"verification:manage": "npm run build && node dist/manage-verification.js",
 		"dev": "npx nodemon --exec npx tsx src/bot.ts",
 		"register": "npx tsx src/register.ts"
 	},
