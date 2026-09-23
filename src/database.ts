@@ -1184,15 +1184,19 @@ export class Database {
 			// Use the @> array operator rather than = ANY() to ensure the PostgreSQL query planner
 			// correctly utilizes the GIN index on source_message_ids for improved performance.
 			const result = await client.query<{ id: string; channel_id: string; review_message_id: string | null }>(
-				`UPDATE task_proposals SET status='superseded',review_outcome='superseded',
-				 error='A cited Discord source message was deleted.',reviewed_at=now(),updated_at=now()
-				 WHERE status='pending_review' AND source_message_ids @> ARRAY[$1]::text[]
-				 RETURNING id,channel_id,review_message_id`,
-				[messageId],
-			);
-			for (const row of result.rows) await client.query(
-				"INSERT INTO task_audit_log(proposal_id,event,metadata) VALUES($1,'source_deleted',$2)",
-				[row.id, jsonParameter({ messageId })],
+				`WITH updated_rows AS (
+					UPDATE task_proposals SET status='superseded',review_outcome='superseded',
+					error='A cited Discord source message was deleted.',reviewed_at=now(),updated_at=now()
+					WHERE status='pending_review' AND source_message_ids @> ARRAY[$1]::text[]
+					RETURNING id,channel_id,review_message_id
+				),
+				inserted_audit_logs AS (
+					INSERT INTO task_audit_log(proposal_id,event,metadata)
+					SELECT id,'source_deleted',$2
+					FROM updated_rows
+				)
+				SELECT id,channel_id,review_message_id FROM updated_rows`,
+				[messageId, jsonParameter({ messageId })],
 			);
 			await client.query("COMMIT");
 			return result.rows;
