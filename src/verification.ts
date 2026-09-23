@@ -78,6 +78,11 @@ if (process.env.VERIFICATION_RUN_MIGRATIONS !== "false") await verificationStore
 // Fail startup if externally managed migrations were not applied.
 await verificationStore.pool.query("SELECT 1 FROM discord_participant_links LIMIT 1");
 await verificationStore.pool.query("SELECT 1 FROM discord_verification_challenges LIMIT 1");
+await verificationStore.cleanupExpiredChallenges();
+const challengeCleanup = setInterval(() => {
+	void verificationStore.cleanupExpiredChallenges().catch(() => console.error("Expired verification challenge cleanup failed"));
+}, 15 * 60 * 1000);
+challengeCleanup.unref();
 
 const app = createVerificationApp({
 	secret: INTERNAL_API_SECRET,
@@ -90,6 +95,7 @@ const app = createVerificationApp({
 });
 const server = app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 export async function closeVerification() {
+	clearInterval(challengeCleanup);
 	await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
 	await verificationStore.close();
 }
