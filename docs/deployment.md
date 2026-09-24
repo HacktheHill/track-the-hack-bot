@@ -23,7 +23,8 @@ The production bot runs as a single Azure Container App process with:
   references; and
 - an Azure managed identity when Azure OpenAI extraction is enabled.
 
-The Track the Hack web application calls `POST /verify` over the private
+The Track the Hack web application calls `POST /verify`,
+`POST /participant-links/status`, and `POST /notifications/deliver` over the private
 Container Apps network. Both workloads must use the same `INTERNAL_API_SECRET`.
 Requests are authenticated with `x-track-the-hack-timestamp` and
 `x-track-the-hack-signature`, where the signature is HMAC-SHA256 over
@@ -31,6 +32,11 @@ Requests are authenticated with `x-track-the-hack-timestamp` and
 the token is the bot-issued signed opaque proof, and Track derives `hackerId`
 from the participant session. Raw Discord-ID payloads are rejected. See the
 [verification workflow](../README.md#participant-verification).
+
+Notification endpoints use the same secret with separate signing domains:
+`discord-participant-links-status:v1:` and `discord-notifications-deliver:v1:`.
+Apply the bot database migration before deploying the Track notification UI so
+`notification_delivery_receipts` is available for idempotent DM delivery.
 
 ## Runtime configuration
 
@@ -164,13 +170,13 @@ database migration.
 Configure these as repository or Production-environment settings, according to
 the repository's GitHub environment policy:
 
-| Kind | Name | Purpose |
-| --- | --- | --- |
-| Secret | `AZURE_CLIENT_ID` | Federated deployment identity |
-| Secret | `AZURE_TENANT_ID` | Azure tenant |
-| Secret | `AZURE_SUBSCRIPTION_ID` | Azure subscription |
-| Variable | `AZURE_ACR_LOGIN_SERVER` | Registry login server |
-| Variable | `AZURE_RESOURCE_GROUP` | Container App resource group |
+| Kind     | Name                     | Purpose                       |
+| -------- | ------------------------ | ----------------------------- |
+| Secret   | `AZURE_CLIENT_ID`        | Federated deployment identity |
+| Secret   | `AZURE_TENANT_ID`        | Azure tenant                  |
+| Secret   | `AZURE_SUBSCRIPTION_ID`  | Azure subscription            |
+| Variable | `AZURE_ACR_LOGIN_SERVER` | Registry login server         |
+| Variable | `AZURE_RESOURCE_GROUP`   | Container App resource group  |
 
 The federated deployment identity needs permission to push to the registry and
 update the bot Container App. The Container App's runtime identity separately
@@ -203,8 +209,10 @@ Never print or commit the token.
 2. Deploy an immutable commit-SHA image and confirm an active revision is healthy.
 3. Check `/healthz`, `/readyz`, and the Discord Gateway connection.
 4. Exercise an authenticated Track the Hack-to-bot verification request.
-5. If enabled, verify PostgreSQL and OpenProject operations from a permitted
+5. Exercise signed link-status and DM delivery with a designated test participant;
+   repeat the same delivery ID and confirm that only one DM is created.
+6. If enabled, verify PostgreSQL and OpenProject operations from a permitted
    Organizer channel.
-6. If enabled, test Azure OpenAI drafting in an allowlisted non-sensitive channel.
-7. Confirm the bot has **Manage Webhooks** in channels where organizers schedule messages, then test scheduling and cancellation.
-8. Confirm monitoring covers restarts, unhealthy revisions, and zero replicas.
+7. If enabled, test Azure OpenAI drafting in an allowlisted non-sensitive channel.
+8. Confirm the bot has **Manage Webhooks** in channels where organizers schedule messages, then test scheduling and cancellation.
+9. Confirm monitoring covers restarts, unhealthy revisions, and zero replicas.
