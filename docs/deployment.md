@@ -37,6 +37,9 @@ Notification endpoints use the same secret with separate signing domains:
 `discord-participant-links-status:v1:` and `discord-notifications-deliver:v1:`.
 Apply the bot database migration before deploying the Track notification UI so
 `notification_delivery_receipts` is available for idempotent DM delivery.
+The complete endpoint, receipt, and failure contract is in
+[`notifications.md`](./notifications.md); Track's cross-service runbook owns the
+real-provider send and opt-out acceptance procedure.
 
 ## Runtime configuration
 
@@ -209,10 +212,20 @@ Never print or commit the token.
 2. Deploy an immutable commit-SHA image and confirm an active revision is healthy.
 3. Check `/healthz`, `/readyz`, and the Discord Gateway connection.
 4. Exercise an authenticated Track the Hack-to-bot verification request.
-5. Exercise signed link-status and DM delivery with a designated test participant;
-   repeat the same delivery ID and confirm that only one DM is created.
+5. Exercise signed link-status and DM delivery through Track with a designated test
+   participant and confirm exactly one DM. Confirm replay idempotency in the automated
+   suite; do not hand-sign or replay a production request merely to test it.
 6. If enabled, verify PostgreSQL and OpenProject operations from a permitted
    Organizer channel.
 7. If enabled, test Azure OpenAI drafting in an allowlisted non-sensitive channel.
 8. Confirm the bot has **Manage Webhooks** in channels where organizers schedule messages, then test scheduling and cancellation.
 9. Confirm monitoring covers restarts, unhealthy revisions, and zero replicas.
+
+For notification releases, steps 4–5 must be performed through Track's normal
+participant and organizer flows rather than a hand-signed production request. Follow
+the full
+[`Track notification acceptance checklist`](https://github.com/HacktheHill/track-the-hack/blob/main/docs/NOTIFICATIONS.md#real-provider-end-to-end-acceptance),
+including isolated audience verification, separate confirmation at every external-send
+boundary, exact one-per-channel receipt checks, opt-out enforcement, and final
+closeout. Do not declare the cross-service feature accepted until every applicable
+check is recorded.
