@@ -13,62 +13,62 @@ the Hack the Hill Discord-to-OpenProject task workflow.
 
 1. **Clone the Repository**
 
-   ```bash
-   git clone https://github.com/hackthehill/track-the-hack-bot.git
-   cd track-the-hack-bot
-   ```
+    ```bash
+    git clone https://github.com/hackthehill/track-the-hack-bot.git
+    cd track-the-hack-bot
+    ```
 
 2. **Install dependencies**
 
-   ```bash
-   npm ci
-   ```
+    ```bash
+    npm ci
+    ```
 
 3. **Configure the environment**
 
-   ```sh
-   cp .env.example .env
-   ```
+    ```sh
+    cp .env.example .env
+    ```
 
-   Fill in the core Discord, role, log-channel, Track the Hack URL, and HMAC
-   values in `.env`. `CLIENT_ID` is required when registering commands. The
-   remaining OpenProject, mapping, and optional Azure OpenAI values
-   are documented in [.env.example](.env.example).
+    Fill in the core Discord, role, log-channel, Track the Hack URL, and HMAC
+    values in `.env`. `CLIENT_ID` is required when registering commands. The
+    remaining OpenProject, mapping, and optional Azure OpenAI values
+    are documented in [.env.example](.env.example).
 
-   The core runtime values are:
+    The core runtime values are:
 
-   | Variable | Purpose |
-   | --- | --- |
-   | `DISCORD_TOKEN` | Discord bot token |
-   | `COMMUNITY_GUILD_ID` | Community server |
-   | `ORGANIZER_GUILD_ID` | Organizer server |
-   | `COMMUNITY_GUILD_HACKER_ROLE_ID` | Role assigned after verification |
-   | `COMMUNITY_GUILD_ORGANIZER_ROLE_ID` | Organizer role managed in the Community server |
-   | `ORGANIZER_GUILD_ORGANIZER_ROLE_ID` | Source Organizer role and mapping-admin role |
-   | `LOG_CHANNEL_ID` | Community verification log channel |
-   | `TRACK_THE_HACK_URL` | Public Track the Hack application URL |
-   | `INTERNAL_API_SECRET` | At least 32 random characters, shared with Track for signed links and requests |
-   | `DATABASE_URL` | Bot-owned PostgreSQL database; never Track MySQL |
+    | Variable                            | Purpose                                                                        |
+    | ----------------------------------- | ------------------------------------------------------------------------------ |
+    | `DISCORD_TOKEN`                     | Discord bot token                                                              |
+    | `COMMUNITY_GUILD_ID`                | Community server                                                               |
+    | `ORGANIZER_GUILD_ID`                | Organizer server                                                               |
+    | `COMMUNITY_GUILD_HACKER_ROLE_ID`    | Role assigned after verification                                               |
+    | `COMMUNITY_GUILD_ORGANIZER_ROLE_ID` | Organizer role managed in the Community server                                 |
+    | `ORGANIZER_GUILD_ORGANIZER_ROLE_ID` | Source Organizer role and mapping-admin role                                   |
+    | `LOG_CHANNEL_ID`                    | Community verification log channel                                             |
+    | `TRACK_THE_HACK_URL`                | Public Track the Hack application URL                                          |
+    | `INTERNAL_API_SECRET`               | At least 32 random characters, shared with Track for signed links and requests |
+    | `DATABASE_URL`                      | Bot-owned PostgreSQL database; never Track MySQL                               |
 
-   `PORT` is optional and defaults to `4000`.
+    `PORT` is optional and defaults to `4000`.
 
 4. **Register Discord commands**
 
-   ```bash
-   npm run register
-   ```
+    ```bash
+    npm run register
+    ```
 
-   Run this once for a new Discord application and again whenever the command
-   definitions change.
+    Run this once for a new Discord application and again whenever the command
+    definitions change.
 
 5. **Build and start the bot**
 
-   ```bash
-   npm run build
-   npm start
-   ```
+    ```bash
+    npm run build
+    npm start
+    ```
 
-   For development with automatic restarts, use `npm run dev` instead.
+    For development with automatic restarts, use `npm run dev` instead.
 
 ### Discord application setup
 
@@ -93,6 +93,15 @@ in each direction. A failed Discord role assignment keeps the binding so the
 same participant can retry, including with a new link. Existing Hacker roles
 still require a binding. Conflicting bindings require organizer intervention;
 there is no silent reassignment or automatic role revocation.
+
+Track uses that binding for participant notifications without receiving Discord
+identifiers. Signed `POST /participant-links/status` requests return only Hacker
+IDs and linked booleans. Signed `POST /notifications/deliver` requests accept up
+to 50 stable delivery IDs and Hacker IDs, resolve the private Discord identity
+inside the bot, and send direct messages with mentions disabled. The
+`notification_delivery_receipts` table makes confirmed sends idempotent; an
+ambiguous interrupted send becomes `uncertain` and is never retried
+automatically.
 
 Both tables are created at startup by default, independently of OpenProject.
 To manage migrations externally, run `npm run migrate:db`, then set
@@ -386,7 +395,8 @@ POSTGRES_PASSWORD=change-me docker compose -f docker-compose.local.yml up --buil
 ### Container deployment
 
 Production runs as a private Azure Container App with managed PostgreSQL. The
-bot exposes `/healthz` and `/readyz`; Track the Hack calls `/verify` over private
+bot exposes `/healthz` and `/readyz`; Track the Hack calls `/verify`,
+`/participant-links/status`, and `/notifications/deliver` over private
 HTTPS with `x-track-the-hack-timestamp` and `x-track-the-hack-signature`
 (HMAC-SHA256 over `timestamp.body`). Invalid or expired signatures are rejected.
 Bot-specific deployment and release guidance is in

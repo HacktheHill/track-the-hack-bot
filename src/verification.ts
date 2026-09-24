@@ -74,14 +74,29 @@ const log = async (client: Client, member: GuildMember) => {
 };
 
 const verificationStore = new VerificationStore(DATABASE_URL);
-if (process.env.VERIFICATION_RUN_MIGRATIONS !== "false") await verificationStore.migrate();
+if (process.env.VERIFICATION_RUN_MIGRATIONS !== "false")
+	await verificationStore.migrate();
 // Fail startup if externally managed migrations were not applied.
-await verificationStore.pool.query("SELECT 1 FROM discord_participant_links LIMIT 1");
-await verificationStore.pool.query("SELECT 1 FROM discord_verification_challenges LIMIT 1");
+await verificationStore.pool.query(
+	"SELECT 1 FROM discord_participant_links LIMIT 1",
+);
+await verificationStore.pool.query(
+	"SELECT 1 FROM discord_verification_challenges LIMIT 1",
+);
+await verificationStore.pool.query(
+	"SELECT 1 FROM notification_delivery_receipts LIMIT 1",
+);
 await verificationStore.cleanupExpiredChallenges();
-const challengeCleanup = setInterval(() => {
-	void verificationStore.cleanupExpiredChallenges().catch(() => console.error("Expired verification challenge cleanup failed"));
-}, 15 * 60 * 1000);
+const challengeCleanup = setInterval(
+	() => {
+		void verificationStore
+			.cleanupExpiredChallenges()
+			.catch(() =>
+				console.error("Expired verification challenge cleanup failed"),
+			);
+	},
+	15 * 60 * 1000,
+);
 challengeCleanup.unref();
 
 const app = createVerificationApp({
@@ -90,18 +105,40 @@ const app = createVerificationApp({
 	isReady: () => getClient().isReady() && isIntegrationReady(),
 	grantRole: async discordId => {
 		const client = getClient();
-		await grantVerifiedHackerRole(client, COMMUNITY_GUILD_ID, COMMUNITY_GUILD_HACKER_ROLE_ID, discordId, member => log(client, member));
+		await grantVerifiedHackerRole(
+			client,
+			COMMUNITY_GUILD_ID,
+			COMMUNITY_GUILD_HACKER_ROLE_ID,
+			discordId,
+			member => log(client, member),
+		);
+	},
+	sendDirectMessage: async (discordId, content) => {
+		const user = await getClient().users.fetch(discordId);
+		const message = await user.send({
+			content,
+			allowedMentions: { parse: [] },
+		});
+		return message.id;
 	},
 });
-const server = app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+const server = app.listen(PORT, () =>
+	console.log(`Server running on port ${PORT}`),
+);
 export async function closeVerification() {
 	clearInterval(challengeCleanup);
-	await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+	await new Promise<void>((resolve, reject) =>
+		server.close(error => (error ? reject(error) : resolve())),
+	);
 	await verificationStore.close();
 }
 
 const getVerificationLinkButton = async (userId: string) => {
-	const link = await verificationStore.createLink(TRACK_THE_HACK_URL, INTERNAL_API_SECRET, userId);
+	const link = await verificationStore.createLink(
+		TRACK_THE_HACK_URL,
+		INTERNAL_API_SECRET,
+		userId,
+	);
 	return new ActionRowBuilder<ButtonBuilder>().addComponents(
 		new ButtonBuilder()
 			.setLabel("Verification Link / Lien de vérification")
@@ -169,7 +206,9 @@ const registerVerificationCommand = (client: Client) => {
 
 				const userId = interaction.user.id;
 
-				await interaction.followUp(await getVerificationLinkReply(userId));
+				await interaction.followUp(
+					await getVerificationLinkReply(userId),
+				);
 			}
 		} catch {
 			console.error("Error generating verification link");
