@@ -91,8 +91,10 @@ The bot's `discord_verification_challenges` table holds hashed references,
 Discord IDs, and expiry. `discord_participant_links` persists a unique binding
 in each direction. A failed Discord role assignment keeps the binding so the
 same participant can retry, including with a new link. Existing Hacker roles
-still require a binding. Conflicting bindings require organizer intervention;
-there is no silent reassignment or automatic role revocation.
+still require a binding. A conflict response identifies only whether the
+Discord account, participant pass, or both already have a binding; it never
+returns the other identifier. Conflicting bindings require organiser
+intervention, with no silent reassignment or automatic role revocation.
 
 Track uses that binding for participant notifications without receiving Discord
 identifiers. Signed `POST /participant-links/status` requests return only Hacker

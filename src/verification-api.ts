@@ -137,7 +137,9 @@ export function createVerificationApp(options: {
 				return res.json({ ok: true });
 			} catch (error) {
 				if (error instanceof VerificationError)
-					return res.status(error.status).json({ ok: false });
+					return res
+						.status(error.status)
+						.json(error.status === 409 ? { ok: false, reason: error.reason } : { ok: false });
 				// Do not send/log request bodies, capabilities or Discord exceptions.
 				console.error("Discord verification failed");
 				return res.status(503).json({ ok: false });

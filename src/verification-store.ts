@@ -11,8 +11,16 @@ const challengeSchema = z.object({
 	discord_id: z.string(),
 	expires_at: z.date(),
 });
+export type VerificationConflictReason =
+	| "discord-account-linked"
+	| "participant-linked"
+	| "both-linked";
+
 export class VerificationError extends Error {
-	constructor(readonly status: 409 | 410) {
+	constructor(
+		readonly status: 409 | 410,
+		readonly reason?: VerificationConflictReason,
+	) {
 		super(
 			status === 409
 				? "Account already linked"
@@ -289,7 +297,24 @@ export class VerificationStore {
 				"SELECT 1 FROM discord_participant_links WHERE discord_id=$1 AND hacker_id=$2",
 				[discordId, hackerId],
 			);
-			if (!existing.rowCount) throw new VerificationError(409);
+			if (!existing.rowCount) {
+				const conflicts = await client.query<{
+					discord_id: string;
+					hacker_id: string;
+				}>(
+					"SELECT discord_id,hacker_id FROM discord_participant_links WHERE discord_id=$1 OR hacker_id=$2",
+					[discordId, hackerId],
+				);
+				const discordLinked = conflicts.rows.some(row => row.discord_id === discordId);
+				const participantLinked = conflicts.rows.some(row => row.hacker_id === hackerId);
+				const reason =
+					discordLinked && participantLinked
+						? "both-linked"
+						: discordLinked
+							? "discord-account-linked"
+							: "participant-linked";
+				throw new VerificationError(409, reason);
+			}
 			await client.query("COMMIT");
 			return discordId;
 		} catch (error) {

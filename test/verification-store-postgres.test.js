@@ -41,6 +41,16 @@ test("PostgreSQL verification maintenance clears expired, linked, and reset stat
 		const link = await store.createLink("https://tracker.example", secret, discordId, now);
 		await store.bind(new URL(link).hash.slice(1), hackerId, secret, now);
 	}
+	for (const [discordId, hackerId, reason] of [
+		["12345678901234567", "bcdefghijklmnopqrstuvw", "discord-account-linked"],
+		["12345678901234568", "abcdefghijklmnopqrstuv", "participant-linked"],
+	]) {
+		const link = await store.createLink("https://tracker.example", secret, discordId, now);
+		await assert.rejects(
+			store.bind(new URL(link).hash.slice(1), hackerId, secret, now),
+			error => error instanceof VerificationError && error.status === 409 && error.reason === reason,
+		);
+	}
 	const reset = await store.resetParticipantLinks();
 	assert.equal(reset.links, 2);
 	assert.ok(reset.challenges >= 2);
