@@ -105,6 +105,13 @@ inside the bot, and send direct messages with mentions disabled. The
 ambiguous interrupted send becomes `uncertain` and is never retried
 automatically.
 
+The full bot-side notification contract, migration/readiness requirements, failure
+semantics, and test rules are in
+[`docs/notifications.md`](docs/notifications.md). The cross-service real-provider
+acceptance checklist is maintained in Track's notification runbook and must be
+completed with a designated test participant and a separate confirmation immediately
+before any external message.
+
 Both tables are created at startup by default, independently of OpenProject.
 To manage migrations externally, run `npm run migrate:db`, then set
 `VERIFICATION_RUN_MIGRATIONS=false`. Startup checks the tables exist. Expired
@@ -400,7 +407,9 @@ Production runs as a private Azure Container App with managed PostgreSQL. The
 bot exposes `/healthz` and `/readyz`; Track the Hack calls `/verify`,
 `/participant-links/status`, and `/notifications/deliver` over private
 HTTPS with `x-track-the-hack-timestamp` and `x-track-the-hack-signature`
-(HMAC-SHA256 over `timestamp.body`). Invalid or expired signatures are rejected.
+(HMAC-SHA256 over the endpoint-specific domain, timestamp, and exact JSON body).
+Verification, link-status, and notification-delivery signatures use separate domains.
+Invalid or expired signatures are rejected.
 Bot-specific deployment and release guidance is in
 [docs/deployment.md](docs/deployment.md).
 
