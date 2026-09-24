@@ -34,16 +34,15 @@ test("PostgreSQL verification maintenance clears expired, linked, and reset stat
 		return error instanceof VerificationError && error.status === 410;
 	});
 
-	for (const [discordId, hackerId] of [
-		["12345678901234567", "abcdefghijklmnopqrstuv"],
-		["12345678901234568", "bcdefghijklmnopqrstuvw"],
-	]) {
-		const link = await store.createLink("https://tracker.example", secret, discordId, now);
-		await store.bind(new URL(link).hash.slice(1), hackerId, secret, now);
-	}
+	const firstDiscordId = "12345678901234567";
+	const firstHackerId = "abcdefghijklmnopqrstuv";
+	const secondDiscordId = "12345678901234568";
+	const secondHackerId = "bcdefghijklmnopqrstuvw";
+	const firstBinding = await store.createLink("https://tracker.example", secret, firstDiscordId, now);
+	await store.bind(new URL(firstBinding).hash.slice(1), firstHackerId, secret, now);
 	for (const [discordId, hackerId, reason] of [
-		["12345678901234567", "bcdefghijklmnopqrstuvw", "discord-account-linked"],
-		["12345678901234568", "abcdefghijklmnopqrstuv", "participant-linked"],
+		[firstDiscordId, secondHackerId, "discord-account-linked"],
+		[secondDiscordId, firstHackerId, "participant-linked"],
 	]) {
 		const link = await store.createLink("https://tracker.example", secret, discordId, now);
 		await assert.rejects(
@@ -51,6 +50,13 @@ test("PostgreSQL verification maintenance clears expired, linked, and reset stat
 			error => error instanceof VerificationError && error.status === 409 && error.reason === reason,
 		);
 	}
+	const secondBinding = await store.createLink("https://tracker.example", secret, secondDiscordId, now);
+	await store.bind(new URL(secondBinding).hash.slice(1), secondHackerId, secret, now);
+	const bothConflict = await store.createLink("https://tracker.example", secret, firstDiscordId, now);
+	await assert.rejects(
+		store.bind(new URL(bothConflict).hash.slice(1), secondHackerId, secret, now),
+		error => error instanceof VerificationError && error.status === 409 && error.reason === "both-linked",
+	);
 	const reset = await store.resetParticipantLinks();
 	assert.equal(reset.links, 2);
 	assert.ok(reset.challenges >= 2);
