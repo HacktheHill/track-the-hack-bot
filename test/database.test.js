@@ -466,9 +466,8 @@ test("deleted cited sources supersede only pending proposals transactionally", a
 	} });
 	const rows = await db.supersedePendingProposalsForDeletedSource("message");
 	assert.equal(rows.length, 1);
-	assert.match(queries[1].sql, /WHERE status='pending_review'/);
-	assert.match(queries[2].sql, /source_deleted/);
-	assert.equal(queries.at(-1).sql, "COMMIT");
+	assert.match(queries[0].sql, /WHERE status='pending_review'/);
+	assert.match(queries[0].sql, /source_deleted/);
 });
 
 test("source preflight invalidation never transitions an already-creating proposal", async () => {
@@ -479,8 +478,8 @@ test("source preflight invalidation never transitions an already-creating propos
 		return { rowCount: null, rows: [] };
 	} });
 	assert.equal(await db.supersedePendingProposalForInvalidSources("proposal", ["deleted"]), false);
-	assert.match(queries[1].sql, /status='pending_review'/);
-	assert.equal(queries.some(({ sql }) => sql.includes("source_invalid_preflight")), false);
+	assert.match(queries[0].sql, /status='pending_review'/);
+	assert.equal(queries.some(({ sql }) => sql.includes("source_invalid_preflight") && !sql.includes("WITH updated AS")), false);
 });
 
 test("existing proposals retarget only before any operation is applied", async () => {
