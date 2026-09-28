@@ -504,15 +504,13 @@ test("existing proposals retarget only before any operation is applied", async (
 
 test("proposal creation finalizes status, audit, and reviewed snapshot atomically", async () => {
 	const queries = [];
-	const client = {
+	const db = databaseWithPool({
 		async query(sql, values) {
 			queries.push({ sql, values });
 			if (sql.includes("UPDATE task_proposals")) return { rowCount: 1, rows: [{ revision: 2 }] };
-			return { rowCount: null, rows: [] };
-		},
-		release() {},
-	};
-	const db = databaseWithPool({ async connect() { return client; } });
+			return { rowCount: 0, rows: [] };
+		}
+	});
 	const corrections = {
 		title: true, description: false, project: false, assignee: false, accountable: false,
 		priority: false, size: false, startDate: false, dueDate: true, estimate: false,
@@ -521,26 +519,23 @@ test("proposal creation finalizes status, audit, and reviewed snapshot atomicall
 		id: "proposal", reviewerId: "reviewer", workPackageId: 42,
 		confirmationMessageId: "confirmation", corrections, finalSnapshot: { title: "Reviewed" },
 	});
-	assert.equal(queries[0].sql, "BEGIN");
-	assert.match(queries[1].sql, /review_outcome='approved'/);
-	assert.match(queries[1].sql, /revision=revision \+ 1/);
-	assert.deepEqual(queries[1].values[4], corrections);
-	assert.match(queries[2].sql, /task_audit_log/);
-	assert.match(queries[3].sql, /task_proposal_revisions/);
-	assert.equal(queries[4].sql, "COMMIT");
+	assert.match(queries[0].sql, /WITH updated AS \(/);
+	assert.match(queries[0].sql, /review_outcome='approved'/);
+	assert.match(queries[0].sql, /revision=revision \+ 1/);
+	assert.deepEqual(queries[0].values[4], corrections);
+	assert.match(queries[0].sql, /task_audit_log/);
+	assert.match(queries[0].sql, /task_proposal_revisions/);
 });
 
 test("existing-task proposal finalization commits status, audit, and revision together", async () => {
 	const queries = [];
-	const client = {
+	const db = databaseWithPool({
 		async query(sql, values) {
 			queries.push({ sql, values });
 			if (sql.includes("UPDATE task_proposals")) return { rowCount: 1, rows: [{ revision: 2 }] };
-			return { rowCount: null, rows: [] };
-		},
-		release() {},
-	};
-	const db = databaseWithPool({ async connect() { return client; } });
+			return { rowCount: 0, rows: [] };
+		}
+	});
 	const corrections = {
 		title: false, description: false, project: false, assignee: false, accountable: false,
 		priority: false, size: false, startDate: false, dueDate: false, estimate: false,
@@ -549,15 +544,14 @@ test("existing-task proposal finalization commits status, audit, and revision to
 		id: "proposal", reviewerId: "reviewer", workPackageId: 42, corrections,
 		action: "update", finalSnapshot: { contentOperation: "postComment" },
 	});
-	assert.equal(queries[0].sql, "BEGIN");
-	assert.match(queries[1].sql, /revision=revision \+ 1/);
-	assert.match(queries[2].sql, /task_audit_log/);
-	assert.match(queries[3].sql, /rag_target_selected/);
-	assert.match(queries[3].sql, /implicitApproval/);
-	assert.match(queries[3].sql, /NOT EXISTS/);
-	assert.deepEqual(queries[3].values, ["proposal", "reviewer", 42]);
-	assert.match(queries[4].sql, /task_proposal_revisions/);
-	assert.equal(queries[5].sql, "COMMIT");
+	assert.match(queries[0].sql, /WITH updated AS \(/);
+	assert.match(queries[0].sql, /revision=revision \+ 1/);
+	assert.match(queries[0].sql, /task_audit_log/);
+	assert.match(queries[0].sql, /rag_target_selected/);
+	assert.match(queries[0].sql, /implicitApproval/);
+	assert.match(queries[0].sql, /NOT EXISTS/);
+	assert.deepEqual(queries[0].values.slice(0, 5), ["proposal", "reviewer", 42, corrections, "update"]);
+	assert.match(queries[0].sql, /task_proposal_revisions/);
 });
 
 test("extraction events retain structured metrics but no message content", async () => {
@@ -635,22 +629,18 @@ test("dismissed proposals require and persist a structured reason", async () => 
 
 test("direct proposal dismissals atomically preserve immutable review telemetry", async () => {
 	const queries = [];
-	const client = {
+	const db = databaseWithPool({
 		async query(sql, values) {
 			queries.push({ sql, values });
 			if (sql.includes("UPDATE task_proposals")) return { rowCount: 1, rows: [{ id: "proposal" }] };
-			return { rowCount: null, rows: [] };
-		},
-		release() {},
-	};
-	const db = databaseWithPool({ async connect() { return client; } });
+			return { rowCount: 0, rows: [] };
+		}
+	});
 	assert.equal(await db.dismissProposal("proposal", "reviewer", "incorrect_proposal"), true);
-	assert.equal(queries[0].sql, "BEGIN");
-	assert.match(queries[1].sql, /dismissal_reason=\$3/);
-	assert.deepEqual(queries[1].values, ["proposal", "reviewer", "incorrect_proposal"]);
-	assert.match(queries[2].sql, /'proposal_dismissed'/);
-	assert.deepEqual(queries[2].values, ["proposal", "reviewer", { reason: "incorrect_proposal" }]);
-	assert.equal(queries[3].sql, "COMMIT");
+	assert.match(queries[0].sql, /WITH updated AS \(/);
+	assert.match(queries[0].sql, /dismissal_reason=\$3/);
+	assert.deepEqual(queries[0].values, ["proposal", "reviewer", "incorrect_proposal", '{"reason":"incorrect_proposal"}']);
+	assert.match(queries[0].sql, /'proposal_dismissed'/);
 });
 
 test("proposal delivery failures become retryable failed proposals", async () => {
