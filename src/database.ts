@@ -1259,11 +1259,9 @@ export class Database {
 		corrections: CorrectionFlags;
 		finalSnapshot: Record<string, unknown>;
 	}) {
-		const client = await this.pool.connect();
-		try {
-			await client.query("BEGIN");
-			const result = await client.query<{ revision: number }>(
-				`UPDATE task_proposals SET status='created', reviewer_discord_id=$2,
+		const result = await this.pool.query<{ revision: number }>(
+			`WITH updated AS (
+				UPDATE task_proposals SET status='created', reviewer_discord_id=$2,
 				 openproject_work_package_id=$3, confirmation_message_id=$4, error=NULL,
 				 review_outcome='approved', reviewed_at=now(), correction_flags=(
 					SELECT jsonb_object_agg(incoming.key,
@@ -1272,25 +1270,18 @@ export class Database {
 				 ),
 				 claim_expires_at=NULL, revision=revision + 1,
 				 review_duration_ms=GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(review_started_at, created_at))) * 1000)::integer,
-				 updated_at=now() WHERE id=$1 AND status='creating' RETURNING revision`,
-				[input.id, input.reviewerId, input.workPackageId, input.confirmationMessageId ?? null, input.corrections],
-			);
-			if (result.rowCount !== 1) throw new Error("This proposal is no longer being applied.");
-			await client.query(
-				"INSERT INTO task_audit_log(proposal_id,event,actor_discord_id,metadata) VALUES($1,'created',$2,$3)",
-				[input.id, input.reviewerId, { workPackageId: input.workPackageId }],
-			);
-			await client.query(
-				"INSERT INTO task_proposal_revisions(proposal_id,revision,phase,payload) VALUES($1,$2,'final',$3)",
-				[input.id, result.rows[0].revision, jsonParameter(input.finalSnapshot)],
-			);
-			await client.query("COMMIT");
-		} catch (error) {
-			await client.query("ROLLBACK");
-			throw error;
-		} finally {
-			client.release();
-		}
+				 updated_at=now() WHERE id=$1 AND status='creating' RETURNING id, revision
+			),
+			audit AS (
+				INSERT INTO task_audit_log(proposal_id,event,actor_discord_id,metadata)
+				SELECT id, 'created', $2, $6 FROM updated
+			)
+			INSERT INTO task_proposal_revisions(proposal_id,revision,phase,payload)
+			SELECT id, revision, 'final', $7 FROM updated
+			RETURNING revision`,
+			[input.id, input.reviewerId, input.workPackageId, input.confirmationMessageId ?? null, input.corrections, jsonParameter({ workPackageId: input.workPackageId }), jsonParameter(input.finalSnapshot)],
+		);
+		if (result.rowCount !== 1) throw new Error("This proposal is no longer being applied.");
 	}
 
 	async markProposalUpdated(id: string, reviewerId: string, workPackageId: number, corrections?: CorrectionFlags, action = "update") {
@@ -1311,50 +1302,40 @@ export class Database {
 		id: string; reviewerId: string; workPackageId: number; corrections: CorrectionFlags;
 		action: string; finalSnapshot: Record<string, unknown>;
 	}) {
-		const client = await this.pool.connect();
-		try {
-			await client.query("BEGIN");
-			const result = await client.query<{ revision: number }>(
-				`UPDATE task_proposals SET status='created', reviewer_discord_id=$2, openproject_work_package_id=$3,
+		const result = await this.pool.query<{ revision: number }>(
+			`WITH updated AS (
+				UPDATE task_proposals SET status='created', reviewer_discord_id=$2, openproject_work_package_id=$3,
 				 review_outcome=$5, reviewed_at=now(), correction_flags=$4, claim_expires_at=NULL,
 				 revision=revision + 1,
 				 review_duration_ms=GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(review_started_at, created_at))) * 1000)::integer,
-				 updated_at=now() WHERE id=$1 AND status='creating' RETURNING revision`,
-				[input.id, input.reviewerId, input.workPackageId, input.corrections, input.action],
-			);
-			if (result.rowCount !== 1) throw new Error("This proposal is no longer being applied.");
-			await client.query(
-				"INSERT INTO task_audit_log(proposal_id,event,actor_discord_id,metadata) VALUES($1,$2,$3,$4)",
-				[input.id, input.action, input.reviewerId, { workPackageId: input.workPackageId }],
-			);
-			await client.query(
-				`INSERT INTO task_audit_log(proposal_id,openproject_work_package_id,event,actor_discord_id,metadata)
-				 SELECT proposal.id,$3,'rag_target_selected',$2,jsonb_build_object(
-					'proposalId',proposal.id,'retrievalRank',(candidate->>'retrievalRank')::integer,
+				 updated_at=now() WHERE id=$1 AND status='creating' RETURNING id, revision, target_work_package_id, rag_candidates
+			),
+			audit AS (
+				INSERT INTO task_audit_log(proposal_id,event,actor_discord_id,metadata)
+				SELECT id, $5, $2, $6 FROM updated
+			),
+			rag_audit AS (
+				INSERT INTO task_audit_log(proposal_id,openproject_work_package_id,event,actor_discord_id,metadata)
+				SELECT updated.id,$3,'rag_target_selected',$2,jsonb_build_object(
+					'proposalId',updated.id,'retrievalRank',(candidate->>'retrievalRank')::integer,
 					'relationship',candidate->>'relationship','confidence',(candidate->>'confidence')::numeric,
 					'retrievalScore',(candidate->>'similarity')::numeric,'recommended',TRUE,'implicitApproval',TRUE
-				 )
-				 FROM task_proposals AS proposal
-				 CROSS JOIN LATERAL jsonb_array_elements(proposal.rag_candidates) AS candidate
-				 WHERE proposal.id=$1 AND proposal.target_work_package_id=$3
-				 AND (candidate->>'workPackageId')::integer=$3 AND candidate->>'recommended'='true'
-				 AND NOT EXISTS (
+				)
+				FROM updated
+				CROSS JOIN LATERAL jsonb_array_elements(updated.rag_candidates) AS candidate
+				WHERE updated.target_work_package_id=$3
+				AND (candidate->>'workPackageId')::integer=$3 AND candidate->>'recommended'='true'
+				AND NOT EXISTS (
 					SELECT 1 FROM task_audit_log AS audit WHERE audit.event='rag_target_selected'
-					AND (audit.proposal_id=proposal.id OR audit.metadata->>'proposalId'=proposal.id::text)
-				 ) LIMIT 1`,
-				[input.id, input.reviewerId, input.workPackageId],
-			);
-			await client.query(
-				"INSERT INTO task_proposal_revisions(proposal_id,revision,phase,payload) VALUES($1,$2,'final',$3)",
-				[input.id, result.rows[0].revision, jsonParameter(input.finalSnapshot)],
-			);
-			await client.query("COMMIT");
-		} catch (error) {
-			await client.query("ROLLBACK");
-			throw error;
-		} finally {
-			client.release();
-		}
+					AND (audit.proposal_id=updated.id OR audit.metadata->>'proposalId'=updated.id::text)
+				) LIMIT 1
+			)
+			INSERT INTO task_proposal_revisions(proposal_id,revision,phase,payload)
+			SELECT id, revision, 'final', $7 FROM updated
+			RETURNING revision`,
+			[input.id, input.reviewerId, input.workPackageId, input.corrections, input.action, jsonParameter({ workPackageId: input.workPackageId }), jsonParameter(input.finalSnapshot)],
+		);
+		if (result.rowCount !== 1) throw new Error("This proposal is no longer being applied.");
 	}
 
 	async markProposalFailed(id: string, status: "failed" | "needs_reconciliation", reviewerId: string, error: string) {

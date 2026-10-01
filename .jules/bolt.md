@@ -1,3 +1,6 @@
 ## 2024-05-15 - OpenProject Cache Stampede
 **Learning:** The `OpenProjectClient`'s naive `cached()` implementation triggers a cache stampede on startup or high concurrency because it didn't coalesce pending promises. Concurrent requests for `projects()`, `users()`, etc. executed identical API calls.
 **Action:** When implementing application-level caching, always store the `Promise` of the work in progress rather than just the final result, preventing duplicate work while the first request is still inflight.
+## 2024-05-18 - Single Query Updates with PostgreSQL CTEs
+**Learning:** We replaced multiple queries surrounded by BEGIN/COMMIT transaction blocks with single atomic queries using Common Table Expressions (CTEs). Since a single query in PostgreSQL is inherently atomic, the transaction wrapper is no longer necessary. We also observed how tests required changes, since they relied on checking indices of a `queries` array inside `test/database.test.js`.
+**Action:** When inserting logs/revisions based on a database update, use `WITH updated AS (UPDATE ... RETURNING ...) INSERT INTO log SELECT ... FROM updated` to reduce database round-trips and simplify logic. Update query assertions accordingly.
