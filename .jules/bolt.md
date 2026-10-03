@@ -1,3 +1,6 @@
 ## 2024-05-15 - OpenProject Cache Stampede
 **Learning:** The `OpenProjectClient`'s naive `cached()` implementation triggers a cache stampede on startup or high concurrency because it didn't coalesce pending promises. Concurrent requests for `projects()`, `users()`, etc. executed identical API calls.
 **Action:** When implementing application-level caching, always store the `Promise` of the work in progress rather than just the final result, preventing duplicate work while the first request is still inflight.
+## YYYY-MM-DD - [Optimize supersedePendingProposalsForDeletedSource N+1 loops using CTEs]
+**Learning:** Found an N+1 query bottleneck inside a loop inside a transaction (`BEGIN` / `COMMIT`) when updating rows and subsequently doing audit logging in `supersedePendingProposalsForDeletedSource`. PostgreSQL supports using a CTE (Common Table Expression) to execute the `UPDATE ... RETURNING` and the subsequent `INSERT INTO ... SELECT ... FROM` in a single query. A single query in PostgreSQL is inherently atomic, so the explicit transaction block and connections checkouts can be removed.
+**Action:** When inserting dependent rows after updating a batch of rows, write a CTE combined query and remove the explicit transaction boundaries instead of a JavaScript level `for...of` loop execution.
