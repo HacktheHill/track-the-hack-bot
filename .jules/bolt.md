@@ -1,3 +1,6 @@
 ## 2024-05-15 - OpenProject Cache Stampede
 **Learning:** The `OpenProjectClient`'s naive `cached()` implementation triggers a cache stampede on startup or high concurrency because it didn't coalesce pending promises. Concurrent requests for `projects()`, `users()`, etc. executed identical API calls.
-**Action:** When implementing application-level caching, always store the `Promise` of the work in progress rather than just the final result, preventing duplicate work while the first request is still inflight.
+**Action:** When implementing application-level caching, always store the `Promise` of the work in progress rather than just the final result, preventing duplicate work while the first request is still inflight.## 2026-10-04 - Optimize dismissProposal with CTE
+**Learning:** In PostgreSQL, combining UPDATE ... RETURNING with an INSERT in a single CTE removes the need for explicit BEGIN/COMMIT blocks since a single query is implicitly atomic. This pattern eliminates multiple network round-trips and makes operations significantly faster. I also learned that using helper methods like `jsonParameter` defined in the codebase is essential when serializing JSONB values, rather than passing raw objects, to ensure reliable parsing by the driver without runtime crash risks.
+
+**Action:** When a transaction consists of an UPDATE and an immediate INSERT based on the updated values (like an audit log), use a CTE (WITH updated AS (...)) to combine them into one query. Remove explicit transaction management for these simple atomic cases.
