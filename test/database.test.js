@@ -457,7 +457,7 @@ test("create-proposal detail edits commit inference, correction flags, and revis
 	assert.equal(queries[3].sql, "COMMIT");
 });
 
-test("deleted cited sources supersede only pending proposals transactionally", async () => {
+test("deleted cited sources supersede only pending proposals using a CTE", async () => {
 	const queries = [];
 	const db = databaseWithPool({ async query(sql, values) {
 		queries.push({ sql, values });
@@ -466,9 +466,10 @@ test("deleted cited sources supersede only pending proposals transactionally", a
 	} });
 	const rows = await db.supersedePendingProposalsForDeletedSource("message");
 	assert.equal(rows.length, 1);
-	assert.match(queries[1].sql, /WHERE status='pending_review'/);
-	assert.match(queries[2].sql, /source_deleted/);
-	assert.equal(queries.at(-1).sql, "COMMIT");
+		assert.match(queries[0].sql, /WITH superseded AS/);
+		assert.match(queries[0].sql, /WHERE status='pending_review'/);
+		assert.match(queries[0].sql, /source_deleted/);
+		assert.equal(queries.length, 1);
 });
 
 test("source preflight invalidation never transitions an already-creating proposal", async () => {
