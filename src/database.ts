@@ -1178,30 +1178,25 @@ export class Database {
 	}
 
 	async supersedePendingProposalsForDeletedSource(messageId: string) {
-		const client = await this.pool.connect();
-		try {
-			await client.query("BEGIN");
-			// Use the @> array operator rather than = ANY() to ensure the PostgreSQL query planner
-			// correctly utilizes the GIN index on source_message_ids for improved performance.
-			const result = await client.query<{ id: string; channel_id: string; review_message_id: string | null }>(
-				`UPDATE task_proposals SET status='superseded',review_outcome='superseded',
+		// Optimization: Combine UPDATE and INSERT into a single database roundtrip using a CTE.
+		// This prevents N+1 queries when multiple proposals cite the same deleted message,
+		// and inherently acts as a single atomic statement without explicit BEGIN/COMMIT blocks.
+		// Note: The @> array operator ensures the PostgreSQL query planner utilizes the GIN index.
+		const result = await this.pool.query<{ id: string; channel_id: string; review_message_id: string | null }>(
+			`WITH updated_proposals AS (
+				UPDATE task_proposals SET status='superseded',review_outcome='superseded',
 				 error='A cited Discord source message was deleted.',reviewed_at=now(),updated_at=now()
 				 WHERE status='pending_review' AND source_message_ids @> ARRAY[$1]::text[]
-				 RETURNING id,channel_id,review_message_id`,
-				[messageId],
-			);
-			for (const row of result.rows) await client.query(
-				"INSERT INTO task_audit_log(proposal_id,event,metadata) VALUES($1,'source_deleted',$2)",
-				[row.id, jsonParameter({ messageId })],
-			);
-			await client.query("COMMIT");
-			return result.rows;
-		} catch (error) {
-			await client.query("ROLLBACK");
-			throw error;
-		} finally {
-			client.release();
-		}
+				 RETURNING id,channel_id,review_message_id
+			), inserted_logs AS (
+				INSERT INTO task_audit_log(proposal_id,event,metadata)
+				SELECT id, 'source_deleted', $2
+				FROM updated_proposals
+			)
+			SELECT * FROM updated_proposals`,
+			[messageId, jsonParameter({ messageId })],
+		);
+		return result.rows;
 	}
 
 	async supersedePendingProposalForInvalidSources(id: string, missingMessageIds: string[], contentChanged = false) {
