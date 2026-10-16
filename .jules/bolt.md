@@ -1,3 +1,6 @@
 ## 2024-05-15 - OpenProject Cache Stampede
 **Learning:** The `OpenProjectClient`'s naive `cached()` implementation triggers a cache stampede on startup or high concurrency because it didn't coalesce pending promises. Concurrent requests for `projects()`, `users()`, etc. executed identical API calls.
 **Action:** When implementing application-level caching, always store the `Promise` of the work in progress rather than just the final result, preventing duplicate work while the first request is still inflight.
+## 2024-05-18 - Combine UPDATE and INSERT via CTE for Batch N+1 Problems
+**Learning:** In PostgreSQL, combining `UPDATE ... RETURNING` and subsequent `INSERT` operations into a single query via a Common Table Expression (CTE) removes the N+1 queries bottleneck. Additionally, because a CTE forms a single query, it implicitly runs as an atomic statement, eliminating the need to explicitly begin, commit, or rollback transactions. This reduces both the number of database roundtrips and manual transaction management.
+**Action:** Always favor CTEs to consolidate related batched data modifications, avoiding the N+1 problem and minimizing the number of queries and explicit transaction boundaries in PostgreSQL.
