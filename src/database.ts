@@ -1062,32 +1062,21 @@ export class Database {
 	}
 
 	async dismissProposal(id: string, reviewerId: string, reason: "not_actionable" | "incorrect_proposal") {
-		const client = await this.pool.connect();
-		try {
-			await client.query("BEGIN");
-			const result = await client.query(
-				`UPDATE task_proposals SET status='dismissed', reviewer_discord_id=$2,
+		// ⚡ Bolt: Uses a single CTE to bundle UPDATE and INSERT together, removing manual
+		// transaction management (BEGIN/COMMIT) and saving database roundtrips.
+		const result = await this.pool.query(
+			`WITH updated AS (
+				UPDATE task_proposals SET status='dismissed', reviewer_discord_id=$2,
 				 review_outcome='dismissed', dismissal_reason=$3, reviewed_at=now(),
 				 review_duration_ms=GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(review_started_at, created_at))) * 1000)::integer,
-				 updated_at=now() WHERE id=$1 AND status='pending_review' AND expires_at > now() RETURNING id`,
-				[id, reviewerId, reason],
-			);
-			if (result.rowCount !== 1) {
-				await client.query("ROLLBACK");
-				return false;
-			}
-			await client.query(
-				"INSERT INTO task_audit_log(proposal_id,event,actor_discord_id,metadata) VALUES($1,'proposal_dismissed',$2,$3)",
-				[id, reviewerId, { reason }],
-			);
-			await client.query("COMMIT");
-			return true;
-		} catch (error) {
-			await client.query("ROLLBACK");
-			throw error;
-		} finally {
-			client.release();
-		}
+				 updated_at=now() WHERE id=$1 AND status='pending_review' AND expires_at > now() RETURNING id
+			)
+			INSERT INTO task_audit_log(proposal_id,event,actor_discord_id,metadata)
+			SELECT id, 'proposal_dismissed', $2, $4 FROM updated
+			RETURNING proposal_id`,
+			[id, reviewerId, reason, { reason }],
+		);
+		return result.rowCount === 1;
 	}
 
 	async markProposalDeliveryFailed(id: string, error: string) {
