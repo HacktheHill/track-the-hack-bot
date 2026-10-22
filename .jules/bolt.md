@@ -1,3 +1,6 @@
 ## 2024-05-15 - OpenProject Cache Stampede
 **Learning:** The `OpenProjectClient`'s naive `cached()` implementation triggers a cache stampede on startup or high concurrency because it didn't coalesce pending promises. Concurrent requests for `projects()`, `users()`, etc. executed identical API calls.
 **Action:** When implementing application-level caching, always store the `Promise` of the work in progress rather than just the final result, preventing duplicate work while the first request is still inflight.
+## 2025-02-12 - Eliminate N+1 bottlenecks in database transactions with CTEs
+**Learning:** This codebase heavily uses PostgreSQL (`pg`) for auditing operations, often pairing an `UPDATE ... RETURNING` with an `INSERT` into an audit log within a `BEGIN`/`COMMIT` transaction. This causes an N+1 query issue for the multiple statements, consuming unnecessary network roundtrips and connection checkout overhead.
+**Action:** Use PostgreSQL Common Table Expressions (CTEs) like `WITH updated AS (...) INSERT ... FROM updated` to combine multiple operations into a single query. This intrinsically provides atomicity, making explicit transaction blocks (`BEGIN`/`COMMIT`) and manual connection pooling (`pool.connect()`) unnecessary.
