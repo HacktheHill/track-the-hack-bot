@@ -1062,32 +1062,20 @@ export class Database {
 	}
 
 	async dismissProposal(id: string, reviewerId: string, reason: "not_actionable" | "incorrect_proposal") {
-		const client = await this.pool.connect();
-		try {
-			await client.query("BEGIN");
-			const result = await client.query(
-				`UPDATE task_proposals SET status='dismissed', reviewer_discord_id=$2,
+		// Optimization: Use CTE to combine UPDATE and INSERT into a single database roundtrip,
+		// eliminating the need for explicit transaction blocks and connection management overhead.
+		const result = await this.pool.query(
+			`WITH updated AS (
+				UPDATE task_proposals SET status='dismissed', reviewer_discord_id=$2,
 				 review_outcome='dismissed', dismissal_reason=$3, reviewed_at=now(),
 				 review_duration_ms=GREATEST(0, EXTRACT(EPOCH FROM (now() - COALESCE(review_started_at, created_at))) * 1000)::integer,
-				 updated_at=now() WHERE id=$1 AND status='pending_review' AND expires_at > now() RETURNING id`,
-				[id, reviewerId, reason],
-			);
-			if (result.rowCount !== 1) {
-				await client.query("ROLLBACK");
-				return false;
-			}
-			await client.query(
-				"INSERT INTO task_audit_log(proposal_id,event,actor_discord_id,metadata) VALUES($1,'proposal_dismissed',$2,$3)",
-				[id, reviewerId, { reason }],
-			);
-			await client.query("COMMIT");
-			return true;
-		} catch (error) {
-			await client.query("ROLLBACK");
-			throw error;
-		} finally {
-			client.release();
-		}
+				 updated_at=now() WHERE id=$1 AND status='pending_review' AND expires_at > now() RETURNING id
+			)
+			INSERT INTO task_audit_log(proposal_id,event,actor_discord_id,metadata)
+			SELECT id,'proposal_dismissed',$2,$4 FROM updated`,
+			[id, reviewerId, reason, { reason }],
+		);
+		return result.rowCount === 1;
 	}
 
 	async markProposalDeliveryFailed(id: string, error: string) {
@@ -1205,27 +1193,19 @@ export class Database {
 	}
 
 	async supersedePendingProposalForInvalidSources(id: string, missingMessageIds: string[], contentChanged = false) {
-		const client = await this.pool.connect();
-		try {
-			await client.query("BEGIN");
-			const result = await client.query(
-				`UPDATE task_proposals SET status='superseded',review_outcome='superseded',
+		// Optimization: Use CTE to combine UPDATE and INSERT into a single database roundtrip,
+		// eliminating the need for explicit transaction blocks and connection management overhead.
+		const result = await this.pool.query(
+			`WITH updated AS (
+				UPDATE task_proposals SET status='superseded',review_outcome='superseded',
 				 error=$2,reviewed_at=now(),updated_at=now()
-				 WHERE id=$1 AND status='pending_review' AND expires_at > now() RETURNING id`,
-				[id, contentChanged ? "Cited Discord source evidence changed after this proposal was created." : "One or more cited Discord source messages were deleted."],
-			);
-			if (result.rowCount === 1) await client.query(
-				"INSERT INTO task_audit_log(proposal_id,event,metadata) VALUES($1,'source_invalid_preflight',$2)",
-				[id, jsonParameter({ missingMessageIds, contentChanged })],
-			);
-			await client.query("COMMIT");
-			return result.rowCount === 1;
-		} catch (error) {
-			await client.query("ROLLBACK");
-			throw error;
-		} finally {
-			client.release();
-		}
+				 WHERE id=$1 AND status='pending_review' AND expires_at > now() RETURNING id
+			)
+			INSERT INTO task_audit_log(proposal_id,event,metadata)
+			SELECT id,'source_invalid_preflight',$3 FROM updated`,
+			[id, contentChanged ? "Cited Discord source evidence changed after this proposal was created." : "One or more cited Discord source messages were deleted.", { missingMessageIds, contentChanged }],
+		);
+		return result.rowCount === 1;
 	}
 
 	async releaseProposal(id: string, error: string) {
