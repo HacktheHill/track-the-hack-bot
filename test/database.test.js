@@ -635,22 +635,18 @@ test("dismissed proposals require and persist a structured reason", async () => 
 
 test("direct proposal dismissals atomically preserve immutable review telemetry", async () => {
 	const queries = [];
-	const client = {
+	const db = databaseWithPool({
 		async query(sql, values) {
 			queries.push({ sql, values });
-			if (sql.includes("UPDATE task_proposals")) return { rowCount: 1, rows: [{ id: "proposal" }] };
+			if (sql.includes("WITH updated AS")) return { rowCount: 1, rows: [{ id: "proposal" }] };
 			return { rowCount: null, rows: [] };
-		},
-		release() {},
-	};
-	const db = databaseWithPool({ async connect() { return client; } });
+		}
+	});
 	assert.equal(await db.dismissProposal("proposal", "reviewer", "incorrect_proposal"), true);
-	assert.equal(queries[0].sql, "BEGIN");
-	assert.match(queries[1].sql, /dismissal_reason=\$3/);
-	assert.deepEqual(queries[1].values, ["proposal", "reviewer", "incorrect_proposal"]);
-	assert.match(queries[2].sql, /'proposal_dismissed'/);
-	assert.deepEqual(queries[2].values, ["proposal", "reviewer", { reason: "incorrect_proposal" }]);
-	assert.equal(queries[3].sql, "COMMIT");
+	assert.match(queries[0].sql, /WITH updated AS/);
+	assert.match(queries[0].sql, /dismissal_reason=\$3/);
+	assert.match(queries[0].sql, /INSERT INTO task_audit_log/);
+	assert.deepEqual(queries[0].values, ["proposal", "reviewer", "incorrect_proposal", JSON.stringify({ reason: "incorrect_proposal" })]);
 });
 
 test("proposal delivery failures become retryable failed proposals", async () => {
