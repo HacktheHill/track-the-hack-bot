@@ -25,7 +25,7 @@
 		"@azure/identity": "^4.13.1",
 		"@azure/storage-blob": "^12.33.0",
 		"@fontsource/rubik": "^5.3.0",
-		"body-parser": "^2.3.0",
+		"body-parser": "^2.4.0",
 		"discord.js": "^14.27.0",
 		"dotenv": "^17.4.2",
 		"express": "^5.2.1",
